@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "rpc-io"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "JSON-RPC 2.0 core with Content-Length, newline, and HTTP framings: one transport for LSP, DAP, MCP, and service APIs."
+description = "JSON-RPC 2.0 engine with Content-Length and newline framings, a sans-IO core, and a blocking adapter: one transport for LSP, DAP, MCP, and service APIs."
 
 # Keywords (5 max)
 keywords = ["json-rpc", "rpc", "lsp", "mcp", "protocol"]
@@ -45,13 +45,17 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+# The endpoint (dispatcher, outgoing calls, cancellation, the blocking adapter)
+# needs threads, clocks, and panic containment. Without `std` the crate is the
+# message model, the framings, and the correlation map, on `alloc` only.
+std = ["jsonx-lib/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# The owner's JSON: borrowing parser, pull reader with raw slices, writer.
+jsonx-lib = { version = "0.2", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -64,8 +68,20 @@ proptest  = "1"
 # BENCHMARKS
 # #################################
 [[bench]]
-name    = "bench"
-harness = false
+name              = "bench"
+harness           = false
+required-features = ["std"]
+
+
+# EXAMPLES
+# #################################
+[[example]]
+name              = "stdio_echo"
+required-features = ["std"]
+
+[[example]]
+name              = "pipe_pair"
+required-features = ["std"]
 
 
 # RELEASE PROFILE
@@ -74,5 +90,6 @@ harness = false
 opt-level     = 3
 lto           = "fat"
 codegen-units = 1
-panic         = "abort"
+# No `panic = "abort"`: the endpoint contains handler panics (DIRECTIVES 4),
+# which needs unwinding in this crate's own examples and benches too.
 strip         = "symbols"
