@@ -16,6 +16,8 @@ use std::{
 
 use jsonx_lib::Parser;
 
+#[cfg(feature = "tracing")]
+use crate::trace::event;
 use crate::{
     config::{Cancellation, Config, Gate},
     error::{CallError, Error},
@@ -33,6 +35,7 @@ use crate::{
     router::{Context, Event, EventFn, Params, RequestHandler, Router},
     sink::Sink,
     stats::{Stats, Tally},
+    trace::call_span,
 };
 
 /// Whether to keep going after a message.
@@ -757,6 +760,7 @@ impl<S, K: Sink> Endpoint<S, K> {
 
     fn on_request(&mut self, request: Request<'_>, batch: Option<u64>, stop: &mut bool) {
         let Request { id, method, params } = request;
+        call_span!("request", method, Some(&id));
         match self.admit(&id, &method, batch) {
             Admission::Admitted => {}
             Admission::Refused(refusal) => {
@@ -879,6 +883,7 @@ impl<S, K: Sink> Endpoint<S, K> {
 
     fn on_notification(&mut self, notification: Notification<'_>, stop: &mut bool) {
         let Notification { method, params } = notification;
+        call_span!("notification", method, None::<&Id<'_>>);
         if let Some(cancellation) = &self.cancellation {
             if *method == *cancellation.method {
                 let target = params.as_ref().and_then(|p| {
@@ -1081,6 +1086,45 @@ fn not_initialized(gate: &Gate) -> ErrorObject {
     )
 }
 
+/// Records an [`Event`] for `tracing`: no params, results, or error data,
+/// which can hold anything the application sends.
+#[cfg(feature = "tracing")]
+fn trace_event(event: &Event<'_>) {
+    match event {
+        Event::Panicked { method, message } => {
+            event!(error, method = %method, panic = %message, "a handler panicked");
+        }
+        Event::Invalid { error, answered } => {
+            event!(debug, code = error.code().0, message = %error.message(), answered, "a malformed message");
+        }
+        Event::UnknownNotification { method } => {
+            event!(debug, method = %method, "a notification with no handler");
+        }
+        Event::Dropped { method } => {
+            event!(debug, method = %method, "a notification dropped before the gate opened");
+        }
+        Event::Unmatched { id } => {
+            event!(debug, id = %id, "a response to no outstanding request");
+        }
+        Event::PeerError { error } => {
+            event!(
+                warn,
+                code = error.code().0,
+                "the peer could not read a message"
+            );
+        }
+        Event::Oversized { error } => {
+            event!(warn, error = %error, "an oversized message was skipped");
+        }
+        Event::Cancelled { id } => {
+            event!(debug, id = %id, "the peer cancelled a request");
+        }
+    }
+}
+
+#[cfg(not(feature = "tracing"))]
+fn trace_event(_event: &Event<'_>) {}
+
 /// Runs user code, turning a panic into its payload.
 fn contain<T>(f: impl FnOnce() -> T) -> Result<T, Box<dyn Any + Send>> {
     panic::catch_unwind(AssertUnwindSafe(f))
@@ -1118,7 +1162,9 @@ fn tally(incoming: &Incoming<'_>, bytes: usize) -> Tally {
 }
 
 /// Tells the event hook, if any; a panic in it is contained and ignored.
+/// With the `tracing` feature, records the event too.
 fn report<S>(hook: &mut Option<EventFn<S>>, state: &mut S, event: &Event<'_>) {
+    trace_event(event);
     if let Some(hook) = hook {
         // The hook only observes; its panic must not take the endpoint down.
         let _ignored = contain(|| hook(state, event));

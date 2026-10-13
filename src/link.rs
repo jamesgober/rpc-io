@@ -42,6 +42,7 @@ use crate::{
     slot::{self, Outcome, Slot, Waiter},
     stats::{Stats, Tally, bump},
     text,
+    trace::event,
 };
 
 /// The encoding buffer is released after a message that grew it past this.
@@ -507,6 +508,7 @@ impl<K: Sink> Inner<K> {
 
     /// Marks the connection closed and releases everything waiting on it.
     fn shut(&mut self) {
+        event!(debug, "the connection is closed");
         self.closed = true;
         self.closed_flag.store(true, Ordering::Release);
         self.timer.stop();
@@ -525,6 +527,7 @@ impl<K: Sink> Inner<K> {
 
     /// Records a sink failure and closes; returns the error for the sender.
     fn fail(&mut self, error: io::Error) -> Error {
+        event!(warn, error = %error, "the transport failed; closing the connection");
         let copy = io::Error::new(error.kind(), error.to_string());
         if self.broken.is_none() {
             self.broken = Some(error);
@@ -541,6 +544,11 @@ impl<K: Sink> Inner<K> {
         if self.gate != GateState::Open && !matches!(sending, Sending::Response) {
             let bytes = self.held_bytes.saturating_add(self.scratch.len());
             if bytes > self.settings.max_held_bytes {
+                event!(
+                    warn,
+                    held = self.held.len(),
+                    "too much is held behind the gate; a message was refused"
+                );
                 return Err(Error::Backlog);
             }
             self.held_bytes = bytes;
@@ -662,9 +670,15 @@ impl<K: Sink> Inner<K> {
         match reason {
             CallError::TimedOut => {
                 bump(&mut self.stats.timed_out);
+                event!(debug, id, "our request timed out");
             }
             CallError::Evicted => {
                 bump(&mut self.stats.evicted);
+                event!(
+                    warn,
+                    id,
+                    "our oldest request was evicted: too many are outstanding"
+                );
             }
             _ => bump(&mut self.stats.cancelled_out),
         }

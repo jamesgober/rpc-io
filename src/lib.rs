@@ -119,6 +119,8 @@ mod sink;
 mod slot;
 #[cfg(feature = "std")]
 mod stats;
+#[cfg(feature = "std")]
+mod trace;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};

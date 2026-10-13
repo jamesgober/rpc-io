@@ -49,6 +49,9 @@ default = ["std"]
 # needs threads, clocks, and panic containment. Without `std` the crate is the
 # message model, the framings, and the correlation map, on `alloc` only.
 std = ["jsonx-lib/std"]
+# Spans for every call handled and events for what the endpoint does on its
+# own, through `tracing`. Off, the instrumentation compiles to nothing.
+tracing = ["std", "dep:tracing"]
 
 
 # DEPENDENCIES
@@ -56,6 +59,10 @@ std = ["jsonx-lib/std"]
 [dependencies]
 # The owner's JSON: borrowing parser, pull reader with raw slices, writer.
 jsonx-lib = { version = "0.2", default-features = false }
+# Optional, off by default: the `tracing` feature's instrumentation. The
+# ecosystem's standard facade (no runtime of its own); default features off,
+# so no proc-macro crate is pulled in.
+tracing = { version = "0.1.41", optional = true, default-features = false, features = ["std"] }
 
 
 # DEV DEPENDENCIES
