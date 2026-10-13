@@ -21,6 +21,64 @@
 
 ---
 
+## [0.3.0] — 2026-10-13
+
+Hardening, and the adapters around the engine: non-blocking output, self-firing deadlines, an async adapter, typed params, observability, protocol presets, serving helpers, and fuzz targets for every parser of untrusted input. Fixes every finding of the 2026-10-13 audit. See [`docs/release/v0.3.0.md`](./docs/release/v0.3.0.md).
+
+### Added
+
+- **Non-blocking output:** `Queued`, a `Sink` that frames messages into a bounded queue and writes them from its own thread; `outbox()`, the same queue drained by an async task (`OutboxSink` for the endpoint, `Outbox` with `poll_chunk`/`consume` for the writer); `QueueLimits` (`max_bytes` 64 MiB, `max_messages` 65,536, `write_timeout` 60 s). A provided `Sink::close`, called once when the endpoint closes.
+- **Self-firing deadlines:** a timer thread per connection, started with the first deadline, ends due requests with `TimedOut` and tells the peer, with no traffic and no waiter; `Config::timer` / `with_timer`.
+- **Async:** `Call` is a `Future`. `Endpoint::next_read`, `commit`, and `finish` (`run` taken apart, with `Next`) for any reader. The `futures-io` feature: `Endpoint::run_async`, `Outbox` as `AsyncRead` and `AsyncBufRead`, and `Outbox::write_to`.
+- **Typed params and results** (the `serde` feature): `Router::request_typed`, `Router::notification_typed`, `Params::deserialize`, `Raw::deserialize`, `Json::serialize`, `Peer::notify_typed`, `Peer::request_typed`, `Call::wait_typed`, `Responder::ok_typed`, `Serialize`/`Deserialize` for `Id` and `ErrorCode`; `Error::Serialize`; `Event::InvalidParams`.
+- **Observability:** `Stats` from `Endpoint::stats` and `Peer::stats` (traffic both ways, errors, timeouts, evictions, cancellations, panics, and the pending, in-flight, and held gauges). The `tracing` feature: a span per call and events for what the endpoint does on its own, never `params` or results; off, it compiles to nothing.
+- **Interceptor:** `Router::intercept`, run before every routed call, for authorization, rate limits, or an audit log; `Event::Refused`.
+- **Presets:** `Limits::lsp`, `mcp`, `network`, `strict`, and `without_batches` (`max_batch` 0 refuses any batch with "batches are not accepted", for MCP since 2025-06-18); `Config::lsp` and `Config::mcp`; `Gate::lsp` and `Gate::mcp`; `Gate::allow_request` and `allow_requests` (MCP's `ping` before `initialize`).
+- **Progress:** `Progress` (MCP `notifications/progress`) and `WorkDone` (LSP `$/progress` begin, report, end); `Params::progress_token` and `Params::work_done_token`.
+- **Serving** (the `net` feature): `Server`, an accept loop with one endpoint per connection over TCP and Unix domain sockets, bounded by `max_connections`, with a `Stopper` and `Connection`.
+- `Endpoint::run_with`, to read with a decoder the caller owns.
+- `Limits::max_skip_bytes` and `FrameError::TooLargeToSkip`: a Content-Length announcing more than can be skipped closes the connection.
+- `Config::max_held_bytes` (4 MiB) and `Error::Backlog`: a budget on messages held behind the gate.
+- `Decoder::with_read_chunk`, `read_chunk`, and `capacity`; `Framed::with_flush_threshold` and `flush_threshold`.
+- `ErrorCode::CONTENT_MODIFIED`, `SERVER_CANCELLED`, and `REQUEST_FAILED` (LSP).
+- Fuzz targets (`fuzz/`, cargo-fuzz) for Content-Length framing, newline framing, message decoding, batch decoding, and a live endpoint; their checks also run in `cargo test` on random, JSON-shaped, and mutated bytes (`tests/fuzz_harness.rs`).
+- The `tcp_server` example; the `endpoint/run_100k_queued` benchmark; integration tests for the output path, async adapter, typed params, protocols, observability, the server, and the public surface.
+- CI: no_std (`thumbv7em-none-eabihf`), 32-bit (`i686-unknown-linux-gnu`), fuzz smoke, semver, and coverage jobs; clippy for each optional feature alone.
+
+### Changed
+
+- `serve` writes through a `Queued` sink, from a writer thread, and returns once what is queued has been written.
+- A request reusing the id of one still being answered is refused under a `null` id (and reported as `Event::Invalid`), so the real answer stays the only response with that id.
+- `From<Error> for ErrorObject` turns `Error::Io` into "the transport failed", without the operating system's text.
+- `Endpoint::is_closed` and `Peer::is_closed` read a flag instead of taking the endpoint's lock.
+- The endpoint keeps its decoder between `run` calls.
+- The decoder reserves geometrically while a message grows, and its buffer, `Framed`'s, and the endpoint's encoding buffer shrink back after a large message.
+- Deferred requests are looked up without copying their ids.
+- `Router` notification handlers may refuse their params internally (for `notification_typed`); no public signature changed.
+- Optional dependencies, each behind an off-by-default feature: `serde` and `serde_json` (`serde`), `futures-io` (`futures-io`), `tracing` (`tracing`). The default build still depends on `jsonx-lib` alone. Dev-dependency: `serde` with `derive`.
+- The package leaves out `dev/`, `REPS.md`, `.github/`, and `fuzz/`.
+- `rustfmt.toml` drops its nightly-only keys, which warned on every stable `cargo fmt`.
+
+### Fixed
+
+- Resuming `run` after a handler stopped the endpoint lost the messages already read ahead (audit RPC-COR-01): they are kept and handled first.
+- Request deadlines did not fire while `run` was blocked reading (RPC-COR-03): the timer thread fires them.
+- A request reusing an in-flight id got a second response under that id (RPC-COR-02).
+- The blank line that ends a Content-Length header section counted against `max_header_bytes` when it arrived in pieces but not when it arrived whole, so the same stream was accepted or refused depending on read sizes. Found by the new fuzz harness; terminators now always count, as documented.
+- Documentation: the engine does not speak DAP (only the Content-Length framing applies to it), and only `lsp-lang` runs on the crate today (RPC-DOC-01, RPC-DOC-02); `decode`'s "validated in full" now names the early batch refusals (RPC-COR-04); the README's lock claim, `next_deadline`, `End::Stopped`, the "no notification gets a response" claim, the platform list, and the performance numbers match the code; README examples render on GitHub without hidden lines; internal references are gone from the public docs (RPC-CQ-04).
+
+### Security
+
+- A peer that stops reading no longer stalls every thread that touches the endpoint (RPC-SEC-01): with `Queued` (which `serve` and `Server` use) or `outbox`, writes leave the endpoint's lock, and the connection closes once the queue's byte, message, or time limit is reached.
+- Per-connection memory follows the current message, not the largest seen (RPC-SEC-02).
+- `Limits::network` and `Limits::strict` for remote peers, and the memory amplification of `Params::parse` documented (RPC-SEC-03).
+- OS error text no longer reaches the peer through `?` on an `Error::Io` (RPC-SEC-04).
+- Messages held behind the gate are bounded (RPC-SEC-05).
+- A huge announced Content-Length can close the connection instead of keeping it skipping (RPC-SEC-06).
+- Fuzz targets for every parser of untrusted input (RPC-STD-01, RPC-TST-01).
+
+---
+
 ## [0.2.0] - 2026-10-12
 
 The foundation: a working JSON-RPC 2.0 engine with Content-Length and newline framings, built on `jsonx-lib`. See [`docs/release/v0.2.0.md`](./docs/release/v0.2.0.md).
@@ -68,6 +126,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/rpc-io/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rpc-io/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/rpc-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/rpc-io/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/rpc-io/releases/tag/v0.1.0
