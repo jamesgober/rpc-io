@@ -692,6 +692,21 @@ impl Decoder {
         }
     }
 
+    /// A decoder for `framing` under `limits` that starts with the bytes this
+    /// one holds unread, when it stands between messages (as it does when a
+    /// handler stopped the endpoint); empty otherwise.
+    #[cfg(feature = "std")]
+    pub(crate) fn carried(&self, framing: Framing, limits: &Limits) -> Decoder {
+        let mut next = Decoder::new(framing, limits).with_read_chunk(self.chunk);
+        let between = self.failed.is_none() && self.state == Self::fresh(self.framing);
+        if between && self.start < self.end {
+            next.buf = self.buf[self.start..self.end].to_vec();
+            next.end = next.buf.len();
+            next.drained = false;
+        }
+        next
+    }
+
     /// Moves the buffered bytes to the start of the buffer.
     fn compact(&mut self) {
         if self.start > 0 {

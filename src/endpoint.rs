@@ -20,7 +20,7 @@ use crate::{
     config::{Cancellation, Config, Gate},
     error::{CallError, Error},
     error_object::{ErrorCode, ErrorObject, clip},
-    framing::{FrameError, Framing},
+    framing::{Decoder, FrameError, Framing},
     handles::{Peer, Responder},
     id::Id,
     limits::Limits,
@@ -70,7 +70,35 @@ pub enum End {
     /// The input ended cleanly between messages. The endpoint is closed.
     Eof,
     /// A handler called [`Context::stop`]. The endpoint is still open: the
-    /// caller can send more, [`close`](Endpoint::close) it, or drop it.
+    /// caller can send more, [`close`](Endpoint::close) it, drop it, or
+    /// resume reading. Bytes already read past the stopping message stay in
+    /// the endpoint, and the next [`run`](Endpoint::run) or
+    /// [`next_read`](Endpoint::next_read) handles them first.
+    Stopped,
+}
+
+/// What [`Endpoint::next_read`] needs next.
+///
+/// # Examples
+///
+/// ```
+/// use rpc_io::{Endpoint, Framing, Next, Router};
+///
+/// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+/// let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+/// match endpoint.next_read(Framing::Newline)? {
+///     Next::Read(buf) => assert!(!buf.is_empty()),
+///     Next::Stopped => unreachable!("nothing has run yet"),
+/// }
+/// # Ok::<(), rpc_io::Error>(())
+/// ```
+#[derive(Debug)]
+pub enum Next<'a> {
+    /// Read from the stream into this buffer, then call
+    /// [`commit`](Endpoint::commit) with the count (or
+    /// [`finish`](Endpoint::finish) when the stream has ended).
+    Read(&'a mut [u8]),
+    /// A handler called [`Context::stop`]; as [`End::Stopped`].
     Stopped,
 }
 
@@ -132,6 +160,8 @@ pub struct Endpoint<S, K: Sink> {
     parser: Parser,
     gate: Option<Gate>,
     cancellation: Option<Cancellation>,
+    /// The stream decoder, kept between reads so read-ahead is never lost.
+    input: Option<Decoder>,
 }
 
 impl<S, K: Sink> Endpoint<S, K> {
@@ -160,6 +190,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             parser: config.limits.parser(),
             gate: config.gate,
             cancellation: config.cancellation,
+            input: None,
         }
     }
 
@@ -185,6 +216,9 @@ impl<S, K: Sink> Endpoint<S, K> {
         self.parser = config.limits.parser();
         self.gate = config.gate;
         self.cancellation = config.cancellation;
+        if let Some(decoder) = self.input.take() {
+            self.input = Some(decoder.carried(decoder.framing(), &self.limits));
+        }
         self
     }
 
@@ -381,6 +415,12 @@ impl<S, K: Sink> Endpoint<S, K> {
     /// was never read); the connection carries on. When the input ends, the
     /// endpoint closes. Interrupted reads are retried.
     ///
+    /// The decoder lives in the endpoint: after [`End::Stopped`] the bytes
+    /// already read past the stopping message are kept, and calling `run`
+    /// again (with the same stream) handles them first. To read a different
+    /// stream, or to hand the read-ahead to other code, use
+    /// [`run_with`](Endpoint::run_with) and a decoder of your own.
+    ///
     /// # Errors
     ///
     /// [`Error::Frame`] when the input breaks its framing beyond recovery,
@@ -401,30 +441,192 @@ impl<S, K: Sink> Endpoint<S, K> {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn run<R: Read>(&mut self, mut input: R, framing: Framing) -> Result<End, Error> {
-        let result = self.read_loop(&mut input, framing);
-        match result {
-            Ok(End::Stopped) => {}
-            _ => self.close(),
+        let mut decoder = self.take_decoder(framing);
+        let result = self.read_loop(&mut decoder, &mut input);
+        self.settle_input(decoder, &result);
+        result
+    }
+
+    /// As [`run`](Endpoint::run), with a decoder the caller owns: for a stream
+    /// handed over from other code (with the bytes it already read in the
+    /// decoder), or to keep the read-ahead after the endpoint is done with
+    /// the stream. The endpoint's own decoder is not touched.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Endpoint::run).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{End, Endpoint, Framing, Limits, Router};
+    ///
+    /// let router = Router::new().notification("upgrade", |_: &mut (), _, cx| cx.stop());
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, ());
+    /// let mut decoder = Framing::Newline.decoder(&Limits::new());
+    /// let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"upgrade\"}\nraw bytes for the next owner";
+    /// assert_eq!(endpoint.run_with(&mut decoder, input)?, End::Stopped);
+    /// assert_eq!(decoder.buffered(), 28); // still there, for whoever reads next
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn run_with<R: Read>(&mut self, decoder: &mut Decoder, mut input: R) -> Result<End, Error> {
+        let result = self.read_loop(decoder, &mut input);
+        if !matches!(result, Ok(End::Stopped)) {
+            self.close();
         }
         result
     }
 
-    fn read_loop<R: Read>(&mut self, input: &mut R, framing: Framing) -> Result<End, Error> {
+    /// Handles every complete message already buffered, then says what is
+    /// needed next: bytes from the stream, read into the buffer it returns,
+    /// or nothing, because a handler stopped the endpoint.
+    ///
+    /// This, [`commit`](Endpoint::commit), and [`finish`](Endpoint::finish)
+    /// are [`run`](Endpoint::run) taken apart, for streams `run` cannot block
+    /// on: an async reader, a non-blocking socket, a poll loop. The read goes
+    /// straight into the endpoint's decoder, with no copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Endpoint::run); the endpoint is closed after any of them.
+    ///
+    /// # Examples
+    ///
+    /// The loop `run` runs, written out (the read can be any kind of read,
+    /// `.await`ed or not):
+    ///
+    /// ```
+    /// use std::io::Read;
+    /// use rpc_io::{End, Endpoint, Framed, Framing, Next, Router};
+    ///
+    /// let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    /// let mut endpoint = Endpoint::new(Framed::new(Vec::new(), Framing::Newline), router, ());
+    /// let mut input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    /// let end = loop {
+    ///     let buf = match endpoint.next_read(Framing::Newline)? {
+    ///         Next::Read(buf) => buf,
+    ///         Next::Stopped => break End::Stopped,
+    ///     };
+    ///     let n = input.read(buf).map_err(rpc_io::Error::Io)?;
+    ///     if n == 0 {
+    ///         break endpoint.finish()?;
+    ///     }
+    ///     endpoint.commit(n);
+    /// };
+    /// assert_eq!(end, End::Eof);
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn next_read(&mut self, framing: Framing) -> Result<Next<'_>, Error> {
+        if self.is_closed() {
+            self.input = None;
+            return Err(self.closed_error());
+        }
+        let mut decoder = self.take_decoder(framing);
+        match self.drain(&mut decoder, false) {
+            Ok(None) => Ok(Next::Read(self.input.insert(decoder).space())),
+            Ok(Some(_)) => {
+                self.input = Some(decoder);
+                Ok(Next::Stopped)
+            }
+            Err(error) => {
+                self.close();
+                Err(error)
+            }
+        }
+    }
+
+    /// Records that `n` bytes were read into the buffer the last
+    /// [`next_read`](Endpoint::next_read) returned. They are handled by the
+    /// next `next_read` (or [`finish`](Endpoint::finish)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Framing, Next, Router};
+    ///
+    /// let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, ());
+    /// let message = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    /// if let Next::Read(buf) = endpoint.next_read(Framing::Newline)? {
+    ///     buf[..message.len()].copy_from_slice(message);
+    /// }
+    /// endpoint.commit(message.len());
+    /// let _next = endpoint.next_read(Framing::Newline)?; // handles it
+    /// assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":"pong"}"#));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn commit(&mut self, n: usize) {
+        if let Some(decoder) = &mut self.input {
+            decoder.commit(n);
+        }
+    }
+
+    /// Ends the input: handles what is left buffered (a last line without
+    /// its `\n`), then closes the endpoint, unless a handler stops it first.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Endpoint::run): [`Error::Frame`] with
+    /// [`FrameError::Truncated`] if the stream ended inside a message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{End, Endpoint, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// assert_eq!(endpoint.finish()?, End::Eof);
+    /// assert!(endpoint.is_closed());
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn finish(&mut self) -> Result<End, Error> {
+        let Some(mut decoder) = self.input.take() else {
+            if self.is_closed() {
+                return Err(self.closed_error());
+            }
+            self.close();
+            return Ok(End::Eof);
+        };
+        let result = if self.is_closed() {
+            Err(self.closed_error())
+        } else {
+            self.drain(&mut decoder, true)
+                .map(|end| end.unwrap_or(End::Eof))
+        };
+        self.settle_input(decoder, &result);
+        result
+    }
+
+    /// The endpoint's decoder for `framing`, carrying over what a decoder of
+    /// another framing held unread.
+    fn take_decoder(&mut self, framing: Framing) -> Decoder {
+        match self.input.take() {
+            Some(decoder) if decoder.framing() == framing => decoder,
+            Some(decoder) => decoder.carried(framing, &self.limits),
+            None => framing.decoder(&self.limits),
+        }
+    }
+
+    /// Keeps the decoder after a stop; closes the endpoint after anything
+    /// else.
+    fn settle_input(&mut self, decoder: Decoder, result: &Result<End, Error>) {
+        if matches!(result, Ok(End::Stopped)) {
+            self.input = Some(decoder);
+        } else {
+            self.close();
+        }
+    }
+
+    fn read_loop<R: Read>(&mut self, decoder: &mut Decoder, input: &mut R) -> Result<End, Error> {
         if self.is_closed() {
             return Err(self.closed_error());
         }
-        let mut decoder = framing.decoder(&self.limits);
         loop {
-            loop {
-                let flow = match decoder.next_frame() {
-                    Ok(Some(body)) => self.handle(body)?,
-                    Ok(None) => break,
-                    Err(error) if error.is_recoverable() => self.oversized(error)?,
-                    Err(error) => return Err(Error::Frame(error)),
-                };
-                if flow == Flow::Stop {
-                    return Ok(End::Stopped);
-                }
+            if let Some(end) = self.drain(decoder, false)? {
+                return Ok(end);
             }
             let space = decoder.space();
             if space.is_empty() {
@@ -440,15 +642,26 @@ impl<S, K: Sink> Endpoint<S, K> {
             };
             decoder.commit(n);
         }
+        Ok(self.drain(decoder, true)?.unwrap_or(End::Eof))
+    }
+
+    /// Handles every complete message in `decoder` (at the end of the input
+    /// when `finishing`); `Some(End::Stopped)` if a handler stopped.
+    fn drain(&mut self, decoder: &mut Decoder, finishing: bool) -> Result<Option<End>, Error> {
         loop {
-            let flow = match decoder.finish() {
+            let next = if finishing {
+                decoder.finish()
+            } else {
+                decoder.next_frame()
+            };
+            let flow = match next {
                 Ok(Some(body)) => self.handle(body)?,
-                Ok(None) => return Ok(End::Eof),
+                Ok(None) => return Ok(None),
                 Err(error) if error.is_recoverable() => self.oversized(error)?,
                 Err(error) => return Err(Error::Frame(error)),
             };
             if flow == Flow::Stop {
-                return Ok(End::Stopped);
+                return Ok(Some(End::Stopped));
             }
         }
     }

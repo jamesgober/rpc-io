@@ -483,6 +483,184 @@ fn test_serve_stops_and_keeps_the_endpoint_open_on_stop() {
     assert_eq!(out.text(), "{\"jsonrpc\":\"2.0\",\"method\":\"bye\"}\n");
 }
 
+#[test]
+fn test_run_resumed_after_stop_handles_the_read_ahead() {
+    // Found by the audit (RPC-COR-01): the decoder reads ahead, and a second
+    // `run` after a handler stopped used to start from an empty decoder,
+    // losing every message read past the stop.
+    let router = Router::new()
+        .notification("pause", |_: &mut u32, _, cx| cx.stop())
+        .notification("count", |n, _, _| *n += 1);
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, 0u32);
+    let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"count\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"count\"}\n";
+    let mut reader = &input[..];
+    assert_eq!(
+        e.run(&mut reader, Framing::Newline).ok(),
+        Some(End::Stopped)
+    );
+    assert!(reader.is_empty(), "the reader was read ahead");
+    assert_eq!(*e.state(), 0);
+    assert_eq!(e.run(&mut reader, Framing::Newline).ok(), Some(End::Eof));
+    assert_eq!(*e.state(), 2);
+}
+
+#[test]
+fn test_read_ahead_carries_over_to_another_framing() {
+    let router = Router::new()
+        .notification("upgrade", |_: &mut Vec<String>, _, cx| cx.stop())
+        .notification("hello", |log, params, _| {
+            log.push(
+                params
+                    .raw()
+                    .map(|r| r.as_str().to_owned())
+                    .unwrap_or_default(),
+            );
+        });
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, Vec::new());
+    let mut input = b"{\"jsonrpc\":\"2.0\",\"method\":\"upgrade\"}\n".to_vec();
+    Framing::ContentLength.encode(
+        br#"{"jsonrpc":"2.0","method":"hello","params":[1]}"#,
+        &mut input,
+    );
+    let mut reader = input.as_slice();
+    assert_eq!(
+        e.run(&mut reader, Framing::Newline).ok(),
+        Some(End::Stopped)
+    );
+    assert_eq!(
+        e.run(&mut reader, Framing::ContentLength).ok(),
+        Some(End::Eof)
+    );
+    assert_eq!(e.state(), &["[1]"]);
+}
+
+#[test]
+fn test_next_read_commit_and_finish_drive_the_endpoint() {
+    use rpc_io::Next;
+    let router = Router::new()
+        .request("echo", |_: &mut (), params, _| {
+            Ok(params
+                .into_raw()
+                .map_or(rpc_io::Raw::NULL, rpc_io::Raw::into_owned))
+        })
+        .notification("exit", |_, _, cx| cx.stop());
+    let out = Shared::default();
+    let mut e = Endpoint::new(Framed::new(out.clone(), Framing::Newline), router, ());
+    // A last line without its `\n`, delivered three bytes at a time.
+    let wire = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"echo\",\"params\":[1]}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"echo\"}";
+    for chunk in wire.chunks(3) {
+        match e.next_read(Framing::Newline) {
+            Ok(Next::Read(buf)) => buf[..chunk.len()].copy_from_slice(chunk),
+            other => panic!("{other:?}"),
+        }
+        e.commit(chunk.len());
+    }
+    assert_eq!(e.finish().ok(), Some(End::Eof));
+    assert_eq!(
+        out.text(),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[1]}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}\n"
+    );
+    assert!(e.is_closed());
+    assert!(matches!(e.next_read(Framing::Newline), Err(Error::Closed)));
+    assert!(matches!(e.finish(), Err(Error::Closed)));
+    e.commit(5); // nothing to commit to: ignored
+}
+
+#[test]
+fn test_next_read_reports_a_stop_and_keeps_what_follows() {
+    use rpc_io::Next;
+    let router = Router::new()
+        .notification("exit", |_: &mut u32, _, cx| cx.stop())
+        .notification("n", |n, _, _| *n += 1);
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, 0u32);
+    let wire =
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n";
+    if let Ok(Next::Read(buf)) = e.next_read(Framing::Newline) {
+        buf[..wire.len()].copy_from_slice(wire);
+    }
+    e.commit(wire.len());
+    assert!(matches!(e.next_read(Framing::Newline), Ok(Next::Stopped)));
+    assert_eq!(*e.state(), 0);
+    assert!(matches!(e.next_read(Framing::Newline), Ok(Next::Read(_))));
+    assert_eq!(*e.state(), 1);
+    assert!(!e.is_closed());
+}
+
+#[test]
+fn test_next_read_closes_on_a_fatal_frame_error() {
+    use rpc_io::Next;
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, Router::<()>::new(), ());
+    let wire = b"Content-Length: x\r\n\r\n";
+    if let Ok(Next::Read(buf)) = e.next_read(Framing::ContentLength) {
+        buf[..wire.len()].copy_from_slice(wire);
+    }
+    e.commit(wire.len());
+    assert!(matches!(
+        e.next_read(Framing::ContentLength),
+        Err(Error::Frame(FrameError::InvalidContentLength))
+    ));
+    assert!(e.is_closed());
+}
+
+#[test]
+fn test_finish_inside_a_message_is_truncated() {
+    use rpc_io::Next;
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, Router::<()>::new(), ());
+    let wire = b"Content-Length: 10\r\n\r\n{}";
+    if let Ok(Next::Read(buf)) = e.next_read(Framing::ContentLength) {
+        buf[..wire.len()].copy_from_slice(wire);
+    }
+    e.commit(wire.len());
+    assert!(matches!(
+        e.finish(),
+        Err(Error::Frame(FrameError::Truncated))
+    ));
+    assert!(e.is_closed());
+}
+
+#[test]
+fn test_run_with_a_caller_decoder_leaves_the_endpoint_decoder_alone() {
+    let router = Router::new().notification("stop", |_: &mut (), _, cx| cx.stop());
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, ());
+    let mut decoder = Framing::Newline.decoder(&Limits::new());
+    let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"stop\"}\nrest";
+    assert_eq!(e.run_with(&mut decoder, input).ok(), Some(End::Stopped));
+    assert_eq!(decoder.buffered(), 4);
+    // A limits change keeps the endpoint's own (empty) state consistent.
+    let mut e = e.with_config(Config::new().with_limits(Limits::new().with_max_batch(2)));
+    assert_eq!(e.run(&b""[..], Framing::Newline).ok(), Some(End::Eof));
+    let mut decoder = Framing::Newline.decoder(&Limits::new());
+    assert!(matches!(
+        e.run_with(&mut decoder, &b""[..]),
+        Err(Error::Closed)
+    ));
+}
+
+#[test]
+fn test_config_change_after_a_stop_keeps_the_read_ahead() {
+    let router = Router::new()
+        .notification("stop", |_: &mut u32, _, cx| cx.stop())
+        .notification("n", |n, _, _| *n += 1);
+    let (tx, _rx) = mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, 0u32);
+    let input =
+        b"{\"jsonrpc\":\"2.0\",\"method\":\"stop\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n";
+    let mut reader = &input[..];
+    assert_eq!(
+        e.run(&mut reader, Framing::Newline).ok(),
+        Some(End::Stopped)
+    );
+    let mut e = e.with_config(Config::new());
+    assert_eq!(e.run(&mut reader, Framing::Newline).ok(), Some(End::Eof));
+    assert_eq!(*e.state(), 1);
+}
+
 // --- A client and a server over a pipe -----------------------------------------
 
 #[test]

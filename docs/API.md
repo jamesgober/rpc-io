@@ -189,6 +189,8 @@ One JSON-RPC connection: a [`Router`](#router), the state `S` its handlers work 
 | `with_sink(&self, f) -> R` | Runs `f` on the sink under the lock (to inspect a `Framed<Vec<u8>>`). |
 | `handle(&mut self, body: &[u8]) -> Result<Flow, Error>` | Handles one unframed body (a message or a batch). |
 | `run(&mut self, input: impl Read, framing) -> Result<End, Error>` | Reads and handles framed messages until the input ends or a handler stops. |
+| `run_with(&mut self, decoder: &mut Decoder, input) -> Result<End, Error>` | As `run`, with a decoder the caller owns (stream hand-off). |
+| `next_read(&mut self, framing) -> Result<Next, Error>`, `commit(&mut self, n)`, `finish(&mut self) -> Result<End, Error>` | `run` taken apart, for async and non-blocking readers: handle what is buffered, read into the returned buffer, commit the count. |
 | `close(&mut self)` | Closes: flushes, ends every `Call` with `Closed`, cancels deferred work. Idempotent. |
 | `is_closed(&self) -> bool` | Whether the connection has ended. |
 | `next_deadline(&self) -> Option<Instant>`, `expire(&self)` | Drive our requests' deadlines when not using `Call::wait`. |
@@ -212,7 +214,7 @@ assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"exit"}"#)?, Flow::Stop
 
 ### `Endpoint::run`
 
-A message over `Limits::max_message_bytes` is skipped without being buffered and answered with `-32600` under `null`; the session goes on. When the input ends, the endpoint closes. When a handler stops it, it stays open (bytes already read past the stopping message are dropped). Interrupted reads are retried. **Errors:** `Error::Frame` for a framing the input broke beyond recovery, `Error::Io`, `Error::Closed`; the endpoint is closed after any of them.
+A message over `Limits::max_message_bytes` is skipped without being buffered and answered with `-32600` under `null`; the session goes on. When the input ends, the endpoint closes. When a handler stops it, it stays open, and the bytes already read past the stopping message stay in the endpoint: the next `run` handles them first. Interrupted reads are retried. **Errors:** `Error::Frame` for a framing the input broke beyond recovery, `Error::Io`, `Error::Closed`; the endpoint is closed after any of them.
 
 ```rust
 use rpc_io::{End, Endpoint, Framed, Framing, Router};

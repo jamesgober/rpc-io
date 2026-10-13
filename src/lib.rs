@@ -129,7 +129,7 @@ pub use raw::{Json, Raw};
 pub use config::{Cancellation, Config, Gate};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use endpoint::{End, Endpoint, Flow, serve};
+pub use endpoint::{End, Endpoint, Flow, Next, serve};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use error::{CallError, Error};
