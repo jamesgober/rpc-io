@@ -21,6 +21,7 @@ fn shaped() -> impl Strategy<Value = Vec<u8>> {
         Just(&b",\"method\":\"ok\""[..]),
         Just(&b",\"method\":\"later\""[..]),
         Just(&b",\"method\":\"note\""[..]),
+        Just(&b",\"method\":\"ask\""[..]),
         Just(&b",\"method\":\"boom\""[..]),
         Just(&b",\"method\":\"$/cancelRequest\",\"params\":{\"id\":1}"[..]),
         Just(&b",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}"[..]),
@@ -111,6 +112,8 @@ const SEEDS: &[&[u8]] = &[
     b"\x0b\x02[{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ok\",\"params\":[1]},{\"jsonrpc\":\"2.0\",\"method\":\"note\"},7]\n",
     b"\x03\x09{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"a\":[1,2]}}\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"x\"}}\n",
     b"\x86\x11Content-Length: 3\r\ncontent-type: a\r\n\r\n[1]\r\nContent-Length: 2\r\n\r\n{}",
+    b"\x01\x03{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ask\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"later\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ok\"}\n",
+    b"\x00\x07Content-Length: 39\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ask\"}",
 ];
 
 /// Bytes worth inserting: JSON punctuation, line ends, digits, letters.

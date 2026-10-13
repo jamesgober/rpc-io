@@ -7,11 +7,16 @@
 //! framing), so a fuzzer explores those along with the payload.
 #![allow(dead_code)]
 
-use std::sync::mpsc;
+use std::{
+    collections::{HashMap, HashSet},
+    io::{self, Write},
+    sync::{Arc, Mutex, PoisonError, mpsc},
+    time::Duration,
+};
 
 use rpc_io::{
-    Config, Decoder, Endpoint, ErrorCode, FrameError, Framing, Incoming, Limits, Message,
-    Responder, Router, decode,
+    Config, Decoder, Endpoint, ErrorCode, Flow, FrameError, Framing, Incoming, Limits, Message,
+    Queued, Responder, Router, Sink, decode,
 };
 
 /// Splits off the first byte (0 when there is none).
@@ -187,6 +192,12 @@ fn hostile(panics: bool) -> Router<Vec<Responder>> {
         .deferred("now", |_, _, _, responder| {
             let _answered = responder.ok(1);
         })
+        .request("ask", |_, _, cx| {
+            // Our own request, cancelled when its deadline fires.
+            cx.request_with_timeout("question", (), Duration::from_millis(1))?
+                .detach();
+            Ok(())
+        })
         .notification("note", |_, _, cx| {
             let _sent = cx.notify("noted", ());
         })
@@ -202,41 +213,196 @@ fn hostile(panics: bool) -> Router<Vec<Responder>> {
     }
 }
 
-/// A live endpoint reading any bytes with either framing: never panics,
-/// ends, and sends only well-formed responses and the handlers'
-/// notifications.
+/// A writer whose bytes the check reads once the endpoint is gone.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The ids the peer's requests used: how many requests used each (an upper
+/// bound on the responses under it), and the ids of valid requests (each
+/// must be answered at least once).
+#[derive(Default)]
+struct Asked {
+    count: HashMap<String, usize>,
+    valid: HashSet<String>,
+}
+
+impl Asked {
+    fn note(&mut self, body: &[u8], limits: &Limits) {
+        let mut note = |entry: &rpc_io::Entry<'_>| match entry {
+            Ok(Message::Request(request)) => {
+                let id = request.id.to_string();
+                *self.count.entry(id.clone()).or_default() += 1;
+                let _new = self.valid.insert(id);
+            }
+            Ok(_) => {}
+            Err(invalid) => {
+                if let Some(id) = invalid.id() {
+                    *self.count.entry(id.to_string()).or_default() += 1;
+                }
+            }
+        };
+        match decode(body, limits) {
+            Incoming::Single(entry) => note(&entry),
+            Incoming::Batch(entries) => entries.iter().for_each(note),
+        }
+    }
+}
+
+/// Feeds `data` to `endpoint`, cut by its own framing: through `run` when
+/// `whole`, else frame by frame through `handle`. Notes every request
+/// framed, and returns whether each must have been answered (the input was
+/// read to its end and no handler stopped the endpoint).
+fn drive<K: Sink>(
+    endpoint: &mut Endpoint<Vec<Responder>, K>,
+    framing: Framing,
+    limits: &Limits,
+    data: &[u8],
+    whole: bool,
+    asked: &mut Asked,
+) -> bool {
+    if whole {
+        // `run` may stop early; the requests it was sent bound its answers.
+        for body in frames(framing.decoder(limits), data, usize::MAX)
+            .iter()
+            .flatten()
+        {
+            asked.note(body, limits);
+        }
+        let _ended = endpoint.run(data, framing);
+        return false;
+    }
+    let mut decoder = framing.decoder(limits);
+    let mut rest = data;
+    loop {
+        loop {
+            let body = match decoder.next_frame() {
+                Ok(Some(body)) => body,
+                Ok(None) => break,
+                Err(error) if error.is_recoverable() => continue,
+                Err(_) => return false,
+            };
+            asked.note(body, limits);
+            if !matches!(endpoint.handle(body), Ok(Flow::Continue)) {
+                return false;
+            }
+        }
+        if rest.is_empty() {
+            break;
+        }
+        let n = decoder.feed(rest);
+        rest = &rest[n..];
+    }
+    while let Ok(Some(body)) = decoder.finish() {
+        asked.note(body, limits);
+        if !matches!(endpoint.handle(body), Ok(Flow::Continue)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A live endpoint reading any bytes with either framing, over a channel
+/// (deadlines checked as it goes) or a `Queued` writer thread (with the
+/// timer thread). It never panics and ends; sends only well-formed
+/// responses, its own requests, and notifications it may send; answers no
+/// id more often than requests used it; and, when it read all the input,
+/// answers every valid request at least once (except a deferred request the
+/// peer cancelled under MCP, which gets no answer).
 pub fn endpoint(data: &[u8], panics: bool) {
     let (knob, data) = take(data);
+    let (mode, data) = take(data);
     let framing = if knob & 1 == 0 {
         Framing::ContentLength
     } else {
         Framing::Newline
     };
-    let mut config = Config::new()
-        .with_limits(limits(knob).with_max_message_bytes(4096))
-        .with_timer(false);
+    let limits = limits(knob).with_max_message_bytes(4096);
+    let queued = mode & 3 == 3;
+    let mut config = Config::new().with_limits(limits).with_timer(queued);
     if knob & 2 != 0 {
         config = config.with_gate(Some(rpc_io::Gate::new("ok").allow("note")));
     }
-    if knob & 4 != 0 {
+    let mcp = knob & 4 != 0;
+    if mcp {
         config = config.with_cancellation(Some(rpc_io::Cancellation::mcp()));
     }
-    let (tx, rx) = mpsc::channel::<String>();
-    let mut endpoint = Endpoint::new(tx, hostile(panics), Vec::new()).with_config(config);
-    let _ended = endpoint.run(data, framing);
-    endpoint.state_mut().clear(); // answers every deferred request
-    drop(endpoint);
-    for sent in rx.try_iter() {
+    let mut asked = Asked::default();
+    let whole = mode & 4 != 0;
+    let (complete, sent) = if queued {
+        let captured = Captured::default();
+        let Ok(sink) = Queued::new(captured.clone(), framing) else {
+            return; // no thread to write with: nothing to check
+        };
+        let mut endpoint = Endpoint::new(sink, hostile(panics), Vec::new()).with_config(config);
+        let complete = drive(&mut endpoint, framing, &limits, data, whole, &mut asked);
+        endpoint.state_mut().clear(); // answers every deferred request
+        drop(endpoint); // and waits for the writer to drain
+        let bytes = captured
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let sent = frames(framing.decoder(&Limits::new()), &bytes, usize::MAX)
+            .into_iter()
+            .map(|frame| match frame {
+                Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+                Err(error) => panic!("the writer framed badly: {error}"),
+            })
+            .collect::<Vec<_>>();
+        (complete, sent)
+    } else {
+        let (tx, rx) = mpsc::channel::<String>();
+        let mut endpoint = Endpoint::new(tx, hostile(panics), Vec::new()).with_config(config);
+        let complete = drive(&mut endpoint, framing, &limits, data, whole, &mut asked);
+        endpoint.state_mut().clear();
+        drop(endpoint);
+        (complete, rx.try_iter().collect())
+    };
+    let mut answered: HashMap<String, usize> = HashMap::new();
+    let mut count = |id: Option<&rpc_io::Id<'_>>| {
+        if let Some(id) = id {
+            *answered.entry(id.to_string()).or_default() += 1;
+        }
+    };
+    for sent in &sent {
         match decode(sent.as_bytes(), &Limits::new()) {
-            Incoming::Single(Ok(Message::Response(_))) => {}
-            Incoming::Single(Ok(Message::Notification(n))) => assert_eq!(n.method, "noted"),
-            Incoming::Batch(entries) => assert!(
-                entries
-                    .iter()
-                    .all(|e| matches!(e, Ok(Message::Response(_)))),
+            Incoming::Single(Ok(Message::Response(r))) => count(r.id.as_ref()),
+            Incoming::Single(Ok(Message::Request(r))) => assert_eq!(r.method, "question"),
+            Incoming::Single(Ok(Message::Notification(n))) => assert!(
+                ["noted", "$/cancelRequest", "notifications/cancelled"].contains(&&*n.method),
                 "{sent}"
             ),
+            Incoming::Batch(entries) => {
+                for entry in &entries {
+                    match entry {
+                        Ok(Message::Response(r)) => count(r.id.as_ref()),
+                        other => panic!("a batch answer holds {other:?}: {sent}"),
+                    }
+                }
+            }
             other => panic!("sent {other:?}: {sent}"),
+        }
+    }
+    for (id, n) in &answered {
+        let limit = asked.count.get(id).copied().unwrap_or(0);
+        assert!(*n <= limit, "{n} answers to id {id}, used {limit} times");
+    }
+    if complete && !mcp {
+        for id in &asked.valid {
+            assert!(answered.contains_key(id), "request {id} was never answered");
         }
     }
 }
