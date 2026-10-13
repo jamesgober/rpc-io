@@ -93,6 +93,10 @@ impl From<Error> for ErrorObject {
     /// An `-32603` internal error saying what failed, so a handler can apply
     /// `?` to a send through its [`Context`](crate::Context).
     ///
+    /// An [`Error::Io`] says only that the transport failed: the operating
+    /// system's text (which can name paths and hosts) stays on this side. Log
+    /// the [`Error`] itself for the detail.
+    ///
     /// # Examples
     ///
     /// ```
@@ -101,9 +105,15 @@ impl From<Error> for ErrorObject {
     /// let e = ErrorObject::from(Error::Closed);
     /// assert_eq!(e.code(), ErrorCode::INTERNAL_ERROR);
     /// assert_eq!(e.message(), "the connection is closed");
+    ///
+    /// let io = std::io::Error::other("C:\\secret\\path is locked");
+    /// assert_eq!(ErrorObject::from(Error::Io(io)).message(), "the transport failed");
     /// ```
     fn from(error: Error) -> Self {
-        ErrorObject::internal_error(error.to_string())
+        match error {
+            Error::Io(_) => ErrorObject::internal_error("the transport failed"),
+            other => ErrorObject::internal_error(other.to_string()),
+        }
     }
 }
 
