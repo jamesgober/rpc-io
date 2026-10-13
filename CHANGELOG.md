@@ -49,7 +49,7 @@ Hardening, and the adapters around the engine: non-blocking output, self-firing 
 ### Changed
 
 - `serve` writes through a `Queued` sink, from a writer thread, and returns once what is queued has been written (for at most `close_timeout`).
-- Dropping a `Call` before its outcome cancels the request: its pending slot is freed and the peer is sent the cancel notification. `Call::detach` keeps the 0.2 behaviour.
+- Dropping a `Call` before its outcome cancels the request: its pending slot is freed and the peer is sent the cancel notification. `Call` is `#[must_use]`, so a request whose `Call` is discarded (`peer.request(..)?;`, which in 0.2 sent it and ignored the answer) warns at compile time; `Call::detach` keeps the 0.2 behaviour.
 - Typed-param errors quote at most 256 bytes of `serde`'s message.
 - A request reusing the id of one still being answered is refused under a `null` id (and reported as `Event::Invalid`), so the real answer stays the only response with that id.
 - `From<Error> for ErrorObject` turns `Error::Io` into "the transport failed", without the operating system's text.

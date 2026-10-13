@@ -311,6 +311,7 @@ impl fmt::Debug for Peer {
 /// assert_eq!(call.wait().map(|raw| raw.as_str().to_owned()), Ok("[42]".to_owned()));
 /// # Ok::<(), rpc_io::Error>(())
 /// ```
+#[must_use = "dropping a Call cancels the request; call .detach() to let it run"]
 pub struct Call {
     id: u64,
     outcome: Arc<Slot>,
@@ -441,7 +442,7 @@ impl Call {
     /// let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
     /// endpoint.peer().request("index", ())?.detach();
     /// assert_eq!(endpoint.stats().pending, 1); // still outstanding
-    /// endpoint.peer().request("cancel me", ())?; // dropped: cancelled
+    /// drop(endpoint.peer().request("cancel me", ())?); // cancelled
     /// assert_eq!(endpoint.stats().pending, 1);
     /// assert_eq!(rx.try_iter().count(), 3); // two requests, one cancel
     /// # Ok::<(), rpc_io::Error>(())
