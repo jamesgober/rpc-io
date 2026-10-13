@@ -15,7 +15,7 @@ use serde::{
 
 use crate::{
     error::{CallError, Error},
-    error_object::{ErrorCode, ErrorObject},
+    error_object::{ErrorCode, ErrorObject, clip_to},
     handles::{Call, Peer, Responder},
     id::Id,
     raw::{Json, Raw},
@@ -23,8 +23,11 @@ use crate::{
 };
 
 /// The `INVALID_PARAMS` error for a value that does not fit its type.
+/// `serde_json` quotes the offending value, which the peer chose: the text is
+/// clipped, as every peer-controlled text the crate repeats is.
 fn mismatch(error: &serde_json::Error) -> ErrorObject {
-    ErrorObject::invalid_params(format!("invalid params: {error}"))
+    let text = error.to_string();
+    ErrorObject::invalid_params(format!("invalid params: {}", clip_to(&text, 256)))
 }
 
 impl Params<'_> {

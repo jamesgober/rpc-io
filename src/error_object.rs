@@ -324,11 +324,16 @@ impl From<jsonx_lib::Error> for ErrorObject {
 /// At most the first 128 bytes of `text` (on a character boundary), with an
 /// ellipsis when cut, so peer-controlled text quoted in a message stays short.
 pub(crate) fn clip(text: &str) -> Cow<'_, str> {
-    const MAX: usize = 128;
-    if text.len() <= MAX {
+    clip_to(text, 128)
+}
+
+/// At most the first `max` bytes of `text` (on a character boundary), with an
+/// ellipsis when cut.
+pub(crate) fn clip_to(text: &str, max: usize) -> Cow<'_, str> {
+    if text.len() <= max {
         return Cow::Borrowed(text);
     }
-    let mut end = MAX;
+    let mut end = max;
     while !text.is_char_boundary(end) {
         end -= 1;
     }

@@ -234,3 +234,18 @@ fn test_ids_and_codes_through_serde() {
     let json = rpc_io::Json::serialize(&cancel).map(|j| j.to_string());
     assert_eq!(json.ok().as_deref(), Some(r#"{"id":"r-1","code":-32800}"#));
 }
+
+#[test]
+fn test_a_mismatch_quoting_a_huge_value_is_clipped() {
+    // Found by the verifier (RPC2-005): serde's message quotes the value
+    // that did not fit, so a 100,000-byte string came back whole.
+    let (mut e, rx) = endpoint(router(), Vec::new());
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{{"textDocument":{{"uri":7}},"position":"{}"}}}}"#,
+        "A".repeat(100_000)
+    );
+    assert!(e.handle(body.as_bytes()).is_ok());
+    let replies = sent(&rx);
+    assert!(replies[0].len() < 600, "{} bytes", replies[0].len());
+    assert!(replies[0].contains("-32602"));
+}
