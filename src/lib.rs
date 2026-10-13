@@ -117,6 +117,8 @@ mod router;
 mod sink;
 #[cfg(feature = "std")]
 mod slot;
+#[cfg(feature = "std")]
+mod stats;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};
@@ -149,6 +151,9 @@ pub use router::{Context, Event, Params, Router};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use sink::{Framed, Sink};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use stats::Stats;
 
 /// Compiles and runs the `rust` code blocks in `README.md` and `docs/API.md` as
 /// part of `cargo test`, so the published examples cannot drift from the API.

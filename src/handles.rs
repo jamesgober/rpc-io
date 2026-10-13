@@ -24,6 +24,7 @@ use crate::{
     link::Link,
     raw::{Json, Raw},
     slot::{Outcome, Slot},
+    stats::Stats,
 };
 
 /// A flag that says a request was cancelled.
@@ -244,6 +245,27 @@ impl Peer {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.link.is_closed()
+    }
+
+    /// The connection's counters and gauges; see [`Stats`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// let peer = endpoint.peer();
+    /// peer.notify("hello", ())?;
+    /// let _call = peer.request("ask", ())?;
+    /// let stats = peer.stats();
+    /// assert_eq!((stats.notifications_out, stats.requests_out, stats.pending), (1, 1, 1));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        self.link.stats()
     }
 }
 

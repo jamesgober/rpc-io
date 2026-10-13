@@ -32,6 +32,7 @@ use crate::{
     raw::{Json, Raw},
     router::{Context, Event, EventFn, Params, RequestHandler, Router},
     sink::Sink,
+    stats::{Stats, Tally},
 };
 
 /// Whether to keep going after a message.
@@ -368,6 +369,25 @@ impl<S, K: Sink> Endpoint<S, K> {
         self.shared.lock().expire();
     }
 
+    /// The connection's counters and gauges; see [`Stats`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// endpoint.handle(b"{oops")?;
+    /// let stats = endpoint.stats();
+    /// assert_eq!((stats.bodies_in, stats.invalid_in, stats.errors_out), (1, 1, 1));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        self.shared.lock().stats()
+    }
+
     /// Handles one message body (a message or a batch, unframed): routes
     /// calls to handlers, answers requests, settles answers to our requests.
     /// Everything sent during it is flushed before it returns.
@@ -392,9 +412,10 @@ impl<S, K: Sink> Endpoint<S, K> {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn handle(&mut self, body: &[u8]) -> Result<Flow, Error> {
-        self.begin_turn()?;
+        let incoming = decode(body, &self.limits);
+        self.begin_turn(&tally(&incoming, body.len()))?;
         let mut stop = false;
-        match decode(body, &self.limits) {
+        match incoming {
             Incoming::Single(entry) => self.dispatch(entry, None, &mut stop),
             Incoming::Batch(entries) => {
                 let owed = entries.iter().filter(|entry| owes_response(entry)).count();
@@ -669,7 +690,10 @@ impl<S, K: Sink> Endpoint<S, K> {
 
     /// Answers a message the framing skipped as too large.
     fn oversized(&mut self, error: FrameError) -> Result<Flow, Error> {
-        self.begin_turn()?;
+        self.begin_turn(&Tally {
+            invalid: 1,
+            ..Tally::default()
+        })?;
         let answer = ErrorObject::invalid_request(format!("the message is too large: {error}"));
         self.answer(None, None, &Err(&answer));
         report(
@@ -690,11 +714,12 @@ impl<S, K: Sink> Endpoint<S, K> {
             .map_or(Error::Closed, Error::Io)
     }
 
-    fn begin_turn(&self) -> Result<(), Error> {
+    fn begin_turn(&self, tally: &Tally) -> Result<(), Error> {
         let mut inner = self.shared.lock();
         if inner.is_closed() {
             return Err(inner.take_broken().map_or(Error::Closed, Error::Io));
         }
+        inner.take_in(tally);
         inner.endpoint_thread = Some(thread::current().id());
         inner.cork();
         inner.expire();
@@ -770,6 +795,7 @@ impl<S, K: Sink> Endpoint<S, K> {
                     Ok(Ok(value)) => Ok(value),
                     Ok(Err(refusal)) => Err(refusal),
                     Err(payload) => {
+                        self.shared.lock().count_panic();
                         report(
                             &mut self.router.on_event,
                             &mut self.state,
@@ -801,6 +827,7 @@ impl<S, K: Sink> Endpoint<S, K> {
                 // A panic drops the responder while unwinding, which answers
                 // the request with `INTERNAL_ERROR`.
                 if let Err(payload) = contain(|| handler(state, params, &mut cx, responder)) {
+                    self.shared.lock().count_panic();
                     report(
                         &mut self.router.on_event,
                         &mut self.state,
@@ -891,6 +918,7 @@ impl<S, K: Sink> Endpoint<S, K> {
         let state = &mut self.state;
         let mut cx = Context::new(&self.link, stop, None, &method);
         if let Err(payload) = contain(|| handler(state, params, &mut cx)) {
+            self.shared.lock().count_panic();
             report(
                 &mut self.router.on_event,
                 &mut self.state,
@@ -1067,6 +1095,26 @@ fn panic_message(payload: &(dyn Any + Send)) -> Cow<'_, str> {
     } else {
         Cow::Borrowed("(a panic payload that is not text)")
     }
+}
+
+/// What `incoming`, decoded from `bytes` bytes, holds, for the counters.
+fn tally(incoming: &Incoming<'_>, bytes: usize) -> Tally {
+    let mut tally = Tally {
+        body: true,
+        bytes,
+        ..Tally::default()
+    };
+    let mut count = |entry: &Entry<'_>| match entry {
+        Ok(Message::Request(_)) => tally.requests += 1,
+        Ok(Message::Notification(_)) => tally.notifications += 1,
+        Ok(Message::Response(_)) => tally.responses += 1,
+        Err(_) => tally.invalid += 1,
+    };
+    match incoming {
+        Incoming::Single(entry) => count(entry),
+        Incoming::Batch(entries) => entries.iter().for_each(count),
+    }
+    tally
 }
 
 /// Tells the event hook, if any; a panic in it is contained and ignored.

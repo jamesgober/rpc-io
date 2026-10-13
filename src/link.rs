@@ -40,6 +40,7 @@ use crate::{
     raw::Json,
     sink::Sink,
     slot::{self, Outcome, Slot, Waiter},
+    stats::{Stats, Tally, bump},
     text,
 };
 
@@ -64,6 +65,7 @@ pub(crate) trait Link: Send + Sync {
     ) -> Result<(), Error>;
     fn on_endpoint_thread(&self) -> bool;
     fn is_closed(&self) -> bool;
+    fn stats(&self) -> Stats;
 }
 
 /// A request just sent: its id, where its outcome arrives, its deadline.
@@ -108,6 +110,7 @@ impl<K: Sink> Shared<K> {
                 held: Vec::new(),
                 held_bytes: 0,
                 held_requests: BTreeSet::new(),
+                stats: Stats::default(),
                 settings: Settings::from(config),
                 epoch: Instant::now(),
                 endpoint_thread: None,
@@ -170,6 +173,10 @@ impl<K: Sink> Link for Shared<K> {
 
     fn is_closed(&self) -> bool {
         Shared::is_closed(self)
+    }
+
+    fn stats(&self) -> Stats {
+        self.lock().stats()
     }
 }
 
@@ -371,6 +378,8 @@ pub(crate) struct Inner<K> {
     /// Ids of our requests in `held` and not abandoned since: lookups stay
     /// `O(log n)` however much is held.
     held_requests: BTreeSet<u64>,
+    /// The counters; the gauges are filled in by `stats`.
+    stats: Stats,
     pub(crate) settings: Settings,
     epoch: Instant,
     /// The thread inside the endpoint's `handle` or `run`, if any.
@@ -384,6 +393,27 @@ impl<K: Sink> Inner<K> {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// A snapshot of the counters, with the gauges as they are now.
+    pub(crate) fn stats(&self) -> Stats {
+        Stats {
+            pending: self.pending.len(),
+            in_flight: self.in_flight.len(),
+            held: self.held.len(),
+            ..self.stats
+        }
+    }
+
+    /// Counts an incoming body (or, with `tally.body` unset, a message the
+    /// framing skipped).
+    pub(crate) fn take_in(&mut self, tally: &Tally) {
+        self.stats.take_in(tally);
+    }
+
+    /// Counts a contained handler panic.
+    pub(crate) fn count_panic(&mut self) {
+        bump(&mut self.stats.panics);
     }
 
     /// Replaces the settings and the capacity of the pending map (kept if
@@ -527,6 +557,14 @@ impl<K: Sink> Inner<K> {
             });
             return Ok(());
         }
+        bump(&mut self.stats.bodies_out);
+        self.stats.bytes_out = self.stats.bytes_out.wrapping_add(self.scratch.len() as u64);
+        match sending {
+            Sending::Request(_) => bump(&mut self.stats.requests_out),
+            Sending::Notification => bump(&mut self.stats.notifications_out),
+            // Counted one by one in `respond`, batch elements included.
+            Sending::Response => {}
+        }
         let mut sent = guard(|| self.sink.send(&self.scratch));
         // Inside a turn the endpoint flushes once at its end; a message from
         // any other thread (a worker answering, a progress report) must not
@@ -621,6 +659,15 @@ impl<K: Sink> Inner<K> {
     /// Ends a request removed from `pending` without an answer: tells the peer
     /// to stop (unless it was never sent), and tells the waiter why.
     fn abandon(&mut self, id: u64, waiter: Waiter, reason: CallError) {
+        match reason {
+            CallError::TimedOut => {
+                bump(&mut self.stats.timed_out);
+            }
+            CallError::Evicted => {
+                bump(&mut self.stats.evicted);
+            }
+            _ => bump(&mut self.stats.cancelled_out),
+        }
         // Never sent: its held body is skipped when the gate opens, and the
         // peer has nothing to cancel.
         if !self.held_requests.remove(&id) && !self.closed {
@@ -655,6 +702,10 @@ impl<K: Sink> Inner<K> {
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
+        }
+        bump(&mut self.stats.responses_out);
+        if result.is_err() {
+            bump(&mut self.stats.errors_out);
         }
         self.scratch.clear();
         write_response(&mut self.scratch, id, result);
@@ -713,7 +764,10 @@ impl<K: Sink> Inner<K> {
                     continue;
                 }
                 self.scratch = message.body;
-                if self.deliver(Sending::Notification).is_err() {
+                let sending = message
+                    .request
+                    .map_or(Sending::Notification, Sending::Request);
+                if self.deliver(sending).is_err() {
                     break;
                 }
             }
@@ -787,6 +841,7 @@ impl<K: Sink> Inner<K> {
         let Some(request) = self.in_flight.remove(id) else {
             return false;
         };
+        bump(&mut self.stats.cancelled_in);
         request.token.cancel();
         let reply = self.settings.cancellation.as_ref().and_then(|c| c.reply);
         let _sent = match reply {
