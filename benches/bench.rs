@@ -5,7 +5,7 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use rpc_io::{Endpoint, Framed, Framing, Incoming, Limits, Pending, Raw, Router, decode};
+use rpc_io::{Endpoint, Framed, Framing, Incoming, Limits, Pending, Queued, Raw, Router, decode};
 
 const MESSAGES: usize = 100_000;
 
@@ -150,6 +150,24 @@ fn bench_endpoint(c: &mut Criterion) {
                 )
             },
             |mut endpoint| {
+                let _end = endpoint.run(wire.as_slice(), Framing::ContentLength);
+                black_box(*endpoint.state())
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    // Through the non-blocking output path: the writer thread does the
+    // writes, and dropping the endpoint waits for it to finish them.
+    group.bench_function("run_100k_queued", |b| {
+        b.iter_batched(
+            || {
+                let sink = Queued::new(std::io::sink(), Framing::ContentLength);
+                sink.map(|sink| Endpoint::new(sink, hover_router(), 0))
+            },
+            |endpoint| {
+                let Ok(mut endpoint) = endpoint else {
+                    return black_box(0);
+                };
                 let _end = endpoint.run(wire.as_slice(), Framing::ContentLength);
                 black_box(*endpoint.state())
             },
