@@ -306,3 +306,44 @@ fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
     drop(release);
     assert!(closer.join().is_ok());
 }
+
+/// A writer that takes a few bytes per write, slowly but steadily.
+struct Trickle(Shared);
+
+impl Write for Trickle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        thread::sleep(Duration::from_millis(5));
+        self.0.write(&buf[..buf.len().min(64)])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_a_slow_steady_reader_is_not_timed_out() {
+    // Found by the verifier (RPC2-004): the write timeout counted from the
+    // start of a batch, so a peer that kept reading, slowly, was cut off.
+    let written = Shared::default();
+    let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(100)));
+    let sink = Queued::with_limits(Trickle(written.clone()), Framing::Newline, limits);
+    let Ok(sink) = sink else {
+        panic!("no writer thread")
+    };
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    let peer = endpoint.peer();
+    let big = "x".repeat(4096); // ~64 writes of 64 bytes: ~320 ms, past the timeout
+    assert!(peer.notify("big", jsonx_lib::json!([big])).is_ok());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(400) {
+        assert!(
+            peer.notify("small", ()).is_ok(),
+            "a steady reader was cut off"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(peer);
+    drop(endpoint);
+    assert!(written.text().contains("small"));
+}

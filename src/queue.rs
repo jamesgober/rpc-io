@@ -23,6 +23,10 @@ use crate::{
 /// A drained buffer grown past this by one large batch is released.
 const KEEP: usize = 64 * 1024;
 
+/// The writer thread hands the writer at most this much at a time, so that
+/// progress is seen (and the no-progress timeout restarted) as it is made.
+const WRITE_CHUNK: usize = 64 * 1024;
+
 /// How long a closing [`Queued`] sleeps between checks on its writer.
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
@@ -33,14 +37,21 @@ const DRAIN_POLL: Duration = Duration::from_millis(50);
 /// |---|---:|---|
 /// | `max_bytes` | 64 MiB | framed bytes queued or being written |
 /// | `max_messages` | 65,536 | messages queued or being written |
-/// | `write_timeout` | 60 s | how long one batch may take to write |
+/// | `write_timeout` | 60 s | how long the writer may go without any byte being written |
 /// | `close_timeout` | 10 s | how long closing waits for the queue to drain |
 ///
 /// A message that would take the queue past `max_bytes` or `max_messages`
 /// fails the queue (one message is always taken when the queue is empty, so
-/// a single large message still goes out). So does any send once a batch
-/// has been writing for longer than `write_timeout`. A failed queue refuses
-/// everything with the same I/O error, which closes the endpoint.
+/// a single large message still goes out). `write_timeout` is a no-progress
+/// timeout: the writer writes at most 64 KiB at a time and every byte the
+/// peer takes restarts it, so a slow but steady reader is never cut off. It
+/// is checked whenever a message is sent, the endpoint flushes, or the queue
+/// closes (a writer blocked in a write cannot check it itself; give the
+/// writer a write timeout of its own, as [`Server`](crate::Server) does with
+/// its sockets, to have the write itself fail). A failed queue refuses
+/// everything with the same I/O error, which closes the endpoint. A peer that
+/// stops reading therefore costs at most `max_bytes` of memory, and the
+/// connection is closed by the first send after `write_timeout`.
 ///
 /// `#[non_exhaustive]`: start from [`QueueLimits::new`] and chain `with_*`.
 ///
@@ -62,7 +73,8 @@ pub struct QueueLimits {
     pub max_bytes: usize,
     /// Most messages queued or being written.
     pub max_messages: usize,
-    /// The longest one batch may take to write; `None` waits forever.
+    /// The longest the writer may go without writing a byte while it has
+    /// bytes to write; `None` waits forever.
     pub write_timeout: Option<Duration>,
     /// The longest closing waits for what is queued to be written, after
     /// which the writer is left to finish (or fail) on its own.
@@ -281,6 +293,14 @@ impl Core {
         true
     }
 
+    /// Records that the writer wrote some bytes.
+    fn progress(&self) {
+        let mut state = self.lock();
+        if state.progressed.is_some() {
+            state.progressed = Some(Instant::now());
+        }
+    }
+
     /// Bytes and messages queued or being written.
     fn pending(&self) -> (usize, usize) {
         let state = self.lock();
@@ -351,8 +371,9 @@ fn recycle(batch: &mut Vec<u8>) {
 /// byte stream from its own thread.
 ///
 /// A send never waits on the peer: the endpoint's lock covers framing a
-/// message into the queue, and the writer thread does the `write_all` and
-/// one `flush` per batch of queued messages without it. A peer that stops reading therefore stalls no sender: the queue grows
+/// message into the queue, and the writer thread does the writes (in chunks
+/// of at most 64 KiB) and one `flush` per batch of queued messages without
+/// it. A peer that stops reading therefore stalls no sender: the queue grows
 /// to its [`QueueLimits`], then the connection closes. This is the sink
 /// [`serve`] uses, and the one to use for any peer that might be slow.
 ///
@@ -582,7 +603,7 @@ fn write_loop<W: Write>(core: &Core, mut writer: W) {
             state.take(&mut batch);
         }
         let written = panic::catch_unwind(AssertUnwindSafe(|| {
-            writer.write_all(&batch)?;
+            write_chunks(core, &mut writer, &batch)?;
             writer.flush()
         }))
         .unwrap_or_else(|_| Err(io::Error::other("the writer panicked")));
@@ -599,13 +620,38 @@ fn write_loop<W: Write>(core: &Core, mut writer: W) {
     }
 }
 
+/// Writes all of `batch`, at most [`WRITE_CHUNK`] bytes per call, recording
+/// progress after each write that took bytes.
+fn write_chunks<W: Write>(core: &Core, writer: &mut W, batch: &[u8]) -> io::Result<()> {
+    let mut rest = batch;
+    while !rest.is_empty() {
+        let chunk = &rest[..rest.len().min(WRITE_CHUNK)];
+        match writer.write(chunk) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the writer accepted no bytes",
+                ));
+            }
+            Ok(n) => {
+                rest = &rest[n..];
+                core.progress();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// A sink whose messages an async task writes: the two halves of a bounded
 /// outgoing queue.
 ///
 /// The [`OutboxSink`] goes into the [`Endpoint`](crate::Endpoint); the
 /// [`Outbox`] goes to a task that writes what it yields to the peer, on any
 /// executor. A send never waits on the peer, and the queue is bounded by
-/// `limits`, as for [`Queued`]. When the endpoint closes, the outbox yields what is left,
+/// `limits`, as for [`Queued`] (`write_timeout` counts from the last
+/// [`consume`](Outbox::consume) that took bytes). When the endpoint closes, the outbox yields what is left,
 /// then ends; when the outbox is dropped, the sink fails, which closes the
 /// endpoint.
 ///
@@ -773,6 +819,9 @@ impl Outbox {
     /// See [`poll_chunk`](Outbox::poll_chunk).
     pub fn consume(&mut self, n: usize) {
         self.at = self.at.saturating_add(n).min(self.batch.len());
+        if n > 0 {
+            self.core.progress();
+        }
     }
 
     /// Framed bytes queued or being written.
