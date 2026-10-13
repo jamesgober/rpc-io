@@ -157,6 +157,8 @@ For any input, an [`Endpoint`](#endpoint):
 
 Request ids are strings or integers within `i64`. JSON-RPC 2.0 also allows `null` and fractions; LSP and MCP forbid them, and so does this crate: such a request is refused with `-32600` under `null`. Ids compare by value (`7` and `"7"` differ; `-0` reads as `0`, and is echoed as `0`). Our own requests are numbered from 1 upward.
 
+A request that reuses the id of a request still being answered is refused with `-32600` under `null`. This deliberately departs from the letter of JSON-RPC 2.0 §5, which says a response's id must be the request's and keeps `null` for ids that could not be read: answering under the reused id would give the peer two responses with one id, one of them for a request it cannot tell apart. The in-flight request's answer stays the only response with that id.
+
 ### Batches
 
 A batch is answered with one array holding one response per request, in the order they were answered, and nothing at all when it holds only notifications and responses. An empty batch, a batch over `Limits::max_batch`, and a batch with a JSON syntax error are each answered with a single error object, not an array. A batch over the limit is refused as soon as it passes the limit, without reading the rest (so its size cannot drive the work done), and with batches off (`max_batch` 0, as MCP's 2025-06-18 revision wants) any batch is refused at its `[`. A batch with deferred requests is sent when its last answer arrives. The [gate](#gate)'s opening request cannot be sent in a batch.
