@@ -22,10 +22,15 @@ use rpc_io::{
 struct Stalled {
     release: mpsc::Receiver<()>,
     written: Shared,
+    /// Told each time a write begins, when set.
+    entered: Option<mpsc::Sender<()>>,
 }
 
 impl Write for Stalled {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(entered) = &self.entered {
+            let _told = entered.send(());
+        }
         if self.release.recv().is_err() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "released"));
         }
@@ -38,14 +43,25 @@ impl Write for Stalled {
 }
 
 fn stalled(limits: QueueLimits) -> (Queued, mpsc::Sender<()>, Shared) {
+    let (sink, release, written, _entered) = stalled_watched(limits, false);
+    (sink, release, written)
+}
+
+/// As `stalled`, and with `watch`, a receiver told when each write begins.
+fn stalled_watched(
+    limits: QueueLimits,
+    watch: bool,
+) -> (Queued, mpsc::Sender<()>, Shared, mpsc::Receiver<()>) {
     let (release, wait) = mpsc::channel();
+    let (entered, writes) = mpsc::channel();
     let written = Shared::default();
     let writer = Stalled {
         release: wait,
         written: written.clone(),
+        entered: watch.then_some(entered),
     };
     match Queued::with_limits(writer, Framing::Newline, limits) {
-        Ok(sink) => (sink, release, written),
+        Ok(sink) => (sink, release, written, writes),
         Err(error) => panic!("{error}"),
     }
 }
@@ -145,9 +161,13 @@ fn test_overflowing_queue_closes_the_connection() {
 #[test]
 fn test_stalled_write_times_out_and_closes() {
     let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(30)));
-    let (sink, release, _written) = stalled(limits);
+    let (sink, release, _written, writes) = stalled_watched(limits, true);
     let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
     assert!(endpoint.peer().notify("stuck", ()).is_ok());
+    // The write timeout runs from when the writer took the batch, which is
+    // before it entered the write: once it has, a sleep past the timeout is
+    // enough, however loaded the machine.
+    assert!(writes.recv_timeout(Duration::from_secs(30)).is_ok());
     thread::sleep(Duration::from_millis(80));
     let result = endpoint.peer().notify("next", ());
     assert!(
