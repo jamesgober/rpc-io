@@ -570,20 +570,14 @@ fn write_loop<W: Write>(core: &Core, mut writer: W) {
 /// feature):
 ///
 /// ```
-/// use std::{sync::Arc, task::{Context, Poll, Wake, Waker}};
+/// use std::task::{Context, Poll, Waker};
 /// use rpc_io::{Endpoint, Framing, QueueLimits, Router};
-///
-/// struct Nothing;
-/// impl Wake for Nothing {
-///     fn wake(self: Arc<Self>) {}
-/// }
 ///
 /// let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new());
 /// let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
 /// endpoint.peer().notify("ready", ())?;
 ///
-/// let waker = Waker::from(Arc::new(Nothing));
-/// let mut cx = Context::from_waker(&waker);
+/// let mut cx = Context::from_waker(Waker::noop());
 /// let Poll::Ready(chunk) = outbox.poll_chunk(&mut cx) else { panic!() };
 /// assert_eq!(chunk, b"{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\n");
 /// let n = chunk.len();
@@ -680,15 +674,10 @@ impl Outbox {
     /// # Examples
     ///
     /// ```
-    /// use std::{sync::Arc, task::{Context, Poll, Wake, Waker}};
+    /// use std::task::{Context, Poll, Waker};
     /// use rpc_io::{Framing, QueueLimits, Sink};
     ///
-    /// struct Nothing;
-    /// impl Wake for Nothing {
-    ///     fn wake(self: Arc<Self>) {}
-    /// }
-    /// let waker = Waker::from(Arc::new(Nothing));
-    /// let mut cx = Context::from_waker(&waker);
+    /// let mut cx = Context::from_waker(Waker::noop());
     ///
     /// let (mut sink, mut outbox) = rpc_io::outbox(Framing::ContentLength, QueueLimits::new());
     /// sink.send("{}")?;

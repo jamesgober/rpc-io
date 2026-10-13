@@ -770,7 +770,7 @@ Outgoing queues that never block the sender: messages are framed into a bounded 
 - **`QueueLimits`** (`#[non_exhaustive]`, `Copy`): `max_bytes` (64 MiB), `max_messages` (65,536), `write_timeout` (60 s; `None` waits forever), with `new()` and `with_*`. A message that would take the queue past a limit fails it (one message is always taken when it is empty), and so does any send once a write has stalled past `write_timeout`. A failed queue refuses everything with the same I/O error, which closes the endpoint.
 
 ```rust
-use std::{sync::Arc, task::{Context, Poll, Wake, Waker}};
+use std::task::{Context, Poll, Waker};
 use rpc_io::{Endpoint, Framing, QueueLimits, Queued, Router};
 
 // A thread-written sink for a byte stream:
@@ -778,13 +778,10 @@ let endpoint = Endpoint::new(Queued::new(std::io::sink(), Framing::ContentLength
 endpoint.peer().notify("ready", ()).ok();
 
 // An async-drained one:
-struct Nothing;
-impl Wake for Nothing { fn wake(self: Arc<Self>) {} }
 let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new().with_max_bytes(1 << 20));
 let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
 endpoint.peer().notify("ready", ()).ok();
-let waker = Waker::from(Arc::new(Nothing));
-let Poll::Ready(chunk) = outbox.poll_chunk(&mut Context::from_waker(&waker)) else { panic!() };
+let Poll::Ready(chunk) = outbox.poll_chunk(&mut Context::from_waker(Waker::noop())) else { panic!() };
 assert_eq!(chunk, b"{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\n");
 # Ok::<(), std::io::Error>(())
 ```

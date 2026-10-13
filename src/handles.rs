@@ -473,19 +473,13 @@ impl Future for Call {
     /// # Examples
     ///
     /// ```
-    /// use std::{future::Future, pin::pin, sync::Arc, task::{Context, Poll, Wake}};
+    /// use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
     /// use rpc_io::{Endpoint, Router};
-    ///
-    /// struct Nothing;
-    /// impl Wake for Nothing {
-    ///     fn wake(self: Arc<Self>) {}
-    /// }
     ///
     /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
     /// let mut endpoint = Endpoint::new(tx, Router::new(), ());
     /// let mut call = pin!(endpoint.peer().request("x", ())?);
-    /// let waker = Arc::new(Nothing).into();
-    /// let mut cx = Context::from_waker(&waker);
+    /// let mut cx = Context::from_waker(Waker::noop());
     /// assert!(call.as_mut().poll(&mut cx).is_pending());
     /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":"yes"}"#)?;
     /// let Poll::Ready(outcome) = call.as_mut().poll(&mut cx) else { panic!() };
