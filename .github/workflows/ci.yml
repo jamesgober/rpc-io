@@ -128,7 +128,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Line coverage (all features)
-        run: cargo llvm-cov --all-features --summary-only --fail-under-lines 93
+        run: cargo llvm-cov --all-features --summary-only --fail-under-lines 95
 
   security:
     name: Security (audit + deny)
