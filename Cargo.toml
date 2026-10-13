@@ -32,6 +32,10 @@ documentation = "https://docs.rs/rpc-io"
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
 
+# Package contents: the crate, its docs, tests, benches, and examples. Not the
+# engineering notes, the standards file, CI, or the fuzz workspace.
+exclude = ["dev/", "REPS.md", ".github/", "fuzz/"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
