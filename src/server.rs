@@ -16,6 +16,7 @@ use crate::{
     endpoint::{End, Endpoint, Next},
     error::Error,
     framing::Framing,
+    limits::Limits,
     queue::{QueueLimits, Queued},
     router::Router,
     trace::event,
@@ -54,8 +55,8 @@ pub struct Connection {
 /// | Setting | Default | Meaning |
 /// |---|---|---|
 /// | `framing` | (given) | the framing of every connection |
-/// | `config` | [`Config::new`] | every endpoint's settings |
-/// | `queue` | [`QueueLimits::new`] | every connection's outgoing queue |
+/// | `config` | [`Config::new`] with [`Limits::network`] | every endpoint's settings |
+/// | `queue` | [`QueueLimits::new`] with 8 MiB and 4,096 messages | every connection's outgoing queue |
 /// | `max_connections` | 256 | connections served at once; the next is not accepted until one ends |
 /// | `message_timeout` | 30 s | how long a message may take to arrive once it has begun, and a new connection to send its first one |
 /// | `idle_timeout` | 300 s | how long a connection may stay silent between messages |
@@ -69,6 +70,12 @@ pub struct Connection {
 /// sockets therefore delay other clients by at most `message_timeout`; they
 /// cannot lock them out. Each connection costs a reader thread, a writer
 /// thread, and, once a request with a deadline is sent on it, a timer thread.
+/// The defaults bound a connection's memory to about a 4 MiB message (and
+/// the value tree a handler parses from it) plus an 8 MiB queue; raise them
+/// with [`with_config`](Server::with_config) and
+/// [`with_queue`](Server::with_queue) for trusted peers that send more.
+///
+/// [`Limits::network`]: crate::Limits::network
 ///
 /// The writer's socket gets the queue's `write_timeout` as its write timeout,
 /// so a peer that stops reading fails the write itself, and a failed write
@@ -445,13 +452,17 @@ impl Server {
     /// ```
     /// let server = rpc_io::Server::new(rpc_io::Framing::ContentLength);
     /// assert_eq!(server.max_connections(), 256);
+    /// assert_eq!(server.config().limits, rpc_io::Limits::network());
+    /// assert_eq!(server.queue().max_bytes, 8 << 20);
     /// ```
     #[must_use]
     pub fn new(framing: Framing) -> Self {
         Self {
             framing,
-            config: Config::new(),
-            queue: QueueLimits::new(),
+            config: Config::new().with_limits(Limits::network()),
+            queue: QueueLimits::new()
+                .with_max_bytes(8 * 1024 * 1024)
+                .with_max_messages(4096),
             max_connections: 256,
             deadlines: Deadlines {
                 message: Some(Duration::from_secs(30)),
@@ -522,8 +533,9 @@ impl Server {
         self.deadlines.idle
     }
 
-    /// Sets every endpoint's [`Config`]. For peers across a network, start
-    /// from [`Limits::network`](crate::Limits::network).
+    /// Sets every endpoint's [`Config`], replacing the default (whose
+    /// limits are [`Limits::network`]). Keep network limits for peers across
+    /// a network.
     ///
     /// # Examples
     ///
@@ -567,6 +579,26 @@ impl Server {
     pub fn with_max_connections(mut self, count: usize) -> Self {
         self.max_connections = count.max(1);
         self
+    }
+
+    /// Every endpoint's settings.
+    ///
+    /// # Examples
+    ///
+    /// See [`new`](Server::new).
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Every connection's outgoing queue limits.
+    ///
+    /// # Examples
+    ///
+    /// See [`new`](Server::new).
+    #[must_use]
+    pub fn queue(&self) -> QueueLimits {
+        self.queue
     }
 
     /// How many connections are served at once.
