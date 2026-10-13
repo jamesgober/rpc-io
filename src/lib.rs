@@ -113,6 +113,8 @@ mod link;
 mod router;
 #[cfg(feature = "std")]
 mod sink;
+#[cfg(feature = "std")]
+mod slot;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};

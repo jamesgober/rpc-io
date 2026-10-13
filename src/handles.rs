@@ -4,11 +4,13 @@
 
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvTimeoutError, TryRecvError},
     },
+    task::{self, Poll},
     thread,
     time::{Duration, Instant},
 };
@@ -19,8 +21,9 @@ use crate::{
     error::{CallError, Error},
     error_object::ErrorObject,
     id::Id,
-    link::{Link, Outcome},
+    link::Link,
     raw::{Json, Raw},
+    slot::{Outcome, Slot},
 };
 
 /// A flag that says a request was cancelled.
@@ -258,6 +261,13 @@ impl fmt::Debug for Peer {
 /// (rejected, timed out, cancelled, evicted, connection closed). Dropping a
 /// `Call` does not cancel the request; its answer is then discarded.
 ///
+/// Wait for it by blocking ([`wait`](Call::wait)), by polling
+/// ([`try_wait`](Call::try_wait)), or by `.await`ing it: `Call` is a
+/// [`Future`] on any executor, woken when the outcome arrives (deadlines
+/// included, which fire on their own; see
+/// [`Config::timer`](crate::Config)). Once the future has returned its
+/// outcome, polling again returns [`CallError::Closed`].
+///
 /// # Examples
 ///
 /// ```
@@ -273,7 +283,7 @@ impl fmt::Debug for Peer {
 /// ```
 pub struct Call {
     id: u64,
-    outcome: mpsc::Receiver<Outcome>,
+    outcome: Arc<Slot>,
     deadline: Option<Instant>,
     link: Arc<dyn Link>,
 }
@@ -336,25 +346,23 @@ impl Call {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn wait(self) -> Result<Raw<'static>, CallError> {
-        match self.outcome.try_recv() {
-            Ok(outcome) => return outcome,
-            Err(TryRecvError::Disconnected) => return Err(CallError::Closed),
-            Err(TryRecvError::Empty) => {}
+        if let Some(outcome) = self.outcome.try_take() {
+            return outcome;
         }
         if self.link.on_endpoint_thread() {
             return Err(CallError::WouldDeadlock);
         }
         if let Some(deadline) = self.deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.outcome.recv_timeout(left) {
-                Ok(outcome) => return outcome,
-                Err(RecvTimeoutError::Disconnected) => return Err(CallError::Closed),
-                // Due: expiring delivers `TimedOut` (or the answer, if it won
-                // the race), so the blocking receive below returns at once.
-                Err(RecvTimeoutError::Timeout) => self.link.expire(),
+            if let Some(outcome) = self.outcome.wait_until(Some(deadline)) {
+                return outcome;
             }
+            // Due: expiring delivers `TimedOut` (or the answer, if it won the
+            // race), so the blocking wait below returns at once.
+            self.link.expire();
         }
-        self.outcome.recv().unwrap_or(Err(CallError::Closed))
+        self.outcome
+            .wait_until(None)
+            .unwrap_or(Err(CallError::Closed))
     }
 
     /// The outcome if it has arrived, or the call back to try again later.
@@ -381,10 +389,9 @@ impl Call {
         if self.deadline.is_some_and(|d| d <= Instant::now()) {
             self.link.expire();
         }
-        match self.outcome.try_recv() {
-            Ok(outcome) => Ok(outcome),
-            Err(TryRecvError::Disconnected) => Ok(Err(CallError::Closed)),
-            Err(TryRecvError::Empty) => Err(self),
+        match self.outcome.try_take() {
+            Some(outcome) => Ok(outcome),
+            None => Err(self),
         }
     }
 
@@ -433,6 +440,41 @@ impl Call {
             id: self.id,
             link: Arc::clone(&self.link),
         }
+    }
+}
+
+impl Future for Call {
+    type Output = Outcome;
+
+    /// The outcome once it has arrived.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{future::Future, pin::pin, sync::Arc, task::{Context, Poll, Wake}};
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// struct Nothing;
+    /// impl Wake for Nothing {
+    ///     fn wake(self: Arc<Self>) {}
+    /// }
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, Router::new(), ());
+    /// let mut call = pin!(endpoint.peer().request("x", ())?);
+    /// let waker = Arc::new(Nothing).into();
+    /// let mut cx = Context::from_waker(&waker);
+    /// assert!(call.as_mut().poll(&mut cx).is_pending());
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":"yes"}"#)?;
+    /// let Poll::Ready(outcome) = call.as_mut().poll(&mut cx) else { panic!() };
+    /// assert_eq!(outcome.map(|raw| raw.as_str().to_owned()), Ok(r#""yes""#.to_owned()));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Outcome> {
+        if self.deadline.is_some_and(|d| d <= Instant::now()) {
+            self.link.expire();
+        }
+        self.outcome.poll(cx)
     }
 }
 

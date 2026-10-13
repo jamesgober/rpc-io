@@ -14,7 +14,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io, mem,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -27,16 +27,14 @@ use crate::{
     id::Id,
     message::{write_call, write_numbered_call, write_response},
     pending::Pending,
-    raw::{Json, Raw},
+    raw::Json,
     sink::Sink,
+    slot::{self, Outcome, Slot, Waiter},
     text,
 };
 
 /// The encoding buffer is released after a message that grew it past this.
 const SCRATCH_KEEP: usize = 64 * 1024;
-
-/// How one of our requests ended.
-pub(crate) type Outcome = Result<Raw<'static>, CallError>;
 
 /// What the handles need from the shared state, with the sink type erased.
 pub(crate) trait Link: Send + Sync {
@@ -61,7 +59,7 @@ pub(crate) trait Link: Send + Sync {
 /// A request just sent: its id, where its outcome arrives, its deadline.
 pub(crate) struct Issued {
     pub(crate) id: u64,
-    pub(crate) outcome: mpsc::Receiver<Outcome>,
+    pub(crate) outcome: Arc<Slot>,
     pub(crate) deadline: Option<Instant>,
 }
 
@@ -254,7 +252,7 @@ pub(crate) struct Inner<K> {
     corked: bool,
     /// Reused buffer every message is encoded in.
     scratch: String,
-    pending: Pending<mpsc::Sender<Outcome>>,
+    pending: Pending<Waiter>,
     in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
     next_batch: u64,
@@ -342,8 +340,7 @@ impl<K: Sink> Inner<K> {
     fn shut(&mut self) {
         self.closed = true;
         for (_, waiter) in self.pending.drain() {
-            // A waiter that dropped its `Call` has nothing to be told.
-            let _gone = waiter.send(Err(CallError::Closed));
+            waiter.send(Err(CallError::Closed));
         }
         for request in mem::take(&mut self.in_flight).into_values() {
             // Workers still answering see the cancellation and can stop.
@@ -416,7 +413,7 @@ impl<K: Sink> Inner<K> {
             return Err(Error::Closed);
         }
         self.expire();
-        let (waiter, outcome) = mpsc::channel();
+        let (waiter, outcome) = slot::slot();
         let deadline = timeout
             .or(self.settings.request_timeout)
             .and_then(|t| self.now().checked_add(t));
@@ -464,8 +461,7 @@ impl<K: Sink> Inner<K> {
         }
         match self.pending.settle(id) {
             Some(waiter) => {
-                // A waiter that dropped its `Call` did not want the answer.
-                let _gone = waiter.send(outcome);
+                waiter.send(outcome);
                 true
             }
             None => false,
@@ -474,13 +470,13 @@ impl<K: Sink> Inner<K> {
 
     /// Ends a request removed from `pending` without an answer: tells the peer
     /// to stop (unless it was never sent), and tells the waiter why.
-    fn abandon(&mut self, id: u64, waiter: mpsc::Sender<Outcome>, reason: CallError) {
+    fn abandon(&mut self, id: u64, waiter: Waiter, reason: CallError) {
         // Never sent: its held body is skipped when the gate opens, and the
         // peer has nothing to cancel.
         if !self.held_requests.remove(&id) && !self.closed {
             self.send_cancel(id);
         }
-        let _gone = waiter.send(Err(reason));
+        waiter.send(Err(reason));
     }
 
     /// Sends the cancel notification for our request `id`. Best effort: if
@@ -575,7 +571,7 @@ impl<K: Sink> Inner<K> {
             for message in held {
                 if let Some(id) = message.request.filter(|id| live.contains(id)) {
                     if let Some(waiter) = self.pending.settle(id) {
-                        let _gone = waiter.send(Err(CallError::Cancelled));
+                        waiter.send(Err(CallError::Cancelled));
                     }
                 }
             }
