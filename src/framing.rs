@@ -800,7 +800,14 @@ impl Decoder {
     ) -> Result<Step, FrameError> {
         let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
             self.scan = self.end;
-            let pending = self.end - self.start;
+            let pending = &self.buf[self.start..self.end];
+            // A lone `\r` before the first header line may be a stray blank
+            // line, which is not counted (below); anything else is.
+            let pending = if lines == 0 && pending == b"\r" {
+                0
+            } else {
+                pending.len()
+            };
             if bytes.saturating_add(pending) > self.max_header_bytes {
                 return Err(self.fail(FrameError::HeaderTooLarge {
                     limit: self.max_header_bytes,
@@ -811,17 +818,26 @@ impl Decoder {
         let line_end = self.scan + at + 1;
         let line_len = line_end - self.start;
         let line = trim_line(&self.buf, self.start..line_end - 1);
+        // Every line of the section counts, its line end included, and so
+        // does the blank line that ends it: in pieces it is counted above
+        // as it arrives, so whole it must be too, or the outcome would
+        // depend on how the input was split.
+        let bytes = bytes.saturating_add(line_len);
         if line.is_empty() {
             self.start = line_end;
             self.scan = line_end;
-            // Stray blank lines between messages are skipped; after a header
-            // line, a blank line ends the section.
+            // Stray blank lines between messages are skipped, uncounted;
+            // after a header line, a blank line ends the section.
             if lines > 0 {
+                if bytes > self.max_header_bytes {
+                    return Err(self.fail(FrameError::HeaderTooLarge {
+                        limit: self.max_header_bytes,
+                    }));
+                }
                 self.end_headers(length)?;
             }
             return Ok(Step::Again);
         }
-        let bytes = bytes.saturating_add(line_len);
         if bytes > self.max_header_bytes {
             return Err(self.fail(FrameError::HeaderTooLarge {
                 limit: self.max_header_bytes,

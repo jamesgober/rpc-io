@@ -224,3 +224,42 @@ fn newline_frames(limits: &Limits, input: &[u8], chunk: usize) -> Vec<Result<Vec
     }
     out
 }
+
+#[test]
+fn test_header_terminator_counts_against_the_budget_however_the_input_is_split() {
+    // Found by the fuzz harness: the blank line that ends a header section
+    // counted against `max_header_bytes` when it arrived in pieces (its `\r`
+    // was pending) but not when it arrived whole, so the same stream was
+    // refused or accepted depending on the read sizes. Terminators count.
+    let limits = Limits::new().with_max_header_bytes(16);
+    let input = b"ontent-type: a\r\n\r\n";
+    for chunk in [1, 2, 3, 17, 100] {
+        let mut decoder = Framing::ContentLength.decoder(&limits);
+        let mut result = Ok(None);
+        for piece in input.chunks(chunk) {
+            let _taken = decoder.feed(piece);
+            result = decoder.next_frame().map(|frame| frame.map(<[u8]>::to_vec));
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            result,
+            Err(FrameError::HeaderTooLarge { limit: 16 }),
+            "chunk {chunk}"
+        );
+    }
+    // Within the budget, terminator included, it is read either way.
+    let limits = Limits::new().with_max_header_bytes(22);
+    for chunk in [1, 5, 100] {
+        let mut decoder = Framing::ContentLength.decoder(&limits);
+        let mut frames = Vec::new();
+        for piece in b"Content-Length: 1\r\n\r\nx".chunks(chunk) {
+            let _taken = decoder.feed(piece);
+            while let Ok(Some(frame)) = decoder.next_frame() {
+                frames.push(frame.to_vec());
+            }
+        }
+        assert_eq!(frames, [b"x".to_vec()], "chunk {chunk}");
+    }
+}
