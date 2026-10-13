@@ -326,9 +326,9 @@ impl<S, K: Sink> Endpoint<S, K> {
     }
 
     /// When the earliest of our outstanding requests is due, if any has a
-    /// deadline. A caller driving the endpoint without [`run`](Endpoint::run)
-    /// calls [`expire`](Endpoint::expire) then; [`Call::wait`](crate::Call::wait)
-    /// enforces its own deadline either way.
+    /// deadline. Deadlines fire on their own (see [`Config::timer`]); with the
+    /// timer off, a caller calls [`expire`](Endpoint::expire) then.
+    /// [`Call::wait`](crate::Call::wait) enforces its own deadline either way.
     ///
     /// # Examples
     ///

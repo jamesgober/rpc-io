@@ -6,15 +6,22 @@
 //! Everything sits behind one mutex. Handles on other threads send through it
 //! directly, so a deferred reply or a notification from a worker goes out at
 //! once, even while the endpoint's own thread is blocked reading. The lock is
-//! held only to encode and hand a message to the sink, never while user code
-//! (a handler or event hook) runs. One connection's traffic is serial on the
-//! wire anyway, so a single lock costs nothing a lock-free design would save.
+//! held to encode a message and hand it to the sink, never while a handler or
+//! event hook runs. One connection's traffic is serial on the wire anyway, so
+//! a single lock costs nothing a lock-free design would save, as long as the
+//! sink does not block: a sink that writes to a slow peer holds the lock for
+//! the write, which is why [`Queued`](crate::Queued) exists.
+//!
+//! Deadlines fire on their own: the first request with one starts a timer
+//! thread that sleeps until the earliest is due, expires it, and sleeps again.
+//! It holds only a weak reference, so it never keeps the connection alive,
+//! and it stops when the connection closes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     io, mem,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -65,12 +72,17 @@ pub(crate) struct Issued {
 
 pub(crate) struct Shared<K> {
     inner: Mutex<Inner<K>>,
+    timer: Arc<Timer>,
 }
 
 impl<K: Sink> Shared<K> {
     pub(crate) fn new(sink: K, config: &Config) -> Arc<Self> {
-        Arc::new(Self {
+        let timer = Arc::new(Timer::default());
+        Arc::new_cyclic(|me| Self {
+            timer: Arc::clone(&timer),
             inner: Mutex::new(Inner {
+                me: Weak::clone(me),
+                timer,
                 sink,
                 closed: false,
                 broken: None,
@@ -98,6 +110,12 @@ impl<K: Sink> Shared<K> {
     /// [`Sink`]; the state is still usable, so the poison is ignored.
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner<K>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<K> Drop for Shared<K> {
+    fn drop(&mut self) {
+        self.timer.stop();
     }
 }
 
@@ -145,6 +163,7 @@ pub(crate) struct Settings {
     pub(crate) cancellation: Option<Cancellation>,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) max_in_flight: usize,
+    pub(crate) timer: bool,
 }
 
 impl From<&Config> for Settings {
@@ -153,8 +172,75 @@ impl From<&Config> for Settings {
             cancellation: config.cancellation.clone(),
             request_timeout: config.request_timeout,
             max_in_flight: config.max_in_flight,
+            timer: config.timer,
         }
     }
+}
+
+/// When the timer thread should next wake, and whether it runs.
+#[derive(Default)]
+struct Timer {
+    state: Mutex<TimerState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct TimerState {
+    /// The earliest deadline it knows of (it may have been settled since;
+    /// waking for nothing is harmless).
+    due: Option<Instant>,
+    running: bool,
+    stopped: bool,
+}
+
+impl Timer {
+    fn lock(&self) -> MutexGuard<'_, TimerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends the timer thread, for good.
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.wake.notify_all();
+    }
+}
+
+/// The timer thread: sleeps until the earliest deadline, expires what is due,
+/// and asks the state for the next one. Ends when the timer is stopped or the
+/// shared state is gone.
+fn run_timer<K: Sink>(timer: &Timer, shared: &Weak<Shared<K>>) {
+    let mut state = timer.lock();
+    while !state.stopped {
+        let Some(due) = state.due else {
+            state = timer
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            continue;
+        };
+        let now = Instant::now();
+        if due > now {
+            state = timer
+                .wake
+                .wait_timeout(state, due - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            continue;
+        }
+        state.due = None;
+        drop(state);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        {
+            let mut inner = shared.lock();
+            inner.expire();
+            inner.arm();
+        }
+        drop(shared);
+        state = timer.lock();
+    }
+    state.running = false;
 }
 
 /// Where the gate is.
@@ -243,6 +329,9 @@ enum Sending {
 }
 
 pub(crate) struct Inner<K> {
+    /// The state this sits in, for the timer thread.
+    me: Weak<Shared<K>>,
+    timer: Arc<Timer>,
     sink: K,
     closed: bool,
     /// The first failure of the sink, for the endpoint's thread to report.
@@ -301,6 +390,34 @@ impl<K: Sink> Inner<K> {
             .and_then(|at| self.epoch.checked_add(at))
     }
 
+    /// Makes sure the timer thread wakes for the earliest deadline, starting
+    /// it if it is not running. Without a thread (the timer is off, or one
+    /// could not be started) deadlines are enforced lazily, as `expire` says.
+    fn arm(&mut self) {
+        if !self.settings.timer || self.closed {
+            return;
+        }
+        let Some(due) = self.next_deadline() else {
+            return;
+        };
+        let mut timer = self.timer.lock();
+        if timer.stopped {
+            return;
+        }
+        if timer.due.is_none_or(|at| due < at) {
+            timer.due = Some(due);
+            self.timer.wake.notify_all();
+        }
+        if !timer.running {
+            let shared = Weak::clone(&self.me);
+            let thread_timer = Arc::clone(&self.timer);
+            let started = thread::Builder::new()
+                .name("rpc-io-timer".into())
+                .spawn(move || run_timer(&thread_timer, &shared));
+            timer.running = started.is_ok();
+        }
+    }
+
     pub(crate) fn cork(&mut self) {
         self.corked = true;
     }
@@ -339,6 +456,7 @@ impl<K: Sink> Inner<K> {
     /// Marks the connection closed and releases everything waiting on it.
     fn shut(&mut self) {
         self.closed = true;
+        self.timer.stop();
         for (_, waiter) in self.pending.drain() {
             waiter.send(Err(CallError::Closed));
         }
@@ -426,6 +544,9 @@ impl<K: Sink> Inner<K> {
         if let Err(error) = self.deliver(Sending::Request(id)) {
             let _unsent = self.pending.settle(id);
             return Err(error);
+        }
+        if deadline.is_some() {
+            self.arm();
         }
         Ok(Issued {
             id,

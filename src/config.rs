@@ -14,6 +14,7 @@ use crate::{error_object::ErrorCode, limits::Limits};
 /// | `request_timeout` | none | deadline for our requests that set none themselves |
 /// | `cancellation` | [`Cancellation::lsp`] | the cancel notification, both ways; `None` turns cancellation off |
 /// | `gate` | none | an opening request every other request must wait for |
+/// | `timer` | `true` | deadlines fire on their own, from a helper thread |
 ///
 /// `#[non_exhaustive]`: start from [`Config::new`] and chain `with_*`.
 ///
@@ -45,6 +46,18 @@ pub struct Config {
     pub cancellation: Option<Cancellation>,
     /// The opening request, if the protocol has one.
     pub gate: Option<Gate>,
+    /// Whether our requests' deadlines fire on their own. On (the default),
+    /// the first request with a deadline starts a timer thread for the
+    /// connection, which ends each due request with
+    /// [`CallError::TimedOut`](crate::CallError::TimedOut) and sends the
+    /// peer the cancel notification even while nothing arrives; it sleeps
+    /// between deadlines and stops when the connection closes. Off, a
+    /// deadline is enforced only when it is next looked at: when the endpoint
+    /// handles a message, at the next request, in
+    /// [`Call::wait`](crate::Call::wait) and
+    /// [`try_wait`](crate::Call::try_wait), when an awaited `Call` is polled,
+    /// or by [`Endpoint::expire`](crate::Endpoint::expire).
+    pub timer: bool,
 }
 
 impl Config {
@@ -64,6 +77,7 @@ impl Config {
             request_timeout: None,
             cancellation: Some(Cancellation::lsp()),
             gate: None,
+            timer: true,
         }
     }
 
@@ -151,6 +165,19 @@ impl Config {
     #[must_use]
     pub fn with_gate(mut self, gate: Option<Gate>) -> Self {
         self.gate = gate;
+        self
+    }
+
+    /// Sets `timer`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!rpc_io::Config::new().with_timer(false).timer);
+    /// ```
+    #[must_use]
+    pub fn with_timer(mut self, timer: bool) -> Self {
+        self.timer = timer;
         self
     }
 }

@@ -186,6 +186,97 @@ fn test_timeout_ends_the_call_and_tells_the_peer() {
 }
 
 #[test]
+fn test_timeout_fires_with_no_traffic_and_no_waiter() {
+    // Found by the audit (RPC-COR-03): a deadline was enforced only when a
+    // message arrived or someone waited, so a fire-and-forget request never
+    // told the peer to cancel while the connection was quiet.
+    let (e, rx) = endpoint(Router::<()>::new(), ());
+    let call = e
+        .peer()
+        .request_with_timeout("slow", (), Duration::from_millis(30));
+    let Ok(call) = call else {
+        panic!("request failed")
+    };
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).ok().as_deref(),
+        Some(r#"{"jsonrpc":"2.0","id":1,"method":"slow"}"#)
+    );
+    // Nobody calls `expire`, `wait`, or `handle`: the timer does it.
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).ok().as_deref(),
+        Some(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#)
+    );
+    assert!(e.next_deadline().is_none());
+    assert!(matches!(call.try_wait(), Ok(Err(CallError::TimedOut))));
+}
+
+#[test]
+fn test_timer_fires_deadlines_in_order_and_rearms() {
+    let (e, rx) = endpoint(Router::<()>::new(), ());
+    let peer = e.peer();
+    let late = peer.request_with_timeout("late", (), Duration::from_millis(80));
+    let early = peer.request_with_timeout("early", (), Duration::from_millis(20));
+    let (Ok(late), Ok(early)) = (late, early) else {
+        panic!("request failed")
+    };
+    let mut cancels = Vec::new();
+    while cancels.len() < 2 {
+        let Ok(message) = rx.recv_timeout(Duration::from_secs(5)) else {
+            panic!("a deadline did not fire")
+        };
+        if message.contains("cancelRequest") {
+            cancels.push(message);
+        }
+    }
+    assert!(cancels[0].contains(r#""id":2"#), "{cancels:?}");
+    assert!(cancels[1].contains(r#""id":1"#), "{cancels:?}");
+    assert!(matches!(early.try_wait(), Ok(Err(CallError::TimedOut))));
+    assert!(matches!(late.try_wait(), Ok(Err(CallError::TimedOut))));
+}
+
+#[test]
+fn test_timer_off_leaves_deadlines_to_the_caller() {
+    let (e, rx) = endpoint(Router::<()>::new(), ());
+    let e = e.with_config(Config::new().with_timer(false));
+    let call = e
+        .peer()
+        .request_with_timeout("slow", (), Duration::from_millis(10));
+    let Ok(call) = call else {
+        panic!("request failed")
+    };
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(sent(&rx).len(), 1, "only the request went out");
+    e.expire();
+    assert_eq!(
+        sent(&rx),
+        [r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#]
+    );
+    assert!(matches!(call.try_wait(), Ok(Err(CallError::TimedOut))));
+}
+
+#[test]
+fn test_timer_does_not_keep_the_connection_alive() {
+    let (e, rx) = endpoint(Router::<()>::new(), ());
+    let call = e
+        .peer()
+        .request_with_timeout("slow", (), Duration::from_secs(3600));
+    let Ok(call) = call else {
+        panic!("request failed")
+    };
+    drop(e);
+    // Closed at once, not after an hour; and the sink (the channel) is gone.
+    assert_eq!(call.wait(), Err(CallError::Closed));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rx.try_recv().is_ok() || !matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sink was kept alive"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
 fn test_config_timeout_applies_to_every_request() {
     let (e, _rx) = endpoint(Router::<()>::new(), ());
     let e = e.with_config(Config::new().with_request_timeout(Some(Duration::from_millis(5))));
