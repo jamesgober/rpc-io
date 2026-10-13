@@ -51,7 +51,7 @@ Four LexerSketch servers would otherwise each reimplement the same transport; ls
 - Framing is robust to hostile input: bounded header and body sizes, overflow-checked lengths, precise errors, never a panic.
 - Every request gets exactly one response; malformed envelopes with a valid id are answered with that id.
 - Handler panics are contained and answered with INTERNAL_ERROR; the session survives.
-- A peer that stops reading costs bounded memory and time, and stalls no other thread (`Queued`, `outbox`).
+- A peer that stops reading costs memory bounded by `QueueLimits`, stalls no sender while the connection is open, and at close holds up only the closing thread, for at most `close_timeout` (`Queued`; an `outbox` close does not wait).
 
 ---
 

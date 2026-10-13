@@ -313,11 +313,14 @@ impl<S, K: Sink> Endpoint<S, K> {
         self.shared.is_closed()
     }
 
-    /// Closes the connection: closes the sink (which writes what it holds;
-    /// see [`Sink::close`]), ends every outstanding [`Call`](crate::Call) with
-    /// [`CallError::Closed`], and sets the [`CancelToken`](crate::CancelToken)
-    /// of every deferred request still being answered. Every later send fails
-    /// with [`Error::Closed`]. Idempotent.
+    /// Closes the connection: closes the sink (see [`Sink::close`]), ends
+    /// every outstanding [`Call`](crate::Call) with [`CallError::Closed`], and
+    /// sets the [`CancelToken`](crate::CancelToken) of every deferred request
+    /// still being answered. Then, with the endpoint's lock released, it waits
+    /// for the sink to finish writing (see [`Sink::drain`]; for a
+    /// [`Queued`](crate::Queued) sink, at most its `close_timeout`), so other
+    /// threads see the connection closed at once. Every later send fails with
+    /// [`Error::Closed`]. Idempotent.
     ///
     /// # Examples
     ///
@@ -1104,10 +1107,10 @@ impl<S, K: Sink> fmt::Debug for Endpoint<S, K> {
 ///
 /// Output goes through a [`Queued`](crate::Queued) sink under the default
 /// [`QueueLimits`](crate::QueueLimits): a writer thread does the writes, so a
-/// peer that stops reading stalls no handler or worker, and closes the
-/// connection once the queue's limits are reached. Before returning, `serve`
-/// waits for what is queued to be written (as long as the writes make
-/// progress).
+/// peer that stops reading blocks no handler's or worker's sends, and the
+/// connection closes once the queue's limits are reached. Before returning,
+/// `serve` waits for what is queued to be written, for at most
+/// `close_timeout` and only while the writes make progress.
 ///
 /// # Errors
 ///

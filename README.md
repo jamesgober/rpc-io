@@ -21,7 +21,7 @@
         <strong>rpc-io</strong> is a JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP over Content-Length framing, MCP over newline framing (its stdio transport), and JSON-RPC service APIs over either. Register handlers on a <code>Router</code>, hand it a byte stream, and the crate does the rest: framing, the envelope, batches, id correlation, cancellation in both directions, an opening-request gate, deadlines, and the error codes the specification prescribes. Its Content-Length framing layer also cuts Debug Adapter Protocol messages, which use the same base protocol; DAP's messages are not JSON-RPC, so for DAP only the framing applies, not the engine.
     </p>
     <p>
-        It is built to take hostile input. Header sections, bodies, batches, and JSON nesting all have budgets checked before memory is spent; nothing recurses on input; every request gets exactly one response; a handler that panics is answered with <code>INTERNAL_ERROR</code> while the session carries on; and a peer that stops reading costs bounded memory and time instead of freezing the server. Every parser of untrusted input has a fuzz target. It is the transport of <code>lsp-lang</code> 2.0; the other LexerSketch servers are planned to move onto it.
+        It is built to take hostile input. Header sections, bodies, batches, and JSON nesting all have budgets checked before memory is spent; nothing recurses on input; every request gets exactly one response; a handler that panics is answered with <code>INTERNAL_ERROR</code> while the session carries on; and a peer that stops reading costs no more memory than its outgoing queue's limits, and its connection is closed at the next send once the writer has made no progress for the queue's write timeout, instead of freezing the server. Every parser of untrusted input has a fuzz target. <code>lsp-lang</code> 2.0 runs on its 0.2 release; the other LexerSketch servers are planned to move onto it.
     </p>
     <br>
     <hr>
@@ -44,7 +44,7 @@ Five layers, each usable on its own:
 - **Messages.** [`decode`](./docs/API.md#decode) reads a body into [`Message`](./docs/API.md#message)s (`Request`, `Notification`, `Response`), a batch, or an [`Invalid`](./docs/API.md#invalid) that says how to answer it. `params` and `result` stay borrowed [`Raw`](./docs/API.md#raw) slices of the body until a handler parses them.
 - **Correlation.** [`Pending`](./docs/API.md#pending) maps our outstanding request ids to waiters, with deadlines and a capacity; every operation is `O(log n)`.
 - **Endpoint.** An [`Endpoint`](./docs/API.md#endpoint) routes the peer's calls to a [`Router`](./docs/API.md#router)'s handlers and settles answers to our own requests, sent through a [`Peer`](./docs/API.md#peer) from any thread. [`serve`](./docs/API.md#serve) is the one-call server; [`Server`](./docs/API.md#server) serves a listener.
-- **Output.** A [`Sink`](./docs/API.md#sink-and-framed) takes each outgoing message. [`Queued`](./docs/API.md#queued-and-outbox) writes from its own thread and an [`outbox`](./docs/API.md#queued-and-outbox) from an async task, both behind bounded limits, so a slow peer never blocks a sender.
+- **Output.** A [`Sink`](./docs/API.md#sink-and-framed) takes each outgoing message. [`Queued`](./docs/API.md#queued-and-outbox) writes from its own thread and an [`outbox`](./docs/API.md#queued-and-outbox) from an async task, both behind bounded limits, so a slow peer blocks no sender while the connection is open. Closing waits for the queue to drain only after releasing the endpoint's lock, and for at most `QueueLimits::close_timeout`.
 
 <br>
 
@@ -56,7 +56,7 @@ What it guarantees, and how each guarantee is checked:
 | Malformed messages get the specification's codes (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`), under their own id when it can be read. | Every example in section 7 of the JSON-RPC 2.0 specification is a test, verbatim; a property test checks envelope classification against a reference built on a full parse. |
 | Every message shape survives encoding and decoding, through either framing. | Property tests over random requests, notifications, results, and errors (any id, any string, any JSON), fed through the decoder in random chunk sizes. |
 | No input makes it panic, memory stays bounded, and the framing does not depend on how the input is split. | Fuzz targets for both framings, message and batch decoding, and a live endpoint (`fuzz/`), whose checks also run in `cargo test` on random, JSON-shaped, and mutated inputs; the decoder's buffer is checked against its documented bound after every step. |
-| A peer that stops reading stalls nobody. | Tests block the writer and check that every handle still sends and that the connection closes once the queue's byte, message, or time limit is reached. |
+| A peer that stops reading stalls no sender, and closing over it holds up no other thread. | Tests block the writer and check that every handle still sends, that the connection closes once the queue's byte, message, or no-progress limit is reached, that a slow but steady reader is not cut off, and that while a close waits on a stalled writer a `Responder` on another thread returns at once. |
 | Deadlines fire on their own. | Tests let a request time out with no traffic and no waiter and check the cancel notification goes out. |
 | A handler panic is contained. | Tests panic in request, deferred, and notification handlers, the interceptor, batches, the event hook, the sink, and the writer, and check the answers and that the session goes on (or, for the output, closes cleanly). |
 | Cancellation races resolve to one outcome. | Tests race worker answers against peer cancellations, and our cancellations against the peer's answers, hundreds of times each. |
@@ -119,7 +119,7 @@ fn main() -> Result<(), rpc_io::Error> {
 }
 ```
 
-`serve` writes through a [`Queued`](./docs/API.md#queued-and-outbox) sink: a writer thread does the writes, so a client that stops reading never blocks a handler, and the connection closes once the queue is full (64 MiB by default) or a write stalls for 60 seconds.
+`serve` writes through a [`Queued`](./docs/API.md#queued-and-outbox) sink: a writer thread does the writes, so a client that stops reading does not block a handler's sends. The connection closes once the queue is full (64 MiB by default), or at the first send after the writer has written nothing for 60 seconds. When the input ends, `serve` waits for the queue to drain, for at most 10 seconds (`QueueLimits::close_timeout`).
 
 ### State, and calls in the other direction
 
@@ -272,14 +272,16 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 ## Design notes
 
 - **Exactly one response.** A deferred request is tracked until answered; a `Responder` dropped without answering (a worker returned early, a panic unwound through it) answers `INTERNAL_ERROR` itself. A cancelled request is answered by the endpoint (`-32800` for LSP) or not at all (MCP), and a late answer from the worker returns `Error::AlreadyAnswered` instead of reaching the wire.
-- **Ids.** Request ids are strings or integers within `i64`. `null`, fractions, and other values are refused as invalid requests, as LSP and MCP require. A request whose id is still being answered by a deferred handler is refused under a `null` id, so the only response carrying that id is the real answer. Our own ids are positive integers counted from 1; answers to ids we are not waiting on are reported and dropped.
+- **Ids.** Request ids are strings or integers within `i64`. `null`, fractions, and other values are refused as invalid requests, as LSP and MCP require. A request whose id is still being answered by a deferred handler is refused under a `null` id, so the only response carrying that id is the real answer (a deliberate departure from the letter of JSON-RPC 2.0, which keeps `null` for ids that could not be read). Our own ids are positive integers counted from 1; answers to ids we are not waiting on are reported and dropped.
 - **Malformed messages.** A message with a `method` is answered under its own id when that id is valid and appears once; anything unreadable is answered under `null`, as the specification requires. A broken *response* is never answered (an error under its id would read as an answer to one of the peer's requests); it ends the call it names instead.
 - **Budgets.** `Limits` caps message bytes (64 MiB), header bytes (8 KiB, the terminating blank line included), header lines (32), batch size (1024, or 0 for no batches), the length an oversized body may announce and still be skipped, and every JSON budget of `jsonx-lib` (depth 128 by default). An oversized message is skipped as it arrives, never buffered, and answered; a broken frame ends the connection, since no reliable boundary is left. The defaults suit a local peer; `Limits::network()` and `Limits::strict()` suit remote ones, since a handler that parses `params` builds a value tree that can be several times the message's size.
-- **Output.** A `Sink` runs under the endpoint's lock. `Framed` writes in the sending thread, which is fine for a peer that always reads; `Queued` and `outbox` never block the sender: messages wait in a bounded queue (bytes, messages, and a write timeout), and a peer that stops reading closes the connection instead of freezing it. Messages this side sends before the gate opens are held, within `Config::max_held_bytes`.
+- **Output.** A `Sink` runs under the endpoint's lock. `Framed` writes in the sending thread, which is fine for a peer that always reads; with `Queued` and `outbox` a send does not wait on the peer: messages wait in a bounded queue (bytes, messages, and a no-progress write timeout), and a peer that stops reading closes the connection instead of freezing it. Closing takes the lock only to close the queue; the closing thread then waits for the drain without it, for at most `QueueLimits::close_timeout` (10 s), and other threads see the connection closed at once. Messages this side sends before the gate opens are held, within `Config::max_held_bytes`.
+- **Calls.** Dropping a `Call` before its outcome cancels the request: its pending slot is freed and the peer is told, as a dropped future should (a `select!` that took another branch). `Call::detach` keeps a request outstanding without a waiter.
 - **Deadlines.** A request's deadline fires on its own: a timer thread, started with the first deadline and stopped when the connection closes, ends the call with `TimedOut` and tells the peer to cancel, even when nothing else happens. `Config::with_timer(false)` leaves them to the caller.
 - **Panics.** Handler, interceptor, and event-hook panics are caught; so are panics in a `Sink` or a `Queued` writer, which close the connection as an I/O error. This needs `panic = "unwind"`, Rust's default. An I/O error a handler forwards with `?` reaches the peer as "the transport failed", without the operating system's text.
 - **Threads.** Handlers run on the endpoint's thread, one at a time, in arrival order. `Peer`, `Call`, `Responder`, and `Canceller` are `Send` and work from any thread. The endpoint's lock is held to encode a message and hand it to the sink, never while a handler or hook runs; with `Queued` or `outbox`, never during a write either. A message sent from a worker goes out at once, even while a handler runs.
-- **Observability.** `Endpoint::stats()` and `Peer::stats()` give the connection's counters (traffic both ways, errors, timeouts, evictions, cancellations, panics) and gauges (pending, in flight, held). The `tracing` feature adds a span per call and events at documented levels; neither records `params`, results, or error data.
+- **Observability.** `Endpoint::stats()` and `Peer::stats()` give the connection's counters (traffic both ways, errors, timeouts, evictions, cancellations, panics) and gauges (pending, in flight, held). The `tracing` feature adds a span per call and events at documented levels. They record methods, ids, sizes, error codes, error messages, and panic messages, never `params`, results, or error `data` as such. Text the peer chose is clipped and escaped; an error message may quote part of what the peer sent (a `serde` error names the value that did not fit), clipped to 256 bytes.
+- **Serving.** `Server` closes a connection that leaves a message unfinished for `message_timeout` (30 s, also the time a new connection has to send its first message) or stays silent between messages for `idle_timeout` (300 s), so silent or trickling sockets cannot hold its `max_connections` slots. Its defaults are for untrusted peers: `Limits::network()` (4 MiB messages) and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop (10 ms, doubling to 1 s) instead of ending it.
 
 <hr>
 <br>
@@ -295,7 +297,7 @@ cargo bench --bench bench
 cargo +nightly fuzz run content_length   # also: newline, message, batch, endpoint
 ```
 
-[`tests/properties.rs`](./tests/properties.rs) holds the crate to independent references: a classifier built on a full `jsonx-lib` parse decides what every random envelope should decode to, and random batches check one response per request id. [`tests/fuzz_harness.rs`](./tests/fuzz_harness.rs) runs the fuzz targets' checks on random, JSON-shaped, and mutated bytes in every `cargo test`. [`tests/endpoint.rs`](./tests/endpoint.rs) runs section 7 of the JSON-RPC 2.0 specification verbatim, [`tests/framing.rs`](./tests/framing.rs) runs the framings against malformed and hostile streams, [`tests/session.rs`](./tests/session.rs) covers cancellation, timeouts, the gate, a client and server over a pipe, and races, [`tests/output.rs`](./tests/output.rs) stalls the peer, and [`tests/adversarial.rs`](./tests/adversarial.rs) holds one regression test per finding of the reviews. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+[`tests/properties.rs`](./tests/properties.rs) holds the crate to independent references: a classifier built on a full `jsonx-lib` parse decides what every random envelope should decode to, and random batches check one response per request id. [`tests/fuzz_harness.rs`](./tests/fuzz_harness.rs) runs the fuzz targets' checks on random, JSON-shaped, and mutated bytes in every `cargo test`. [`tests/endpoint.rs`](./tests/endpoint.rs) runs section 7 of the JSON-RPC 2.0 specification verbatim, [`tests/framing.rs`](./tests/framing.rs) runs the framings against malformed and hostile streams, [`tests/session.rs`](./tests/session.rs) covers cancellation, timeouts, the gate, a client and server over a pipe, and races, [`tests/output.rs`](./tests/output.rs) stalls the peer, and [`tests/adversarial.rs`](./tests/adversarial.rs) holds regression tests for the 0.2 review's findings; the 0.3 audits' regressions sit with the behaviour they cover (`tests/output.rs`, `tests/server.rs`, `tests/session.rs`, `tests/typed.rs`, `tests/tracing.rs`). Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>
@@ -304,12 +306,13 @@ cargo +nightly fuzz run content_length   # also: newline, message, batch, endpoi
 
 CI builds and tests on:
 
-- Linux (x86_64), and a 32-bit check (i686)
+- Linux (x86_64), and 32-bit Linux (i686)
 - macOS (Apple Silicon)
 - Windows (x86_64)
-- bare metal (`thumbv7em-none-eabihf`) for the `no_std` layers
 
-The crate uses only `std`'s threads, channels, clocks, and sockets, and no platform-specific code beyond Unix domain sockets in `Server::serve_unix`. Other targets (aarch64 Linux, x86_64 macOS) are expected to work but are not exercised by CI.
+and builds (without running) the `no_std` layers for bare metal (`thumbv7em-none-eabihf`).
+
+The crate uses only `std`'s threads, channels, clocks, and sockets, and no platform-specific code beyond Unix domain sockets in `Server::serve_unix` and how `Server` waits for a socket to become readable on Windows (a short timed `peek`, since shutting a socket down there does not wake a blocked read). Other targets (aarch64 Linux, x86_64 macOS) are expected to work but are not exercised by CI.
 
 <hr>
 <br>

@@ -59,7 +59,9 @@
 //!   reads an async one (`futures-io`). `Call` is a `Future`. Needs `std`.
 //! - **Output** (`Sink`, `Framed`, `Queued`, `outbox`): where messages go.
 //!   `Queued` writes from its own thread and `outbox` from an async task,
-//!   behind `QueueLimits`, so a peer that stops reading blocks no sender.
+//!   behind `QueueLimits`, so a peer that stops reading blocks no sender
+//!   while the connection is open; closing waits for the drain outside the
+//!   endpoint's lock, for at most `QueueLimits::close_timeout`.
 //!   Needs `std`.
 //! - **Serving** (`serve`, and `Server` with the `net` feature): one call
 //!   over a byte stream, or an accept loop over TCP and Unix sockets.
@@ -91,7 +93,8 @@
 //!   on its own; without it the instrumentation compiles to nothing.
 //! - `net`: `Server`, an accept loop over TCP and Unix domain sockets.
 //!
-//! Every optional feature is off by default and adds only what it names.
+//! Every optional feature is off by default, and adds only the crates it
+//! names and their own dependencies.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -23,19 +23,20 @@
 
 ## [0.3.0] — 2026-10-13
 
-Hardening, and the adapters around the engine: non-blocking output, self-firing deadlines, an async adapter, typed params, observability, protocol presets, serving helpers, and fuzz targets for every parser of untrusted input. Fixes every finding of the 2026-10-13 audit. See [`docs/release/v0.3.0.md`](./docs/release/v0.3.0.md).
+Hardening, and the adapters around the engine: non-blocking output, self-firing deadlines, an async adapter, typed params, observability, protocol presets, serving helpers, and fuzz targets for every parser of untrusted input. Fixes the findings of the 2026-10-13 audit and of its release verification, except six deferred or waived with reasons in `dev/ROADMAP.md` and `dev/DIRECTIVES.md` (RPC-COR-06, RPC-CQ-05, and RPC-STD-05 deferred; RPC-CQ-01, RPC-STD-03, and RPC-STD-04 waived). See [`docs/release/v0.3.0.md`](./docs/release/v0.3.0.md).
 
 ### Added
 
-- **Non-blocking output:** `Queued`, a `Sink` that frames messages into a bounded queue and writes them from its own thread; `outbox()`, the same queue drained by an async task (`OutboxSink` for the endpoint, `Outbox` with `poll_chunk`/`consume` for the writer); `QueueLimits` (`max_bytes` 64 MiB, `max_messages` 65,536, `write_timeout` 60 s). A provided `Sink::close`, called once when the endpoint closes.
+- **Non-blocking output:** `Queued`, a `Sink` that frames messages into a bounded queue and writes them from its own thread; `outbox()`, the same queue drained by an async task (`OutboxSink` for the endpoint, `Outbox` with `poll_chunk`/`consume` for the writer); `QueueLimits` (`max_bytes` 64 MiB, `max_messages` 65,536, `write_timeout` 60 s without progress, `close_timeout` 10 s). A provided `Sink::close`, called once when the endpoint closes or after a send or flush failed, and a provided `Sink::drain` returning a `Drain`: what the closing thread waits for after releasing the endpoint's lock.
 - **Self-firing deadlines:** a timer thread per connection, started with the first deadline, ends due requests with `TimedOut` and tells the peer, with no traffic and no waiter; `Config::timer` / `with_timer`.
-- **Async:** `Call` is a `Future`. `Endpoint::next_read`, `commit`, and `finish` (`run` taken apart, with `Next`) for any reader. The `futures-io` feature: `Endpoint::run_async`, `Outbox` as `AsyncRead` and `AsyncBufRead`, and `Outbox::write_to`.
+- **Async:** `Call` is a `Future`, and `Call::detach` lets a request run without a waiter. `Endpoint::next_read`, `commit`, and `finish` (`run` taken apart, with `Next`) for any reader. The `futures-io` feature: `Endpoint::run_async`, `Outbox` as `AsyncRead` and `AsyncBufRead`, and `Outbox::write_to`.
 - **Typed params and results** (the `serde` feature): `Router::request_typed`, `Router::notification_typed`, `Params::deserialize`, `Raw::deserialize`, `Json::serialize`, `Peer::notify_typed`, `Peer::request_typed`, `Call::wait_typed`, `Responder::ok_typed`, `Serialize`/`Deserialize` for `Id` and `ErrorCode`; `Error::Serialize`; `Event::InvalidParams`.
-- **Observability:** `Stats` from `Endpoint::stats` and `Peer::stats` (traffic both ways, errors, timeouts, evictions, cancellations, panics, and the pending, in-flight, and held gauges). The `tracing` feature: a span per call and events for what the endpoint does on its own, never `params` or results; off, it compiles to nothing.
+- **Observability:** `Stats` from `Endpoint::stats` and `Peer::stats` (traffic both ways, errors, timeouts, evictions, cancellations, panics, and the pending, in-flight, and held gauges). The `tracing` feature: a span per call and events for what the endpoint does on its own, never `params`, results, or error `data`; text the peer chose is clipped and escaped; off, it compiles to nothing.
 - **Interceptor:** `Router::intercept`, run before every routed call, for authorization, rate limits, or an audit log; `Event::Refused`.
 - **Presets:** `Limits::lsp`, `mcp`, `network`, `strict`, and `without_batches` (`max_batch` 0 refuses any batch with "batches are not accepted", for MCP since 2025-06-18); `Config::lsp` and `Config::mcp`; `Gate::lsp` and `Gate::mcp`; `Gate::allow_request` and `allow_requests` (MCP's `ping` before `initialize`).
 - **Progress:** `Progress` (MCP `notifications/progress`) and `WorkDone` (LSP `$/progress` begin, report, end); `Params::progress_token` and `Params::work_done_token`.
-- **Serving** (the `net` feature): `Server`, an accept loop with one endpoint per connection over TCP and Unix domain sockets, bounded by `max_connections`, with a `Stopper` and `Connection`.
+- **Serving** (the `net` feature): `Server`, an accept loop with one endpoint per connection over TCP and Unix domain sockets, bounded by `max_connections`, with a `Stopper` and `Connection`. Connections that leave a message unfinished (`with_message_timeout`, 30 s, also the time to send a first message) or stay silent (`with_idle_timeout`, 300 s) are closed. Defaults for untrusted peers: `Limits::network()` and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop instead of ending it.
+- `Endpoint::buffered_input`: the bytes read and held in the endpoint's decoder.
 - `Endpoint::run_with`, to read with a decoder the caller owns.
 - `Limits::max_skip_bytes` and `FrameError::TooLargeToSkip`: a Content-Length announcing more than can be skipped closes the connection.
 - `Config::max_held_bytes` (4 MiB) and `Error::Backlog`: a budget on messages held behind the gate.
@@ -47,7 +48,9 @@ Hardening, and the adapters around the engine: non-blocking output, self-firing 
 
 ### Changed
 
-- `serve` writes through a `Queued` sink, from a writer thread, and returns once what is queued has been written.
+- `serve` writes through a `Queued` sink, from a writer thread, and returns once what is queued has been written (for at most `close_timeout`).
+- Dropping a `Call` before its outcome cancels the request: its pending slot is freed and the peer is sent the cancel notification. `Call::detach` keeps the 0.2 behaviour.
+- Typed-param errors quote at most 256 bytes of `serde`'s message.
 - A request reusing the id of one still being answered is refused under a `null` id (and reported as `Event::Invalid`), so the real answer stays the only response with that id.
 - `From<Error> for ErrorObject` turns `Error::Io` into "the transport failed", without the operating system's text.
 - `Endpoint::is_closed` and `Peer::is_closed` read a flag instead of taking the endpoint's lock.
@@ -69,7 +72,9 @@ Hardening, and the adapters around the engine: non-blocking output, self-firing 
 
 ### Security
 
-- A peer that stops reading no longer stalls every thread that touches the endpoint (RPC-SEC-01): with `Queued` (which `serve` and `Server` use) or `outbox`, writes leave the endpoint's lock, and the connection closes once the queue's byte, message, or time limit is reached.
+- A peer that stops reading no longer stalls every thread that touches the endpoint (RPC-SEC-01): with `Queued` (which `serve` and `Server` use) or `outbox`, writes leave the endpoint's lock, and the connection closes once the queue's byte, message, or no-progress limit is reached. Closing waits for the queue to drain only after releasing the lock, and for at most `close_timeout`.
+- `Server` closes silent and trickling connections, so they cannot hold its connection slots, and starts from network budgets.
+- Peer-chosen text in `tracing` spans and events, and in typed-param errors, is clipped (and escaped in the log).
 - Per-connection memory follows the current message, not the largest seen (RPC-SEC-02).
 - `Limits::network` and `Limits::strict` for remote peers, and the memory amplification of `Params::parse` documented (RPC-SEC-03).
 - OS error text no longer reaches the peer through `?` on an `Error::Io` (RPC-SEC-04).

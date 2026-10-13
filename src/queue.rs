@@ -1,4 +1,4 @@
-//! Sinks whose senders never wait on the peer: [`Queued`] (a writer thread)
+//! Sinks whose senders do not wait on the peer: [`Queued`] (a writer thread)
 //! and [`outbox`] (an async task). Messages are framed into a bounded queue
 //! under [`QueueLimits`]; whoever drains it does the slow part, the write to
 //! the peer, without the endpoint's lock. Closing waits for the drain only
@@ -649,10 +649,11 @@ fn write_chunks<W: Write>(core: &Core, writer: &mut W, batch: &[u8]) -> io::Resu
 ///
 /// The [`OutboxSink`] goes into the [`Endpoint`](crate::Endpoint); the
 /// [`Outbox`] goes to a task that writes what it yields to the peer, on any
-/// executor. A send never waits on the peer, and the queue is bounded by
+/// executor. A send does not wait on the peer, and the queue is bounded by
 /// `limits`, as for [`Queued`] (`write_timeout` counts from the last
-/// [`consume`](Outbox::consume) that took bytes). When the endpoint closes, the outbox yields what is left,
-/// then ends; when the outbox is dropped, the sink fails, which closes the
+/// [`consume`](Outbox::consume) that took bytes). When the endpoint closes,
+/// the outbox yields what is left, then ends; closing does not wait for the
+/// task. When the outbox is dropped, the sink fails, which closes the
 /// endpoint.
 ///
 /// # Examples

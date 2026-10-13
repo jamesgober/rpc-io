@@ -81,8 +81,8 @@
 | [`Responder`](#responder), [`CancelToken`](#canceltoken) | structs | Answer a deferred request once; learn it was cancelled. |
 | [`Progress`, `WorkDone`](#progress-and-workdone) | structs | MCP `notifications/progress`; LSP `$/progress`. |
 | [`Config`](#config), [`Cancellation`](#cancellation), [`Gate`](#gate), [`Limits`](#limits) | structs | Settings, presets, and budgets. |
-| [`Sink`](#sink-and-framed), [`Framed`](#sink-and-framed) | trait, struct | Where outgoing messages go. |
-| [`Queued`, `outbox`, `Outbox`, `OutboxSink`, `QueueLimits`](#queued-and-outbox) | structs, fn | Outgoing queues that never block the sender. |
+| [`Sink`](#sink-and-framed), [`Framed`](#sink-and-framed), [`Drain`](#sink-and-framed) | trait, structs | Where outgoing messages go; what closing waits for. |
+| [`Queued`, `outbox`, `Outbox`, `OutboxSink`, `QueueLimits`](#queued-and-outbox) | structs, fn | Outgoing queues whose senders do not wait on the peer. |
 | [`Framing`](#framing), [`Decoder`](#decoder), [`FrameError`](#frameerror), `READ_CHUNK` | enum, struct, enum, const | Cut bodies out of a byte stream and frame them back. |
 | [`decode`](#decode), [`Incoming`, `Entry`](#incoming-and-entry), [`Message`](#message), [`Request`, `Notification`, `Response`](#request-notification-response), [`Invalid`](#invalid), [`write_batch`](#write_batch) | the message model | Read and write JSON-RPC 2.0 messages. |
 | [`Id`](#id), [`Raw`](#raw), [`Json`](#json), [`ErrorCode`](#errorcode), [`ErrorObject`](#errorobject) | values | Ids, JSON text, JSON to send, error codes and objects. |
@@ -173,7 +173,7 @@ A request gets a deadline from `Peer::request_with_timeout` or `Config::request_
 
 ### Output and slow peers
 
-Every outgoing message goes to the endpoint's [`Sink`](#sink-and-framed), with the endpoint's lock held. A sink that blocks (`Framed` writing to a peer that has stopped reading) blocks every sender for as long, the endpoint's own thread included. [`Queued`](#queued-and-outbox) and [`outbox`](#queued-and-outbox) never block: they frame each message into a bounded queue and a writer thread, or an async task, does the writes. When the peer falls behind past [`QueueLimits`](#queued-and-outbox) (64 MiB, 65,536 messages, or a write stalled 60 seconds, by default) the queue fails and the connection closes. [`serve`](#serve) and [`Server`](#server) use `Queued`.
+Every outgoing message goes to the endpoint's [`Sink`](#sink-and-framed), with the endpoint's lock held. A sink that blocks (`Framed` writing to a peer that has stopped reading) blocks every sender for as long, the endpoint's own thread included. With [`Queued`](#queued-and-outbox) and [`outbox`](#queued-and-outbox) a send does not wait on the peer: each message is framed into a bounded queue, and a writer thread, or an async task, does the writes. When the peer falls behind past [`QueueLimits`](#queued-and-outbox) (by default 64 MiB or 65,536 messages queued, or a writer that has written nothing for 60 seconds, checked at each send, flush, and close), the queue fails and the connection closes. Closing closes the queue under the lock without waiting; the closing thread then waits for what is queued to be written with the lock released, for at most `close_timeout` (10 s), so other threads see the connection closed at once. [`serve`](#serve) and [`Server`](#server) use `Queued`.
 
 ### Threads, turns, and panics
 
@@ -185,7 +185,7 @@ Handlers run on the thread that calls `handle` or `run`, one at a time, in arriv
 pub fn serve<R: Read, W: Write + Send + 'static>(input: R, output: W, framing: Framing, router: Router<()>) -> Result<End, Error>
 ```
 
-The one-call server: reads framed messages from `input`, answers them through `output` with the same framing, and returns when the input ends (`End::Eof`) or a handler calls `Context::stop` (`End::Stopped`). Default [`Config`](#config). Output goes through a [`Queued`](#queued-and-outbox) sink with the default limits, and `serve` returns once what is queued has been written (as long as the writes make progress). For state, settings, or sending to the peer, build an [`Endpoint`](#endpoint).
+The one-call server: reads framed messages from `input`, answers them through `output` with the same framing, and returns when the input ends (`End::Eof`) or a handler calls `Context::stop` (`End::Stopped`). Default [`Config`](#config). Output goes through a [`Queued`](#queued-and-outbox) sink with the default limits, and `serve` returns once what is queued has been written, or after `close_timeout` (10 s), or once the writes stop making progress. For state, settings, or sending to the peer, build an [`Endpoint`](#endpoint).
 
 **Errors:** as [`Endpoint::run`](#endpointrun); `Error::Io` if the writer thread cannot start.
 
@@ -204,14 +204,16 @@ With the `net` feature. An accept loop: one [`Endpoint`](#endpoint) per connecti
 
 | Method | Description |
 |---|---|
-| `new(framing) -> Self` | Defaults: `Config::new()`, `QueueLimits::new()`, 256 connections. |
+| `new(framing) -> Self` | Defaults for untrusted peers: `Config::new()` with `Limits::network()` (4 MiB messages), `QueueLimits::new()` with 8 MiB and 4,096 messages, 256 connections, a 30 s message timeout, a 300 s idle timeout. |
 | `with_config(self, config)`, `with_queue(self, limits)`, `with_max_connections(self, n)` | Settings for every connection; `max_connections` is at least 1. |
+| `with_message_timeout(self, Option<Duration>)`, `with_idle_timeout(self, Option<Duration>)` | How long a message may take to arrive once its first bytes have (and a new connection to send its first message); how long a connection may stay silent between messages. `None` is no limit. A connection past either is closed. |
+| `config(&self) -> &Config`, `queue(&self) -> QueueLimits`, `message_timeout(&self)`, `idle_timeout(&self)` | The settings. |
 | `max_connections(&self)`, `connections(&self)` | The bound, and connections served now. |
 | `stopper(&self) -> Stopper` | A `Clone + Send + Sync` handle: `stop()`, `is_stopped()`. |
 | `serve_tcp(&self, TcpListener, connect)` | Serves until stopped; `connect: FnMut(&Connection) -> (Router<S>, S)` runs once per connection. |
 | `serve_unix(&self, UnixListener, connect)` | The same over a Unix domain socket (Unix only). |
 
-At `max_connections` the loop stops accepting (the system queues further connections) until one ends. `Stopper::stop` stops accepting, shuts every open connection down (the peers see the stream end), and the serve call returns once every connection's thread has finished. `Connection` (`#[non_exhaustive]`) has `id` (counted from 0) and `addr`. **Errors:** the I/O error that ended the accept loop (aborted and reset connections are skipped).
+At `max_connections` the loop stops accepting (the system queues further connections) until one ends. A connection that leaves a message unfinished past `message_timeout`, or stays silent past `idle_timeout`, is closed, so silent or trickling sockets delay other clients by at most `message_timeout` and cannot lock them out. A read that times out closes the connection; the socket is not read again. Each connection's socket gets the queue's `write_timeout` as its write timeout, and a failed write shuts the connection down. A connection costs a reader thread, a writer thread, and, once a request with a deadline is sent on it, a timer thread. `Stopper::stop` stops accepting, shuts every open connection down (the peers see the stream end), and the serve call returns once every connection's thread has finished. `Connection` (`#[non_exhaustive]`) has `id` (counted from 0) and `addr`; the example below uses it, and the `Stopper`. **Errors:** the I/O error that ended the accept loop. Aborted and reset connections are skipped; running out of descriptors, buffers, or memory pauses the loop (10 ms, doubling to 1 s), and it carries on.
 
 ```rust
 # #[cfg(not(feature = "net"))] fn main() {}
@@ -259,7 +261,8 @@ One JSON-RPC connection: a [`Router`](#router), the state `S` its handlers work 
 | `run_with(&mut self, decoder: &mut Decoder, input) -> Result<End, Error>` | As `run`, with a decoder the caller owns (stream hand-off). |
 | `next_read(&mut self, framing) -> Result<Next, Error>`, `commit(&mut self, n)`, `finish(&mut self) -> Result<End, Error>` | `run` taken apart, for async and non-blocking readers: handle what is buffered, read into the returned buffer, commit the count. |
 | `run_async(&mut self, input: impl AsyncRead + Unpin, framing)` | `run` for an async stream (`futures-io`; see [the async adapter](#the-async-adapter-futures-io)). |
-| `close(&mut self)` | Closes: closes the sink, ends every `Call` with `Closed`, cancels deferred work. Idempotent. |
+| `close(&mut self)` | Closes: closes the sink, ends every `Call` with `Closed`, cancels deferred work; then, with the lock released, waits for the sink's [`Drain`](#sink-and-framed) (for `Queued`, at most `close_timeout`). Idempotent. |
+| `buffered_input(&self) -> usize` | Bytes read from the stream and held in the endpoint's decoder: part of a message, or read ahead. |
 | `is_closed(&self) -> bool` | Whether the connection has ended (read without the lock). |
 | `next_deadline(&self) -> Option<Instant>`, `expire(&self)` | The earliest deadline; expire what is due (with the timer off). |
 | `stats(&self) -> Stats` | The connection's [counters and gauges](#stats). |
@@ -762,10 +765,11 @@ pub trait Sink: Send + 'static {
     fn send(&mut self, message: &str) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
     fn close(&mut self) -> io::Result<()> { self.flush() }
+    fn drain(&mut self) -> Option<Drain> { None }
 }
 ```
 
-Each `send` is one unframed body; `flush` is called at the end of each turn and after each message from another thread; `close` once, when the endpoint closes. A sink is called with the endpoint's lock held and must not call back into the endpoint; a sink that blocks blocks every sender. An error, or a panic, closes the connection. Implemented for `mpsc::Sender<String>` (one string per message), [`Framed<W: Write + Send + 'static>`](#sink-and-framed), [`Queued`](#queued-and-outbox), and [`OutboxSink`](#queued-and-outbox).
+Each `send` is one unframed body; `flush` is called at the end of each turn and after each message from another thread; `close` once: when the endpoint closes, or after a send or flush failed. A sink is called with the endpoint's lock held and must not call back into the endpoint; a sink that blocks blocks every sender. `close` should not wait for the peer: a sink with writes still in flight returns a `Drain` from `drain` (asked for once, right after `close`, when the endpoint is closed rather than failed), and the closing thread waits on it after releasing the lock. `Drain::new(impl FnOnce() + Send + 'static)` wraps the wait; `wait(self)` runs it. `Queued` returns one that waits for its writer, for at most `close_timeout`. An error, or a panic, closes the connection. Implemented for `mpsc::Sender<String>` (one string per message), [`Framed<W: Write + Send + 'static>`](#sink-and-framed), [`Queued`](#queued-and-outbox), and [`OutboxSink`](#queued-and-outbox).
 
 `Framed` frames into a reused buffer and writes once per turn, or whenever the flush threshold (64 KiB by default) is waiting, in the sending thread. A buffer grown past twice the threshold by one large message is released after it is written. `Framed` has `new(writer, framing)`, `with_flush_threshold(bytes)`, `flush_threshold()`, `framing()`, `get_ref()`, `get_mut()`, `into_inner()`.
 
@@ -781,11 +785,11 @@ assert_eq!(framed.get_ref().as_slice(), b"Content-Length: 2\r\n\r\n{}");
 
 ## `Queued` and `Outbox`
 
-Outgoing queues that never block the sender: messages are framed into a bounded queue under the endpoint's lock, and the slow part, the write to the peer, happens elsewhere.
+Outgoing queues whose senders do not wait on the peer: messages are framed into a bounded queue under the endpoint's lock, and the slow part, the write to the peer, happens elsewhere, without the lock.
 
-- **`Queued`** (a `Sink`): `new(writer, framing)` and `with_limits(writer, framing, limits)` start a writer thread over any `Write + Send + 'static`, which writes each batch of queued messages with one `write_all` and one `flush`. `framing()`, `limits()`, `pending_bytes()`, `pending_messages()`. Closing (the endpoint closes, or the sink is dropped) writes what is queued and waits for that as long as the writer makes progress, then the writer is dropped. **Errors:** the I/O error from starting the thread.
+- **`Queued`** (a `Sink`): `new(writer, framing)` and `with_limits(writer, framing, limits)` start a writer thread over any `Write + Send + 'static`, which writes each batch of queued messages in chunks of at most 64 KiB, then one `flush`. `framing()`, `limits()`, `pending_bytes()`, `pending_messages()`. Closing the endpoint closes the queue without waiting, under the lock; its `Drain` then waits, without the lock, for what is queued to be written: until the writer is done, has made no progress for `write_timeout`, or `close_timeout` has passed. Dropping a `Queued` that was never closed does the same. When the writer finishes, the writer is dropped; a writer stuck in a write when the wait gives up ends when that write returns. **Errors:** the I/O error from starting the thread.
 - **`outbox(framing, limits) -> (OutboxSink, Outbox)`**: the same queue, drained by an async task. `OutboxSink` goes into the endpoint; `Outbox::poll_chunk(cx)` yields the next framed bytes (an empty chunk at the end), `consume(n)` records how many were written, `pending_bytes()`. With `futures-io`, `Outbox` is an `AsyncRead` and `AsyncBufRead`, and `write_to(writer)` drains it into any `AsyncWrite`. Dropping the `Outbox` fails the sink, which closes the endpoint.
-- **`QueueLimits`** (`#[non_exhaustive]`, `Copy`): `max_bytes` (64 MiB), `max_messages` (65,536), `write_timeout` (60 s; `None` waits forever), with `new()` and `with_*`. A message that would take the queue past a limit fails it (one message is always taken when it is empty), and so does any send once a write has stalled past `write_timeout`. A failed queue refuses everything with the same I/O error, which closes the endpoint.
+- **`QueueLimits`** (`#[non_exhaustive]`, `Copy`): `max_bytes` (64 MiB), `max_messages` (65,536), `write_timeout` (60 s; `None` waits forever), `close_timeout` (10 s), with `new()` and `with_*`. A message that would take the queue past a limit fails it (one message is always taken when it is empty). `write_timeout` is a no-progress timeout: every byte the peer takes restarts it, so a slow but steady reader is never cut off; it is checked at each send, flush, and close, which then fail. A writer blocked in a write cannot check it itself: give the writer its own write timeout (as `Server` does with its sockets) to have the write fail. A failed queue refuses everything with the same I/O error, which closes the endpoint.
 
 ```rust
 use std::task::{Context, Poll, Waker};
@@ -1162,5 +1166,5 @@ assert!(matches!(call.wait(), Err(CallError::Rejected(e)) if e.message() == "no"
 | `std` | yes | The endpoint and everything it uses (`Endpoint`, `serve`, `Router`, handles, `Config`, `Sink`, `Framed`, `Queued`, `outbox`, `Progress`, `WorkDone`, `Stats`, `Error`, `CallError`); forwards to `jsonx-lib/std`. Without it, the crate is `no_std` + `alloc`: framing, the message model, `Pending`. |
 | `serde` | no | Typed params and results (above); adds `serde` and `serde_json`. |
 | `futures-io` | no | The async adapter (above); adds `futures-io`. |
-| `tracing` | no | A debug span per call (method and id) and events for what the endpoint does on its own, under the `rpc_io` target; never `params`, results, or error data. Adds `tracing`. Off, the instrumentation compiles to nothing. |
+| `tracing` | no | A debug span per call (method and id) and events for what the endpoint does on its own, under the `rpc_io` target. Records methods, ids, sizes, error codes and messages, and panic messages; never `params`, results, or error `data` as such. Peer-chosen text is clipped and escaped (`Debug`), and an error message that quotes the peer's input (a `serde` error) is clipped to 256 bytes. Adds `tracing`. Off, the instrumentation compiles to nothing. |
 | `net` | no | `Server`, `Stopper`, `Connection`; `std` only. |

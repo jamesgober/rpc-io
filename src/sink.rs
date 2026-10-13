@@ -11,15 +11,17 @@ use crate::framing::Framing;
 /// or a batch, compact JSON, no framing); the sink frames and transmits it.
 /// [`flush`](Sink::flush) is called after each incoming message has been
 /// handled, and after each message sent from another thread, so a sink may
-/// buffer within a turn and write once. [`close`](Sink::close) is called once,
-/// when the endpoint closes.
+/// buffer within a turn and write once. [`close`](Sink::close) is called once:
+/// when the endpoint closes, or after a send or flush failed.
 ///
 /// The endpoint calls the sink with its internal lock held, from whichever
 /// thread sends: a sink must not call back into the endpoint or its handles,
 /// and a sink that blocks (a write to a peer that is not reading) blocks
 /// every sender for as long. [`Queued`](crate::Queued) and
-/// [`outbox`](crate::outbox) never block: they queue, within limits, and
-/// write from elsewhere.
+/// [`outbox`](crate::outbox) do not wait on the peer: they queue, within
+/// limits, and write from elsewhere. A sink with writes still in flight when
+/// it closes returns a [`Drain`] from [`drain`](Sink::drain), which the
+/// closing thread waits on after releasing the lock.
 ///
 /// Implemented for [`Framed`] (a byte stream, written by the sender),
 /// [`Queued`](crate::Queued) (a byte stream, written by its own thread),
