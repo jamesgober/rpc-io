@@ -29,6 +29,10 @@ const WAKE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const TICK: Duration = Duration::from_millis(250);
 
+/// The first and the longest pause of the accept loop when the system is
+/// out of descriptors or memory.
+const BACKOFF: (Duration, Duration) = (Duration::from_millis(10), Duration::from_secs(1));
+
 /// One accepted connection, as the server's `connect` callback sees it.
 ///
 /// # Examples
@@ -606,9 +610,14 @@ impl Server {
     /// # Errors
     ///
     /// The I/O error that ended the accept loop: reading the listener's
-    /// address, or an `accept` failure other than an aborted or reset
-    /// connection (which are skipped). Every open connection is shut down
-    /// first. A connection's own failures end only that connection.
+    /// address, or an `accept` failure that is not about one connection or a
+    /// passing shortage. An aborted or reset connection is skipped; running
+    /// out of file descriptors, buffers, or memory (`EMFILE`, `ENFILE`,
+    /// `ENOBUFS`, `ENOMEM`, and their Windows counterparts) pauses the loop,
+    /// from 10 ms doubling to 1 s, and it carries on: open connections keep
+    /// being served and free resources as they end. Every open connection is
+    /// shut down before an error is returned. A connection's own failures end
+    /// only that connection.
     ///
     /// # Examples
     ///
@@ -724,13 +733,25 @@ impl Server {
         }
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
         let mut next = 0u64;
+        let mut backoff = BACKOFF.0;
         let result = loop {
             if !self.wait_for_room() {
                 break Ok(());
             }
             let (stream, addr) = match accept() {
-                Ok(accepted) => accepted,
+                Ok(accepted) => {
+                    backoff = BACKOFF.0;
+                    accepted
+                }
                 Err(error) if transient(&error) => continue,
+                Err(_error) if exhausted(&_error) => {
+                    event!(warn, error = %_error, pause = ?backoff, "accept is out of resources; pausing");
+                    if !self.pause(backoff) {
+                        break Ok(());
+                    }
+                    backoff = (backoff * 2).min(BACKOFF.1);
+                    continue;
+                }
                 Err(error) => break Err(error),
             };
             if self.shared.lock().stopped {
@@ -765,6 +786,24 @@ impl Server {
         }
         state.wake = Some(wake);
         true
+    }
+
+    /// Sleeps for `pause`, or until stopped; `false` once stopped.
+    fn pause(&self, pause: Duration) -> bool {
+        let deadline = Instant::now() + pause;
+        let mut state = self.shared.lock();
+        while !state.stopped {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        !state.stopped
     }
 
     /// Waits until fewer than `max_connections` are open; `false` once
@@ -870,6 +909,26 @@ fn reachable(addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+/// Whether an `accept` error is the system running short of descriptors,
+/// buffers, or memory: worth waiting out, not ending the server for.
+fn exhausted(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    // ENOMEM, ENFILE, EMFILE, and ENOBUFS (105 on Linux, 55 on the BSDs and
+    // macOS); WSAEMFILE and WSAENOBUFS on Windows.
+    if cfg!(windows) {
+        matches!(code, 10024 | 10055)
+    } else if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+        matches!(code, 12 | 23 | 24 | 105)
+    } else {
+        matches!(code, 12 | 23 | 24 | 55)
+    }
+}
+
 /// Whether an `accept` error concerns one connection only.
 fn transient(error: &io::Error) -> bool {
     matches!(
@@ -878,4 +937,52 @@ fn transient(error: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::Interrupted
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resource_exhaustion_is_waited_out_and_other_errors_are_not() {
+        let out_of_files = if cfg!(windows) { 10024 } else { 24 };
+        assert!(exhausted(&io::Error::from_raw_os_error(out_of_files)));
+        assert!(exhausted(&io::Error::from(io::ErrorKind::OutOfMemory)));
+        assert!(!exhausted(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!exhausted(&io::Error::other("no code")));
+        assert!(transient(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+        assert!(!transient(&io::Error::from(io::ErrorKind::OutOfMemory)));
+    }
+
+    #[test]
+    fn test_pause_ends_early_on_a_stop() {
+        let server = Server::new(Framing::Newline);
+        let started = Instant::now();
+        assert!(server.pause(Duration::from_millis(20)));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        let stopper = server.stopper();
+        let waker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            stopper.stop();
+        });
+        let started = Instant::now();
+        assert!(!server.pause(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(waker.join().is_ok());
+    }
+
+    #[test]
+    fn test_reachable_replaces_unspecified_addresses() {
+        let v4: SocketAddr = ([0, 0, 0, 0], 9).into();
+        assert_eq!(reachable(v4).ip(), std::net::Ipv4Addr::LOCALHOST);
+        let v6: SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, 9).into();
+        assert_eq!(reachable(v6).ip(), std::net::Ipv6Addr::LOCALHOST);
+        let set: SocketAddr = ([10, 0, 0, 1], 9).into();
+        assert_eq!(reachable(set), set);
+    }
 }
