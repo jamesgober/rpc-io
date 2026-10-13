@@ -152,6 +152,10 @@ struct State {
     finished: bool,
     /// The async writer's task, while it waits for messages.
     waker: Option<Waker>,
+    /// The writer thread is waiting for messages: only then does a send
+    /// need to wake it (a busy writer takes everything queued when its
+    /// write returns).
+    idle: bool,
 }
 
 impl Core {
@@ -169,6 +173,7 @@ impl Core {
                 closed: false,
                 finished: false,
                 waker: None,
+                idle: false,
             }),
             signal: Condvar::new(),
         })
@@ -200,8 +205,11 @@ impl Core {
         }
         state.queued_messages += 1;
         let waker = state.waker.take();
+        let idle = std::mem::take(&mut state.idle);
         drop(state);
-        self.signal.notify_all();
+        if idle {
+            self.signal.notify_all();
+        }
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -518,10 +526,12 @@ fn write_loop<W: Write>(core: &Core, mut writer: W) {
                 if !state.queued.is_empty() {
                     break;
                 }
+                state.idle = true;
                 state = core
                     .signal
                     .wait(state)
                     .unwrap_or_else(PoisonError::into_inner);
+                state.idle = false;
             }
             state.take(&mut batch);
         }
