@@ -783,12 +783,16 @@ impl<S, K: Sink> Endpoint<S, K> {
                 return;
             }
         }
+        let params = Params::new(params, self.parser);
+        if let Some(refusal) = self.intercept(&method, Some(&id), &params) {
+            self.answer(Some(&id), batch, &Err(&refusal));
+            return;
+        }
         let Some(handler) = self.router.requests.get_mut(&*method) else {
             let error = ErrorObject::method_not_found(&method);
             let _reported = self.shared.lock().respond(Some(&id), batch, Err(&error));
             return;
         };
-        let params = Params::new(params, self.parser);
         match handler {
             RequestHandler::Now(handler) => {
                 let state = &mut self.state;
@@ -914,6 +918,18 @@ impl<S, K: Sink> Endpoint<S, K> {
                 return;
             }
         }
+        let params = Params::new(params, self.parser);
+        if let Some(refusal) = self.intercept(&method, None, &params) {
+            report(
+                &mut self.router.on_event,
+                &mut self.state,
+                &Event::Refused {
+                    method: &method,
+                    error: &refusal,
+                },
+            );
+            return;
+        }
         let Some(handler) = self.router.notifications.get_mut(&*method) else {
             report(
                 &mut self.router.on_event,
@@ -922,7 +938,6 @@ impl<S, K: Sink> Endpoint<S, K> {
             );
             return;
         };
-        let params = Params::new(params, self.parser);
         let state = &mut self.state;
         let mut cx = Context::new(&self.link, stop, None, &method);
         match contain(|| handler(state, params, &mut cx)) {
@@ -945,6 +960,35 @@ impl<S, K: Sink> Endpoint<S, K> {
                         message: &panic_message(payload.as_ref()),
                     },
                 );
+            }
+        }
+    }
+
+    /// Runs the router's interceptor on a call; the error to refuse it with,
+    /// if any. A panic in the interceptor refuses the call as a handler panic
+    /// would answer it.
+    fn intercept(
+        &mut self,
+        method: &str,
+        id: Option<&Id<'_>>,
+        params: &Params<'_>,
+    ) -> Option<ErrorObject> {
+        let hook = self.router.intercept.as_mut()?;
+        let state = &mut self.state;
+        match contain(|| hook(state, method, id, params)) {
+            Ok(Ok(())) => None,
+            Ok(Err(refusal)) => Some(refusal),
+            Err(payload) => {
+                self.shared.lock().count_panic();
+                report(
+                    &mut self.router.on_event,
+                    &mut self.state,
+                    &Event::Panicked {
+                        method,
+                        message: &panic_message(payload.as_ref()),
+                    },
+                );
+                Some(ErrorObject::internal_error("the handler panicked"))
             }
         }
     }
@@ -1132,6 +1176,9 @@ fn trace_event(event: &Event<'_>) {
         }
         Event::Cancelled { id } => {
             event!(debug, id = %id, "the peer cancelled a request");
+        }
+        Event::Refused { method, error } => {
+            event!(debug, method = %method, code = error.code().0, "a notification was refused by the interceptor");
         }
         Event::InvalidParams { method, error } => {
             event!(debug, method = %method, message = %error.message(), "a notification's params did not fit its handler");

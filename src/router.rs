@@ -26,6 +26,8 @@ pub(crate) type DeferredFn<S> =
 pub(crate) type NotificationFn<S> =
     Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<(), ErrorObject> + Send>;
 pub(crate) type EventFn<S> = Box<dyn FnMut(&mut S, &Event<'_>) + Send>;
+pub(crate) type InterceptFn<S> =
+    Box<dyn FnMut(&mut S, &str, Option<&Id<'_>>, &Params<'_>) -> Result<(), ErrorObject> + Send>;
 
 /// How a request method is answered.
 pub(crate) enum RequestHandler<S> {
@@ -81,6 +83,7 @@ pub struct Router<S> {
     pub(crate) requests: BTreeMap<Box<str>, RequestHandler<S>>,
     pub(crate) notifications: BTreeMap<Box<str>, NotificationFn<S>>,
     pub(crate) on_event: Option<EventFn<S>>,
+    pub(crate) intercept: Option<InterceptFn<S>>,
 }
 
 impl<S> Router<S> {
@@ -98,6 +101,7 @@ impl<S> Router<S> {
             requests: BTreeMap::new(),
             notifications: BTreeMap::new(),
             on_event: None,
+            intercept: None,
         }
     }
 
@@ -227,6 +231,55 @@ impl<S> Router<S> {
         F: FnMut(&mut S, &Event<'_>) + Send + 'static,
     {
         self.on_event = Some(Box::new(hook));
+        self
+    }
+
+    /// Runs `hook` before every call the router would route: each request
+    /// and each notification, after the gate and cancellation have had their
+    /// say and before the handler is looked up. `Ok(())` lets the call
+    /// through; `Err(error)` refuses it: a request is answered with `error`,
+    /// a notification is dropped and reported as [`Event::Refused`]. The
+    /// place for authorization, rate limits, or an audit log. The hook gets
+    /// the state, the method, the id (`None` for a notification), and the
+    /// params; a panic in it is contained as a handler's would be.
+    /// Registering a hook again replaces it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, ErrorCode, ErrorObject, Router};
+    ///
+    /// #[derive(Default)]
+    /// struct Session { calls: u32, admin: bool }
+    ///
+    /// let router = Router::new()
+    ///     .request("admin/reset", |_: &mut Session, _, _| Ok(()))
+    ///     .request("ping", |_, _, _| Ok("pong"))
+    ///     .intercept(|session, method, _id, _params| {
+    ///         session.calls += 1;
+    ///         if method.starts_with("admin/") && !session.admin {
+    ///             return Err(ErrorObject::new(ErrorCode(1003), "forbidden"));
+    ///         }
+    ///         Ok(())
+    ///     });
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, Session::default());
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"admin/reset"}"#)?;
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)?;
+    /// let replies: Vec<String> = rx.try_iter().collect();
+    /// assert_eq!(replies[0], r#"{"jsonrpc":"2.0","id":1,"error":{"code":1003,"message":"forbidden"}}"#);
+    /// assert_eq!(replies[1], r#"{"jsonrpc":"2.0","id":2,"result":"pong"}"#);
+    /// assert_eq!(endpoint.state().calls, 2);
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn intercept<F>(mut self, hook: F) -> Self
+    where
+        F: FnMut(&mut S, &str, Option<&Id<'_>>, &Params<'_>) -> Result<(), ErrorObject>
+            + Send
+            + 'static,
+    {
+        self.intercept = Some(Box::new(hook));
         self
     }
 
@@ -683,6 +736,14 @@ pub enum Event<'a> {
     Cancelled {
         /// The cancelled request's id.
         id: &'a Id<'a>,
+    },
+    /// A notification refused by the router's
+    /// [interceptor](Router::intercept); it was not handled.
+    Refused {
+        /// The method.
+        method: &'a str,
+        /// The interceptor's error.
+        error: &'a ErrorObject,
     },
     /// A notification's params did not fit what its handler takes (a
     /// [typed](Router::notification_typed) handler, with the `serde`

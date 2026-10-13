@@ -667,3 +667,87 @@ fn test_context_reports_method_and_id_and_sends_before_the_response() {
         ]
     );
 }
+
+// --- The interceptor --------------------------------------------------------
+
+#[test]
+fn test_interceptor_refuses_requests_and_notifications_and_sees_params() {
+    let router = Router::new()
+        .request("open", |_: &mut Vec<String>, _, _| Ok("opened"))
+        .notification("note", |log, _, _| log.push("note handled".into()))
+        .intercept(|log, method, id, params| {
+            log.push(format!(
+                "{method} {} {}",
+                id.map(ToString::to_string).unwrap_or_default(),
+                params
+                    .raw()
+                    .map(|r| r.as_str().to_owned())
+                    .unwrap_or_default()
+            ));
+            if params.parse()?["token"] == "secret" {
+                Ok(())
+            } else {
+                Err(ErrorObject::new(ErrorCode(1003), "unauthorized"))
+            }
+        })
+        .on_event(|log, event| {
+            if let Event::Refused { method, error } = event {
+                log.push(format!("refused {method}: {}", error.message()));
+            }
+        });
+    let (mut e, rx) = endpoint(router, Vec::new());
+    for body in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"open","params":{"token":"secret"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"open","params":{"token":"guess"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"missing","params":{}}"#,
+        r#"[{"jsonrpc":"2.0","method":"note","params":{}},{"jsonrpc":"2.0","method":"note","params":{"token":"secret"}}]"#,
+    ] {
+        assert!(e.handle(body.as_bytes()).is_ok());
+    }
+    assert_eq!(
+        sent(&rx),
+        [
+            r#"{"jsonrpc":"2.0","id":1,"result":"opened"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":1003,"message":"unauthorized"}}"#,
+            // Refused before the method is looked up: no `-32601` leaks out.
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":1003,"message":"unauthorized"}}"#,
+        ]
+    );
+    assert_eq!(
+        e.state(),
+        &[
+            r#"open 1 {"token":"secret"}"#,
+            r#"open 2 {"token":"guess"}"#,
+            "missing 3 {}",
+            "note  {}",
+            "refused note: unauthorized",
+            r#"note  {"token":"secret"}"#,
+            "note handled",
+        ]
+    );
+}
+
+#[test]
+fn test_interceptor_panic_is_contained() {
+    quiet_deliberate_panics();
+    let router = Router::new()
+        .request("m", |_: &mut u32, _, _| Ok(1))
+        .notification("n", |_, _, _| {})
+        .intercept(|_, _, _, _| panic!("deliberate: interceptor"))
+        .on_event(|panics, event| {
+            if matches!(event, Event::Panicked { .. }) {
+                *panics += 1;
+            }
+        });
+    let (mut e, rx) = endpoint(router, 0);
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#)
+            .is_ok()
+    );
+    assert!(e.handle(br#"{"jsonrpc":"2.0","method":"n"}"#).is_ok());
+    let replies = sent(&rx);
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].starts_with(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603"#));
+    assert_eq!(*e.state(), 2);
+    assert_eq!(e.stats().panics, 2);
+}
