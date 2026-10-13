@@ -626,6 +626,13 @@ impl<S, K: Sink> Endpoint<S, K> {
         self.input.as_ref().map_or(0, Decoder::buffered)
     }
 
+    /// Whether the input stopped inside a message (see
+    /// [`Decoder::in_message`]).
+    #[cfg(feature = "net")]
+    pub(crate) fn mid_message(&self) -> bool {
+        self.input.as_ref().is_some_and(Decoder::in_message)
+    }
+
     /// Ends the input: handles what is left buffered (a last line without
     /// its `\n`), then closes the endpoint, unless a handler stops it first.
     ///

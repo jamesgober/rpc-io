@@ -261,6 +261,72 @@ fn test_silent_sockets_cannot_lock_out_a_client() {
 }
 
 #[test]
+fn test_a_client_streaming_past_the_message_deadline_is_served() {
+    // Found by the verifier (RPC3-001): when every read ended inside the next
+    // message, the message deadline never restarted, and a busy client was
+    // cut off one `message_timeout` after it began.
+    let (listener, addr) = listener();
+    let server =
+        Server::new(Framing::Newline).with_message_timeout(Some(Duration::from_millis(300)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    let (mut client, mut reader) = connect(addr);
+    let count = 120;
+    let wire: Vec<u8> = (0..count)
+        .flat_map(|id| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}
+"
+            )
+            .into_bytes()
+        })
+        .collect();
+    // A message and a half every 20 ms, for about 2 s: every read ends inside
+    // the next message, and the stream lasts several deadlines.
+    let chunk = wire.len() * 3 / (2 * count);
+    let writer = thread::spawn(move || {
+        for piece in wire.chunks(chunk) {
+            if client.write_all(piece).is_err() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        true
+    });
+    let started = Instant::now();
+    let mut answered = 0;
+    let mut line = String::new();
+    while answered < count {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(n) if n > 0 => {
+                assert!(line.contains("pong"), "{line}");
+                answered += 1;
+            }
+            other => panic!(
+                "cut off after {answered} answers at {:?}: {other:?}",
+                started.elapsed()
+            ),
+        }
+    }
+    assert!(writer.join().is_ok_and(|wrote| wrote));
+    assert!(
+        started.elapsed() > Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
 fn test_idle_and_unfinished_connections_are_closed() {
     let (listener, addr) = listener();
     let server = Server::new(Framing::Newline)

@@ -66,9 +66,12 @@ pub struct Connection {
 /// connection ends. So is the time a connection can hold a slot without
 /// doing anything: a connection that does not complete a message within
 /// `message_timeout` of starting it (or of connecting), or sends nothing for
-/// `idle_timeout` between messages, is closed. A few silent or trickling
-/// sockets therefore delay other clients by at most `message_timeout`; they
-/// cannot lock them out. Each connection costs a reader thread, a writer
+/// `idle_timeout` between messages, is closed. The message deadline is per
+/// message: it starts with the read that brings a message's first bytes and
+/// restarts each time a message completes, so a client streaming messages
+/// back to back is never cut off, while one message trickled in forever is.
+/// A few silent or trickling sockets therefore delay other clients by at
+/// most `message_timeout`; they cannot lock them out. Each connection costs a reader thread, a writer
 /// thread, and, once a request with a deadline is sent on it, a timer thread.
 /// The defaults bound a connection's memory to about a 4 MiB message (and
 /// the value tree a handler parses from it) plus an 8 MiB queue; raise them
@@ -397,12 +400,14 @@ fn serve_connection<T: Stream, S>(
             Err(error) => return Ending::Failed(error),
         }
         let finished = handled(endpoint);
-        if endpoint.buffered_input() > 0 {
+        if finished != done {
+            // A message ended. What follows it began in the last read: its
+            // own `message_timeout` runs from there.
+            done = finished;
+            busy_since = endpoint.mid_message().then_some(last_read);
+        } else if endpoint.mid_message() {
             // Part of a message: due `message_timeout` after its first bytes.
             busy_since = busy_since.or(Some(last_read));
-        } else if finished != done {
-            done = finished;
-            busy_since = None;
         }
         let deadline = match busy_since {
             Some(since) => deadlines.message.and_then(|t| since.checked_add(t)),

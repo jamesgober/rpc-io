@@ -477,6 +477,22 @@ impl Decoder {
         self.end - self.start
     }
 
+    /// Whether the decoder is inside a message: holding part of one, past
+    /// its headers, or skipping the rest of an oversized one.
+    #[cfg(feature = "net")]
+    pub(crate) fn in_message(&self) -> bool {
+        let fresh = match self.state {
+            State::Headers {
+                lines,
+                bytes,
+                length,
+            } => lines == 0 && bytes == 0 && length.is_none(),
+            State::Line => true,
+            State::Body { .. } | State::Skip { .. } | State::Discard => false,
+        };
+        self.buffered() > 0 || !fresh
+    }
+
     /// The most memory the buffer can ever hold under these limits.
     ///
     /// # Examples
