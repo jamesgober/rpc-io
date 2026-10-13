@@ -129,7 +129,7 @@ For any input, an [`Endpoint`](#endpoint):
 | Code | Constant | When the endpoint answers with it |
 |---:|---|---|
 | `-32700` | `ErrorCode::PARSE_ERROR` | The body is not valid JSON (including invalid UTF-8), or a batch has a syntax error anywhere. Always under `null`. |
-| `-32600` | `ErrorCode::INVALID_REQUEST` | Valid JSON but not a valid message: wrong `jsonrpc`, non-string `method`, non-structured `params`, a bad id, a repeated envelope member, an empty or oversized batch, a message over a JSON budget or over `max_message_bytes`, a repeated opening request, an id already in flight. |
+| `-32600` | `ErrorCode::INVALID_REQUEST` | Valid JSON but not a valid message: wrong `jsonrpc`, non-string `method`, non-structured `params`, a bad id, a repeated envelope member, an empty or oversized batch, a message over a JSON budget or over `max_message_bytes`, a repeated opening request, an id already in flight (answered under `null`, so the in-flight request's answer stays the only response with that id). |
 | `-32601` | `ErrorCode::METHOD_NOT_FOUND` | No request handler for the method. |
 | `-32602` | `ErrorCode::INVALID_PARAMS` | Returned by handlers; `Params::parse` produces it for params that do not parse (duplicate keys, budgets). |
 | `-32603` | `ErrorCode::INTERNAL_ERROR` | A handler panicked, or a `Responder` was dropped without answering. |

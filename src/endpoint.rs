@@ -85,8 +85,9 @@ pub enum End {
 /// What it guarantees, for any input:
 ///
 /// - every request gets exactly one response, and no notification gets one
-///   (the only answer under a `null` id is to a message whose id could not be
-///   read, as JSON-RPC 2.0 prescribes);
+///   (an answer under a `null` id goes to a message whose id could not be
+///   read, as JSON-RPC 2.0 prescribes, or to a request reusing the id of one
+///   still being answered, which must not get a second response under it);
 /// - malformed messages are answered with the spec's codes (`-32700` for
 ///   invalid JSON, `-32600` for an invalid envelope or an empty or oversized
 ///   batch, `-32601` for an unknown method), under their own id when it could
@@ -517,9 +518,27 @@ impl<S, K: Sink> Endpoint<S, K> {
 
     fn on_request(&mut self, request: Request<'_>, batch: Option<u64>, stop: &mut bool) {
         let Request { id, method, params } = request;
-        if let Some(refusal) = self.admit(&id, &method, batch) {
-            self.answer(Some(&id), batch, &Err(&refusal));
-            return;
+        match self.admit(&id, &method, batch) {
+            Admission::Admitted => {}
+            Admission::Refused(refusal) => {
+                self.answer(Some(&id), batch, &Err(&refusal));
+                return;
+            }
+            Admission::DuplicateId(refusal) => {
+                // Under `null`: an error under the id would be a second
+                // response with that id, which the peer could not tell apart
+                // from the answer still to come.
+                self.answer(None, batch, &Err(&refusal));
+                report(
+                    &mut self.router.on_event,
+                    &mut self.state,
+                    &Event::Invalid {
+                        error: &refusal,
+                        answered: true,
+                    },
+                );
+                return;
+            }
         }
         let Some(handler) = self.router.requests.get_mut(&*method) else {
             let error = ErrorObject::method_not_found(&method);
@@ -581,41 +600,40 @@ impl<S, K: Sink> Endpoint<S, K> {
         }
     }
 
-    /// Checks a request against the in-flight ids and the gate; the error to
-    /// refuse it with, if any. Opens the gate's opening phase for the opening
-    /// request.
-    fn admit(&self, id: &Id<'_>, method: &str, batch: Option<u64>) -> Option<ErrorObject> {
+    /// Checks a request against the in-flight ids and the gate. Opens the
+    /// gate's opening phase for the opening request.
+    fn admit(&self, id: &Id<'_>, method: &str, batch: Option<u64>) -> Admission {
         let mut inner = self.shared.lock();
         if inner.in_flight(id) {
-            // Answering it normally would put two responses with one id on
-            // the wire, and the peer could not tell them apart.
-            return Some(ErrorObject::invalid_request(
+            return Admission::DuplicateId(ErrorObject::invalid_request(
                 "the id is already used by a request still being answered",
             ));
         }
-        let gate = self.gate.as_ref()?;
+        let Some(gate) = self.gate.as_ref() else {
+            return Admission::Admitted;
+        };
         let opening = method == gate.method;
-        match &inner.gate {
-            GateState::Open if opening => Some(ErrorObject::invalid_request(format!(
-                "`{}` was already received",
-                clip(method)
-            ))),
-            GateState::Open => None,
-            GateState::Opening(_) if opening => Some(ErrorObject::invalid_request(format!(
+        let refusal = match &inner.gate {
+            GateState::Open if opening => {
+                ErrorObject::invalid_request(format!("`{}` was already received", clip(method)))
+            }
+            GateState::Open => return Admission::Admitted,
+            GateState::Opening(_) if opening => ErrorObject::invalid_request(format!(
                 "`{}` is already being answered",
                 clip(method)
-            ))),
-            GateState::Opening(_) => Some(not_initialized(gate)),
-            GateState::Closed if !opening => Some(not_initialized(gate)),
-            GateState::Closed if batch.is_some() => Some(ErrorObject::invalid_request(format!(
+            )),
+            GateState::Opening(_) => not_initialized(gate),
+            GateState::Closed if !opening => not_initialized(gate),
+            GateState::Closed if batch.is_some() => ErrorObject::invalid_request(format!(
                 "`{}` cannot be sent in a batch",
                 clip(method)
-            ))),
+            )),
             GateState::Closed => {
                 inner.gate = GateState::Opening(id.clone().into_owned());
-                None
+                return Admission::Admitted;
             }
-        }
+        };
+        Admission::Refused(refusal)
     }
 
     fn on_notification(&mut self, notification: Notification<'_>, stop: &mut bool) {
@@ -774,6 +792,16 @@ where
     W: Write + Send + 'static,
 {
     Endpoint::new(Framed::new(output, framing), router, ()).run(input, framing)
+}
+
+/// What [`Endpoint::admit`] decided about a request.
+enum Admission {
+    /// Route it to its handler.
+    Admitted,
+    /// Answer it with this error, under its id.
+    Refused(ErrorObject),
+    /// Its id is in flight already: answer with this error under `null`.
+    DuplicateId(ErrorObject),
 }
 
 /// Whether an entry of a batch will be answered.

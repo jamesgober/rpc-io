@@ -485,8 +485,9 @@ fn test_id_still_in_flight_is_refused() {
     let (mut e, rx) = spec();
     assert!(exchange(&mut e, &rx, r#"{"jsonrpc":"2.0","id":5,"method":"later"}"#).is_empty());
     let reply = one(&mut e, &rx, r#"{"jsonrpc":"2.0","id":5,"method":"later"}"#);
+    // Under `null`, not `5`: the only response under `5` is the real answer.
     assert!(
-        reply.starts_with(r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"#),
+        reply.starts_with(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"#),
         "{reply}"
     );
     // The first request is still the one in flight, and is answered once.
