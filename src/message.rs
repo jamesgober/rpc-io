@@ -740,7 +740,18 @@ fn read_id(raw: &str) -> IdValue<'_> {
 /// notification); `None` when absent, repeated, or not a valid id.
 #[cfg(feature = "std")]
 pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser) -> Option<Id<'a>> {
-    let mut reader = parser.reader(params);
+    match read_id(read_member(params, member, parser)?) {
+        IdValue::Valid(id) => Some(id),
+        IdValue::Null | IdValue::Invalid => None,
+    }
+}
+
+/// The raw value of member `member` of the object `object`; `None` when
+/// `object` is not an object, or the member is absent or repeated (two
+/// values: acting on either could be wrong).
+#[cfg(feature = "std")]
+pub(crate) fn read_member<'a>(object: &'a str, member: &str, parser: &Parser) -> Option<&'a str> {
+    let mut reader = parser.reader(object);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return None;
     }
@@ -750,18 +761,20 @@ pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser)
             Ok(Some(Event::Key(key))) => {
                 let raw = reader.read_raw().ok()??;
                 if *key == *member && found.replace(raw).is_some() {
-                    // Two targets: cancelling either could be the wrong one.
                     return None;
                 }
             }
-            Ok(Some(Event::EndObject)) => break,
+            Ok(Some(Event::EndObject)) => return found,
             _ => return None,
         }
     }
-    match read_id(found?) {
-        IdValue::Valid(id) => Some(id),
-        IdValue::Null | IdValue::Invalid => None,
-    }
+}
+
+/// Whether `raw` (validated JSON) is a string or an integer within `i64`:
+/// what JSON-RPC ids and progress tokens may be.
+#[cfg(feature = "std")]
+pub(crate) fn is_token(raw: &str) -> bool {
+    matches!(read_id(raw), IdValue::Valid(_))
 }
 
 /// The text of a raw JSON string, borrowed when it has no escapes; `None` if

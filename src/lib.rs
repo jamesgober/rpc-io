@@ -112,6 +112,8 @@ mod handles;
 #[cfg(feature = "std")]
 mod link;
 #[cfg(feature = "std")]
+mod progress;
+#[cfg(feature = "std")]
 mod queue;
 #[cfg(feature = "std")]
 mod router;
@@ -148,6 +150,9 @@ pub use error::{CallError, Error};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use handles::{Call, CancelToken, Canceller, Peer, Responder};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use progress::{Progress, WorkDone};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use queue::{Outbox, OutboxSink, QueueLimits, Queued, outbox};

@@ -42,9 +42,10 @@ pub enum Error {
     /// already reach [`Config::max_held_bytes`](crate::Config). This one was
     /// not sent or held; the connection is still open.
     Backlog,
-    /// A value could not be written as JSON (the `serde` feature's typed
-    /// sends: a map whose keys are not strings, or a `Serialize` that
-    /// failed); this says why. Nothing was sent.
+    /// A value could not be written as JSON (a [`Progress`](crate::Progress)
+    /// number that is not finite; with the `serde` feature, a map whose keys
+    /// are not strings, or a `Serialize` that failed); this says why. Nothing
+    /// was sent.
     Serialize(String),
 }
 

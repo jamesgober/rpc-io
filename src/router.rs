@@ -307,6 +307,16 @@ impl<'a> Params<'a> {
         Self { raw, parser }
     }
 
+    /// The parser with the endpoint's budgets.
+    pub(crate) fn parser(&self) -> Parser {
+        self.parser
+    }
+
+    /// The params' JSON text, `None` when absent.
+    pub(crate) fn text(&self) -> Option<&str> {
+        self.raw.as_ref().map(Raw::as_str)
+    }
+
     /// Parses the params (an array or an object; `null` when absent), with
     /// the endpoint's JSON budgets and duplicate keys refused. The value
     /// borrows from the message.
