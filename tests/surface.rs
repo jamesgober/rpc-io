@@ -18,8 +18,8 @@ use common::{Faulty, Shared, endpoint, quiet_deliberate_panics, sent};
 use jsonx_lib::{Kind, Parser, json};
 use rpc_io::{
     CallError, CancelToken, Cancellation, Config, End, Endpoint, Error, ErrorCode, ErrorObject,
-    Event, FrameError, Framed, Framing, Gate, Id, Json, Limits, Pending, QueueLimits, Raw,
-    Responder, Router, Sink,
+    Event, FrameError, Framed, Framing, Gate, Id, Incoming, Json, Limits, Pending, QueueLimits,
+    Queued, Raw, Responder, Router, Sink, decode,
 };
 
 // --- Errors ------------------------------------------------------------------
@@ -373,6 +373,78 @@ fn test_endpoint_accessors_and_debug() {
     e.close();
     let framed = Framed::new(Vec::<u8>::new(), Framing::ContentLength);
     assert!(framed.into_inner().is_empty());
+    // `finish` with nothing read closes the endpoint, once.
+    let (mut fresh, _rx) = endpoint(Router::<()>::new(), ());
+    assert_eq!(fresh.finish().ok(), Some(End::Eof));
+    assert!(fresh.finish().is_err());
+}
+
+#[test]
+fn test_message_accessors_for_every_kind() {
+    let wire = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"m","params":[1]}"#,
+        r#"{"jsonrpc":"2.0","method":"n","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":"r","result":true}"#,
+    ];
+    let mut kinds = Vec::new();
+    for text in wire {
+        let Incoming::Single(Ok(message)) = decode(text.as_bytes(), &Limits::new()) else {
+            panic!("{text} did not decode")
+        };
+        let owned = message.clone().into_owned();
+        assert_eq!(owned, message);
+        assert_eq!(owned.to_string(), text);
+        kinds.push((
+            owned.id().map(ToString::to_string),
+            owned.method().map(str::to_owned),
+        ));
+    }
+    assert_eq!(
+        kinds,
+        [
+            (Some("1".to_owned()), Some("m".to_owned())),
+            (None, Some("n".to_owned())),
+            (Some(r#""r""#.to_owned()), None),
+        ]
+    );
+}
+
+#[test]
+fn test_a_huge_peer_error_message_is_clipped_on_a_char_boundary() {
+    let (mut e, _rx) = endpoint(Router::<()>::new(), ());
+    let call = e.peer().request("x", ());
+    let message = "\\u00e9".repeat(5000); // 2 bytes each in UTF-8
+    let body = format!(r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":7,"message":"{message}"}}}}"#);
+    assert!(e.handle(body.as_bytes()).is_ok());
+    match call.map(rpc_io::Call::wait) {
+        Ok(Err(CallError::Rejected(error))) => {
+            assert_eq!(error.code(), ErrorCode(7));
+            assert_eq!(error.message().len(), 4096);
+            assert!(error.message().chars().all(|c| c == '\u{e9}'));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_queued_accessors_and_drain_debug() {
+    let mut sink = match Queued::new(Vec::new(), Framing::ContentLength) {
+        Ok(sink) => sink,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(sink.framing(), Framing::ContentLength);
+    assert_eq!(sink.limits(), QueueLimits::new());
+    assert_eq!(sink.pending_bytes(), 0);
+    assert!(sink.close().is_ok());
+    let drain = sink.drain();
+    assert!(
+        drain
+            .as_ref()
+            .is_some_and(|d| format!("{d:?}").starts_with("Drain"))
+    );
+    if let Some(drain) = drain {
+        drain.wait();
+    }
 }
 
 #[test]

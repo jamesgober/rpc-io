@@ -156,6 +156,18 @@ fn test_server_stopped_before_it_serves_returns_at_once() {
         .with_queue(rpc_io::QueueLimits::new().with_max_bytes(1 << 20))
         .with_max_connections(0);
     assert_eq!(configured.max_connections(), 1);
+    assert_eq!(configured.config().limits, rpc_io::Limits::network());
+    assert_eq!(configured.queue().max_bytes, 1 << 20);
+    let timed = Server::new(Framing::Newline)
+        .with_message_timeout(Some(Duration::from_secs(5)))
+        .with_idle_timeout(None);
+    assert_eq!(timed.message_timeout(), Some(Duration::from_secs(5)));
+    assert_eq!(timed.idle_timeout(), None);
+    // The defaults are sized for untrusted peers.
+    assert_eq!(server.config().limits, rpc_io::Limits::network());
+    assert_eq!(server.queue().max_bytes, 8 << 20);
+    assert_eq!(server.message_timeout(), Some(Duration::from_secs(30)));
+    assert_eq!(server.idle_timeout(), Some(Duration::from_secs(300)));
     assert!(format!("{server:?} {:?}", server.stopper()).contains("max_connections: 256"));
 }
 

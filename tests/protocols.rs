@@ -231,6 +231,10 @@ fn test_progress_reports_and_work_done_reports() {
     let work = WorkDone::new(endpoint.peer(), token);
     assert!(work.begin("T", true, Some("m"), Some(250)).is_ok());
     assert!(work.report(None, None).is_ok());
+    assert!(work.begin("U", false, None, None).is_ok());
+    assert!(work.end(Some("done")).is_ok());
+    assert_eq!(progress.token().as_str(), r#""t""#);
+    assert_eq!(work.token().as_str(), r#""t""#);
     let sent: Vec<String> = rx.try_iter().collect();
     assert_eq!(
         sent[0],
@@ -250,7 +254,15 @@ fn test_progress_reports_and_work_done_reports() {
         sent[3],
         r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"t","value":{"kind":"report"}}}"#
     );
-    assert_eq!(sent.len(), 4, "the refused report was sent: {sent:?}");
+    assert_eq!(
+        sent[4],
+        r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"t","value":{"kind":"begin","title":"U","cancellable":false}}}"#
+    );
+    assert_eq!(
+        sent[5],
+        r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"t","value":{"kind":"end","message":"done"}}}"#
+    );
+    assert_eq!(sent.len(), 6, "the refused report was sent: {sent:?}");
     assert!(format!("{progress:?} {work:?}").contains("token"));
 }
 
