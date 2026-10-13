@@ -546,6 +546,9 @@ impl<K: Sink> Inner<K> {
         if self.broken.is_none() {
             self.broken = Some(error);
         }
+        // Best effort: the sink failed already, but it still gets to release
+        // what it holds.
+        let _released = self.close_sink();
         self.shut();
         Error::Io(copy)
     }

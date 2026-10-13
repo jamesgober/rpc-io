@@ -347,3 +347,25 @@ fn test_a_slow_steady_reader_is_not_timed_out() {
     drop(endpoint);
     assert!(written.text().contains("small"));
 }
+
+#[test]
+fn test_a_failed_send_still_closes_the_sink() {
+    // Found by the verifier (RPC2-011): after a send failed, `Sink::close`
+    // was never called.
+    struct Closes(mpsc::Sender<&'static str>);
+    impl rpc_io::Sink for Closes {
+        fn send(&mut self, _: &str) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"))
+        }
+        fn close(&mut self) -> io::Result<()> {
+            let _sent = self.0.send("closed");
+            Ok(())
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut endpoint = Endpoint::new(Closes(tx), Router::<()>::new(), ());
+    assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Io(_))));
+    assert_eq!(rx.try_recv().ok(), Some("closed"));
+    endpoint.close();
+    assert!(rx.try_recv().is_err(), "closed twice");
+}
