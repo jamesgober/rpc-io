@@ -3,7 +3,7 @@
 #![cfg(feature = "net")]
 
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     thread,
@@ -195,4 +195,108 @@ fn test_unix_server_serves_and_stops() {
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
     let _removed = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_silent_sockets_cannot_lock_out_a_client() {
+    // Found by the verifier (RPC2-002): four sockets that connected and then
+    // sent one byte (or nothing) held every slot of a 4-slot server forever.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline)
+        .with_max_connections(4)
+        .with_message_timeout(Some(Duration::from_millis(300)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    let mut silent = Vec::new();
+    for i in 0..4 {
+        let (mut socket, _reader) = connect(addr);
+        if i % 2 == 0 {
+            assert!(socket.write_all(b"{").is_ok()); // a message begun, never finished
+        }
+        silent.push(socket);
+    }
+    let started = Instant::now();
+    let (mut client, mut reader) = connect(addr);
+    let answer = ask(
+        &mut client,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+    );
+    assert_eq!(
+        answer,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    // The silent ones were closed.
+    for socket in &mut silent {
+        let _timeout = socket.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut rest = Vec::new();
+        assert!(matches!(io::Read::read_to_end(socket, &mut rest), Ok(0)));
+    }
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
+fn test_idle_and_unfinished_connections_are_closed() {
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline)
+        .with_message_timeout(Some(Duration::from_millis(400)))
+        .with_idle_timeout(Some(Duration::from_millis(400)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    // Idle after a message: served, then closed once silent too long.
+    let (mut client, mut reader) = connect(addr);
+    assert!(
+        ask(
+            &mut client,
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        )
+        .contains("pong")
+    );
+    let started = Instant::now();
+    let mut rest = String::new();
+    assert!(matches!(reader.read_line(&mut rest), Ok(0)));
+    let idle = started.elapsed();
+    assert!(
+        idle >= Duration::from_millis(300) && idle < Duration::from_secs(5),
+        "{idle:?}"
+    );
+    // A message trickled a byte at a time, but too slowly: closed even
+    // though bytes keep arriving.
+    let (mut slow, mut slow_reader) = connect(addr);
+    let message = br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+    let trickle = thread::spawn(move || {
+        for byte in message.iter() {
+            if slow.write_all(&[*byte]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _end = slow.write_all(b"\n");
+    });
+    let mut line = String::new();
+    assert!(matches!(slow_reader.read_line(&mut line), Ok(0)), "{line}");
+    assert!(trickle.join().is_ok());
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
 }

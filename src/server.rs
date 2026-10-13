@@ -8,12 +8,13 @@ use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     config::Config,
-    endpoint::Endpoint,
+    endpoint::{End, Endpoint, Next},
+    error::Error,
     framing::Framing,
     queue::{QueueLimits, Queued},
     router::Router,
@@ -23,9 +24,10 @@ use crate::{
 /// How long the stopper waits to wake a blocked `accept` by connecting.
 const WAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How often a connection's reader looks for a stop while its peer is
-/// silent.
-const STOP_POLL: Duration = Duration::from_millis(100);
+/// On Windows, how often a waiting reader looks for a stop and its
+/// deadline (see [`Stream::wait_readable`]).
+#[cfg(windows)]
+const TICK: Duration = Duration::from_millis(250);
 
 /// One accepted connection, as the server's `connect` callback sees it.
 ///
@@ -51,11 +53,26 @@ pub struct Connection {
 /// | `config` | [`Config::new`] | every endpoint's settings |
 /// | `queue` | [`QueueLimits::new`] | every connection's outgoing queue |
 /// | `max_connections` | 256 | connections served at once; the next is not accepted until one ends |
+/// | `message_timeout` | 30 s | how long a message may take to arrive once it has begun, and a new connection to send its first one |
+/// | `idle_timeout` | 300 s | how long a connection may stay silent between messages |
 ///
 /// Concurrency is bounded: at `max_connections`, the loop stops accepting
 /// (the operating system queues further connections in its backlog) until a
-/// connection ends. Each connection costs a reader thread, a writer thread,
-/// and, once a request with a deadline is sent on it, a timer thread.
+/// connection ends. So is the time a connection can hold a slot without
+/// doing anything: a connection that does not complete a message within
+/// `message_timeout` of starting it (or of connecting), or sends nothing for
+/// `idle_timeout` between messages, is closed. A few silent or trickling
+/// sockets therefore delay other clients by at most `message_timeout`; they
+/// cannot lock them out. Each connection costs a reader thread, a writer
+/// thread, and, once a request with a deadline is sent on it, a timer thread.
+///
+/// The writer's socket gets the queue's `write_timeout` as its write timeout,
+/// so a peer that stops reading fails the write itself, and a failed write
+/// shuts the connection down. On Windows, where shutting a socket down does
+/// not wake a read blocked on it and a timed-out receive leaves the socket in
+/// an undefined state, the reader waits for data with a timed `peek` (which
+/// consumes nothing, so its timeout loses nothing), reads only once data is
+/// there, and closes the connection when a deadline passes.
 ///
 /// [`stopper`](Server::stopper) gives a handle that ends the loop from any
 /// thread: it stops accepting, shuts every open connection down (their peers
@@ -93,7 +110,15 @@ pub struct Server {
     config: Config,
     queue: QueueLimits,
     max_connections: usize,
+    deadlines: Deadlines,
     shared: Arc<Shared>,
+}
+
+/// How long a connection may take to send a message, or stay silent.
+#[derive(Clone, Copy, Debug)]
+struct Deadlines {
+    message: Option<Duration>,
+    idle: Option<Duration>,
 }
 
 /// What the server and its stoppers share.
@@ -196,7 +221,28 @@ impl fmt::Debug for Stopper {
 trait Stream: Read + Write + Send + Sync + Sized + 'static {
     fn try_clone(&self) -> io::Result<Self>;
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn shut(&self);
+
+    /// Prepares the next read to end by `deadline`: `false` if the deadline
+    /// has passed (or the server stopped). Where shutting the socket down
+    /// wakes a blocked read (Unix), this only sets the read timeout to what
+    /// is left, and a read that times out closes the connection.
+    fn wait_readable(
+        &self,
+        deadline: Option<Instant>,
+        _stopped: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
+        let left = match deadline {
+            None => None,
+            Some(at) => match at.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => return Ok(false),
+            },
+        };
+        self.set_read_timeout(left)?;
+        Ok(true)
+    }
 }
 
 impl Stream for TcpStream {
@@ -208,9 +254,45 @@ impl Stream for TcpStream {
         TcpStream::set_read_timeout(self, timeout)
     }
 
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout.filter(|t| !t.is_zero()))
+    }
+
     fn shut(&self) {
         // Already closed by the peer is fine: either way it is over.
         let _closed = self.shutdown(Shutdown::Both);
+    }
+
+    /// Windows: shutting the socket down does not wake a blocked receive,
+    /// and a receive that times out leaves the socket undefined. So the wait
+    /// is a timed `peek` of one byte, repeated every [`TICK`] to look for a
+    /// stop: a peek consumes nothing, so its timeout cannot lose data, and
+    /// the read that follows finds data (or the end of the stream) waiting.
+    #[cfg(windows)]
+    fn wait_readable(
+        &self,
+        deadline: Option<Instant>,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<bool> {
+        let mut byte = [0u8; 1];
+        loop {
+            if stopped() {
+                return Ok(false);
+            }
+            let tick = match deadline {
+                None => TICK,
+                Some(at) => match at.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => left.min(TICK),
+                    _ => return Ok(false),
+                },
+            };
+            self.set_read_timeout(Some(tick))?;
+            match self.peek(&mut byte) {
+                Ok(_) => return Ok(true),
+                Err(error) if is_timeout(&error) || error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -224,36 +306,128 @@ impl Stream for std::os::unix::net::UnixStream {
         std::os::unix::net::UnixStream::set_read_timeout(self, timeout)
     }
 
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_write_timeout(self, timeout.filter(|t| !t.is_zero()))
+    }
+
     fn shut(&self) {
         let _closed = self.shutdown(Shutdown::Both);
     }
 }
 
-/// The reading side of a connection. Shutting a socket down does not wake a
-/// read blocked on it on every platform (not on Windows), so reads time out
-/// every [`STOP_POLL`] to look for a stop; while the server runs, a timeout
-/// is retried and never reaches the endpoint.
-struct Watched<T> {
-    stream: T,
-    shared: Arc<Shared>,
+/// Whether an I/O error is a read or write timing out.
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
-impl<T: Stream> Read for Watched<T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            match self.stream.read(buf) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    if self.shared.lock().stopped {
-                        return Ok(0);
-                    }
-                }
-                read => return read,
+/// The writing side of a connection: a write that fails (or times out)
+/// shuts the connection down, so the reader stops at once instead of at its
+/// next deadline.
+struct Writer<T> {
+    stream: T,
+    closer: Arc<T>,
+}
+
+impl<T: Stream> Write for Writer<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf).inspect_err(|error| {
+            if error.kind() != io::ErrorKind::Interrupted {
+                self.closer.shut();
             }
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush().inspect_err(|_| self.closer.shut())
+    }
+}
+
+/// Why a connection ended, for the log (read only through `Debug`, by the
+/// `tracing` feature).
+#[allow(dead_code)]
+#[derive(Debug)]
+enum Ending {
+    /// The input ended, or a handler stopped the endpoint.
+    Done(End),
+    /// A deadline passed: `message_timeout` or `idle_timeout`.
+    Late,
+    /// The server was stopped.
+    Stopped,
+    /// The connection failed.
+    Failed(Error),
+}
+
+/// Serves one connection until it ends: reads with its deadlines, and
+/// stops at the first one that passes.
+fn serve_connection<T: Stream, S>(
+    stream: &mut T,
+    endpoint: &mut Endpoint<S, Queued>,
+    framing: Framing,
+    deadlines: Deadlines,
+    shared: &Shared,
+) -> Ending {
+    let stopped = || shared.lock().stopped;
+    let handled = |endpoint: &Endpoint<S, Queued>| {
+        let stats = endpoint.stats();
+        stats.bodies_in.wrapping_add(stats.invalid_in)
+    };
+    // A new connection is held to the message deadline until its first
+    // message: connecting and sending nothing does not hold a slot for long.
+    let mut busy_since = Some(Instant::now());
+    let mut last_read = Instant::now();
+    let mut done = 0;
+    loop {
+        match endpoint.next_read(framing) {
+            Ok(Next::Read(_)) => {}
+            Ok(Next::Stopped) => return Ending::Done(End::Stopped),
+            Err(error) => return Ending::Failed(error),
+        }
+        let finished = handled(endpoint);
+        if endpoint.buffered_input() > 0 {
+            // Part of a message: due `message_timeout` after its first bytes.
+            busy_since = busy_since.or(Some(last_read));
+        } else if finished != done {
+            done = finished;
+            busy_since = None;
+        }
+        let deadline = match busy_since {
+            Some(since) => deadlines.message.and_then(|t| since.checked_add(t)),
+            None => deadlines.idle.and_then(|t| last_read.checked_add(t)),
+        };
+        match stream.wait_readable(deadline, &stopped) {
+            Ok(true) => {}
+            Ok(false) if stopped() => return Ending::Stopped,
+            Ok(false) => return Ending::Late,
+            Err(error) => return Ending::Failed(Error::Io(error)),
+        }
+        let Ok(Next::Read(buf)) = endpoint.next_read(framing) else {
+            continue;
+        };
+        match stream.read(buf) {
+            Ok(0) => {
+                return match endpoint.finish() {
+                    Ok(end) => Ending::Done(end),
+                    Err(error) => Ending::Failed(error),
+                };
+            }
+            Ok(n) => {
+                endpoint.commit(n);
+                last_read = Instant::now();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // A read that timed out leaves the socket undefined on some
+            // platforms: the connection is closed, never read again.
+            Err(error) if is_timeout(&error) => {
+                return if stopped() {
+                    Ending::Stopped
+                } else {
+                    Ending::Late
+                };
+            }
+            Err(error) => return Ending::Failed(Error::Io(error)),
         }
     }
 }
@@ -275,8 +449,73 @@ impl Server {
             config: Config::new(),
             queue: QueueLimits::new(),
             max_connections: 256,
+            deadlines: Deadlines {
+                message: Some(Duration::from_secs(30)),
+                idle: Some(Duration::from_secs(300)),
+            },
             shared: Arc::default(),
         }
+    }
+
+    /// Sets how long a message may take to arrive once its first bytes
+    /// have, and a new connection to send its first message (`None`: no
+    /// limit). A connection past it is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let server = rpc_io::Server::new(rpc_io::Framing::Newline).with_message_timeout(Some(Duration::from_secs(5)));
+    /// assert_eq!(server.message_timeout(), Some(Duration::from_secs(5)));
+    /// ```
+    #[must_use]
+    pub fn with_message_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.deadlines.message = timeout;
+        self
+    }
+
+    /// Sets how long a connection may stay silent between messages (`None`:
+    /// no limit). A connection past it is closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let server = rpc_io::Server::new(rpc_io::Framing::Newline).with_idle_timeout(None);
+    /// assert_eq!(server.idle_timeout(), None);
+    /// ```
+    #[must_use]
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.deadlines.idle = timeout;
+        self
+    }
+
+    /// The message timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(rpc_io::Server::new(rpc_io::Framing::Newline).message_timeout(), Some(Duration::from_secs(30)));
+    /// ```
+    #[must_use]
+    pub fn message_timeout(&self) -> Option<Duration> {
+        self.deadlines.message
+    }
+
+    /// The idle timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(rpc_io::Server::new(rpc_io::Framing::Newline).idle_timeout(), Some(Duration::from_secs(300)));
+    /// ```
+    #[must_use]
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.deadlines.idle
     }
 
     /// Sets every endpoint's [`Config`]. For peers across a network, start
@@ -551,19 +790,21 @@ impl Server {
         router: Router<S>,
         state: S,
     ) -> io::Result<Option<JoinHandle<()>>> {
-        let writer = stream.try_clone()?;
         let closer = Arc::new(stream.try_clone()?);
-        stream.set_read_timeout(Some(STOP_POLL))?;
-        let reader = Watched {
-            stream,
-            shared: Arc::clone(&self.shared),
+        let writer = Writer {
+            stream: stream.try_clone()?,
+            closer: Arc::clone(&closer),
         };
+        // A peer that stops reading fails the write itself, which shuts the
+        // connection down (see `Writer`).
+        stream.set_write_timeout(self.queue.write_timeout)?;
         let sink = Queued::with_limits(writer, self.framing, self.queue)?;
-        let (framing, config, shared, id) = (
+        let (framing, config, shared, id, deadlines) = (
             self.framing,
             self.config.clone(),
             Arc::clone(&self.shared),
             connection.id,
+            self.deadlines,
         );
         {
             // Registered under the lock the stopper takes: a connection is
@@ -582,9 +823,11 @@ impl Server {
             .name(format!("rpc-io-connection-{id}"))
             .spawn(move || {
                 let mut endpoint = Endpoint::new(sink, router, state).with_config(config);
-                let ended = endpoint.run(reader, framing);
+                let mut stream = stream;
+                let ended =
+                    serve_connection(&mut stream, &mut endpoint, framing, deadlines, &shared);
                 event!(debug, connection = id, end = ?ended, "a connection ended");
-                // Dropping the endpoint drains its queue; then the stream ends.
+                // Closing the endpoint drains its queue; then the stream ends.
                 drop((endpoint, ended));
                 ending.shut();
                 shared.ended(id);
@@ -607,6 +850,8 @@ impl fmt::Debug for Server {
             .field("config", &self.config)
             .field("queue", &self.queue)
             .field("max_connections", &self.max_connections)
+            .field("message_timeout", &self.deadlines.message)
+            .field("idle_timeout", &self.deadlines.idle)
             .field("connections", &self.connections())
             .finish_non_exhaustive()
     }
