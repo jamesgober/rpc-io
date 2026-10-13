@@ -1,7 +1,8 @@
-//! Sinks that never block the sender: [`Queued`] (a writer thread) and
-//! [`outbox`] (an async task). Messages are framed into a bounded queue under
-//! [`QueueLimits`]; whoever drains it does the slow part, the write to the
-//! peer, without the endpoint's lock.
+//! Sinks whose senders never wait on the peer: [`Queued`] (a writer thread)
+//! and [`outbox`] (an async task). Messages are framed into a bounded queue
+//! under [`QueueLimits`]; whoever drains it does the slow part, the write to
+//! the peer, without the endpoint's lock. Closing waits for the drain only
+//! after the lock is released, and for at most `close_timeout`.
 
 use std::{
     fmt,
@@ -14,7 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{framing::Framing, sink::Sink};
+use crate::{
+    framing::Framing,
+    sink::{Drain, Sink},
+};
 
 /// A drained buffer grown past this by one large batch is released.
 const KEEP: usize = 64 * 1024;
@@ -22,21 +26,21 @@ const KEEP: usize = 64 * 1024;
 /// How long a closing [`Queued`] sleeps between checks on its writer.
 const DRAIN_POLL: Duration = Duration::from_millis(50);
 
-/// Bounds on an outgoing queue: what it may hold, and how long a write to the
-/// peer may stall.
+/// Bounds on an outgoing queue: what it may hold, how long the peer may stop
+/// taking bytes, and how long closing waits for what is left.
 ///
 /// | Bound | Default | Meaning |
 /// |---|---:|---|
 /// | `max_bytes` | 64 MiB | framed bytes queued or being written |
 /// | `max_messages` | 65,536 | messages queued or being written |
-/// | `write_timeout` | 60 s | how long one write may make no progress |
+/// | `write_timeout` | 60 s | how long one batch may take to write |
+/// | `close_timeout` | 10 s | how long closing waits for the queue to drain |
 ///
 /// A message that would take the queue past `max_bytes` or `max_messages`
 /// fails the queue (one message is always taken when the queue is empty, so
-/// a single large message still goes out). So does any send once a write has
-/// been stalled longer than `write_timeout`. A failed queue refuses
-/// everything with the same I/O error, which closes the endpoint: a peer that
-/// stops reading costs bounded memory and, at most, `write_timeout`.
+/// a single large message still goes out). So does any send once a batch
+/// has been writing for longer than `write_timeout`. A failed queue refuses
+/// everything with the same I/O error, which closes the endpoint.
 ///
 /// `#[non_exhaustive]`: start from [`QueueLimits::new`] and chain `with_*`.
 ///
@@ -58,8 +62,11 @@ pub struct QueueLimits {
     pub max_bytes: usize,
     /// Most messages queued or being written.
     pub max_messages: usize,
-    /// The longest a write may make no progress; `None` waits forever.
+    /// The longest one batch may take to write; `None` waits forever.
     pub write_timeout: Option<Duration>,
+    /// The longest closing waits for what is queued to be written, after
+    /// which the writer is left to finish (or fail) on its own.
+    pub close_timeout: Duration,
 }
 
 impl QueueLimits {
@@ -76,6 +83,7 @@ impl QueueLimits {
             max_bytes: 64 * 1024 * 1024,
             max_messages: 65_536,
             write_timeout: Some(Duration::from_secs(60)),
+            close_timeout: Duration::from_secs(10),
         }
     }
 
@@ -117,6 +125,22 @@ impl QueueLimits {
         self.write_timeout = timeout;
         self
     }
+
+    /// Sets `close_timeout`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let limits = rpc_io::QueueLimits::new().with_close_timeout(Duration::from_secs(1));
+    /// assert_eq!(limits.close_timeout, Duration::from_secs(1));
+    /// ```
+    #[must_use]
+    pub const fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
 }
 
 impl Default for QueueLimits {
@@ -142,8 +166,9 @@ struct State {
     /// Bytes and messages taken by the writer and not yet written.
     writing: usize,
     writing_messages: usize,
-    /// When the writer took what it is writing now.
-    writing_since: Option<Instant>,
+    /// While the writer has bytes to write: when it last wrote any (or took
+    /// the batch).
+    progressed: Option<Instant>,
     /// Why the queue failed: the writer's error, a stall, or an overflow.
     failed: Option<(io::ErrorKind, String)>,
     /// The sending side is done: drain, then stop.
@@ -168,7 +193,7 @@ impl Core {
                 queued_messages: 0,
                 writing: 0,
                 writing_messages: 0,
-                writing_since: None,
+                progressed: None,
                 failed: None,
                 closed: false,
                 finished: false,
@@ -234,17 +259,22 @@ impl Core {
         }
     }
 
-    /// Waits until the writer has stopped, as long as it keeps making
-    /// progress; `false` if it stalled past the write timeout instead.
+    /// Waits until the writer has stopped, for at most `close_timeout`, and
+    /// no longer once it has made no progress for `write_timeout`; `false`
+    /// if it gave up.
     fn wait_drained(&self) -> bool {
+        let deadline = Instant::now().checked_add(self.limits.close_timeout);
         let mut state = self.lock();
         while !state.finished {
-            if state.stalled(&self.limits).is_some() {
+            let now = Instant::now();
+            let late = deadline.is_none_or(|at| now >= at);
+            if late || state.stalled(&self.limits).is_some() {
                 return false;
             }
+            let left = deadline.map_or(DRAIN_POLL, |at| (at - now).min(DRAIN_POLL));
             state = self
                 .signal
-                .wait_timeout(state, DRAIN_POLL)
+                .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -277,9 +307,9 @@ impl State {
         Ok(())
     }
 
-    /// The write timeout, if the current write has been stalled past it.
+    /// The write timeout, if the writer has written nothing for longer.
     fn stalled(&self, limits: &QueueLimits) -> Option<Duration> {
-        let since = self.writing_since?;
+        let since = self.progressed?;
         let limit = limits.write_timeout?;
         (since.elapsed() > limit).then_some(limit)
     }
@@ -298,14 +328,14 @@ impl State {
         mem::swap(&mut self.queued, batch);
         self.writing = batch.len();
         self.writing_messages = mem::take(&mut self.queued_messages);
-        self.writing_since = Some(Instant::now());
+        self.progressed = Some(Instant::now());
     }
 
     /// Records that the batch taken last was written (or abandoned).
     fn written(&mut self) {
         self.writing = 0;
         self.writing_messages = 0;
-        self.writing_since = None;
+        self.progressed = None;
     }
 }
 
@@ -320,17 +350,20 @@ fn recycle(batch: &mut Vec<u8>) {
 /// A [`Sink`] that frames messages into a bounded queue and writes them to a
 /// byte stream from its own thread.
 ///
-/// Sending never blocks on the peer: the endpoint's lock covers framing a
+/// A send never waits on the peer: the endpoint's lock covers framing a
 /// message into the queue, and the writer thread does the `write_all` and
-/// `flush` (one of each per batch of queued messages) without it. A peer
-/// that stops reading therefore stalls nobody: the queue grows to its
-/// [`QueueLimits`], then the connection closes. This is the sink [`serve`]
-/// uses, and the one to use for any peer that might be slow.
+/// one `flush` per batch of queued messages without it. A peer that stops reading therefore stalls no sender: the queue grows
+/// to its [`QueueLimits`], then the connection closes. This is the sink
+/// [`serve`] uses, and the one to use for any peer that might be slow.
 ///
-/// Closing the endpoint closes the queue: what is queued is still written,
-/// and closing waits for that as long as the writer makes progress (up to
-/// the write timeout per stalled write). Then the writer thread ends and the
-/// writer is dropped, which ends the stream for the peer.
+/// Closing the endpoint closes the queue without waiting, under the
+/// endpoint's lock; then, with the lock released, the endpoint waits for what
+/// is queued to be written: until the writer is done, has made no progress
+/// for `write_timeout`, or `close_timeout` has passed. Handles on other
+/// threads see the endpoint closed at once and are never held up by this
+/// wait. When the writer finishes, its thread ends and the writer is dropped,
+/// which ends the stream for the peer; a writer still stuck in a write when
+/// the wait gives up ends when that write returns.
 ///
 /// [`serve`]: crate::serve
 ///
@@ -456,18 +489,21 @@ impl Queued {
         self.core.pending().1
     }
 
-    /// Closes the queue and waits for the writer, as [`Sink::close`] says;
-    /// joins the thread once it has stopped.
-    fn shut_down(&mut self) {
-        self.core.close();
-        if self.core.wait_drained() {
-            if let Some(writer) = self.writer.take() {
-                // The thread contains its own panics: it cannot fail to join.
-                let _joined = writer.join();
+    /// The wait for the writer: until it is done or gives up, then joins its
+    /// thread if it stopped.
+    fn waiter(&mut self) -> Drain {
+        let core = Arc::clone(&self.core);
+        let writer = self.writer.take();
+        Drain::new(move || {
+            if core.wait_drained() {
+                if let Some(writer) = writer {
+                    // The thread contains its own panics: it cannot fail to join.
+                    let _joined = writer.join();
+                }
             }
-        }
-        // Otherwise the writer is stuck in a write the timeout gave up on;
-        // the thread ends, and drops the writer, when that write returns.
+            // Otherwise the writer is stuck in a write the wait gave up on;
+            // the thread ends, and drops the writer, when that write returns.
+        })
     }
 }
 
@@ -482,18 +518,28 @@ impl Sink for Queued {
         self.core.check()
     }
 
-    /// Ends the queue: what is queued is written, and this waits for that
-    /// while the writer makes progress.
+    /// Ends the queue without waiting: what is queued is still written.
     fn close(&mut self) -> io::Result<()> {
         let result = self.core.check();
-        self.shut_down();
+        self.core.close();
         result
+    }
+
+    /// Waits, after the endpoint's lock is released, for what is queued to
+    /// be written: see [`Queued`].
+    fn drain(&mut self) -> Option<Drain> {
+        Some(self.waiter())
     }
 }
 
 impl Drop for Queued {
+    /// Closes the queue and waits for it as [`Sink::drain`] would, unless
+    /// the endpoint did so already.
     fn drop(&mut self) {
-        self.shut_down();
+        self.core.close();
+        if self.writer.is_some() {
+            self.waiter().wait();
+        }
     }
 }
 
@@ -558,8 +604,8 @@ fn write_loop<W: Write>(core: &Core, mut writer: W) {
 ///
 /// The [`OutboxSink`] goes into the [`Endpoint`](crate::Endpoint); the
 /// [`Outbox`] goes to a task that writes what it yields to the peer, on any
-/// executor. Sending never blocks, and the queue is bounded by `limits`, as
-/// for [`Queued`]. When the endpoint closes, the outbox yields what is left,
+/// executor. A send never waits on the peer, and the queue is bounded by
+/// `limits`, as for [`Queued`]. When the endpoint closes, the outbox yields what is left,
 /// then ends; when the outbox is dropped, the sink fails, which closes the
 /// endpoint.
 ///

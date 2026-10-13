@@ -192,7 +192,7 @@ pub use router::{Context, Event, Params, Router};
 pub use server::{Connection, Server, Stopper};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use sink::{Framed, Sink};
+pub use sink::{Drain, Framed, Sink};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use stats::Stats;

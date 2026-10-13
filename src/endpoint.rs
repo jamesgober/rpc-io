@@ -330,7 +330,12 @@ impl<S, K: Sink> Endpoint<S, K> {
     /// assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Closed)));
     /// ```
     pub fn close(&mut self) {
-        self.shared.lock().close();
+        // The lock is released before the drain is waited for: other
+        // threads see the endpoint closed at once.
+        let drain = self.shared.lock().close();
+        if let Some(drain) = drain {
+            drain.wait();
+        }
     }
 
     /// When the earliest of our outstanding requests is due, if any has a

@@ -1,7 +1,7 @@
 //! [`Sink`]: where an endpoint's outgoing messages go, and [`Framed`], the
 //! sink that frames them onto a byte stream.
 
-use std::{io, io::Write, sync::mpsc};
+use std::{fmt, io, io::Write, sync::mpsc};
 
 use crate::framing::Framing;
 
@@ -64,8 +64,11 @@ pub trait Sink: Send + 'static {
     }
 
     /// Ends the output: transmits anything buffered and releases what the
-    /// sink holds. Called once, when the endpoint closes; nothing is sent
-    /// after it. The default flushes.
+    /// sink holds. Called once, when the endpoint closes or a send fails;
+    /// nothing is sent after it. Called with the endpoint's lock held, so it
+    /// must not wait on the peer: a sink that needs to wait for its output to
+    /// be written returns that wait from [`drain`](Sink::drain). The default
+    /// flushes.
     ///
     /// # Errors
     ///
@@ -73,6 +76,74 @@ pub trait Sink: Send + 'static {
     /// reported like one from [`send`](Sink::send).
     fn close(&mut self) -> io::Result<()> {
         self.flush()
+    }
+
+    /// What closing waits for once the endpoint's lock is released: taken
+    /// right after [`close`](Sink::close) when the endpoint closes, and run
+    /// with no lock held, so handles on other threads are not held up by it.
+    /// `None` (the default) waits for nothing. [`Queued`](crate::Queued)
+    /// waits here for its queue to drain, within its `close_timeout`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io;
+    /// use rpc_io::{Drain, Sink};
+    ///
+    /// /// Hands messages to a worker; closing waits for it, outside the lock.
+    /// struct Worker(Option<std::thread::JoinHandle<()>>, std::sync::mpsc::Sender<String>);
+    ///
+    /// impl Sink for Worker {
+    ///     fn send(&mut self, message: &str) -> io::Result<()> {
+    ///         self.1.send(message.to_owned()).map_err(|_| io::ErrorKind::BrokenPipe.into())
+    ///     }
+    ///     fn drain(&mut self) -> Option<Drain> {
+    ///         let worker = self.0.take()?;
+    ///         Some(Drain::new(move || { let _joined = worker.join(); }))
+    ///     }
+    /// }
+    /// ```
+    fn drain(&mut self) -> Option<Drain> {
+        None
+    }
+}
+
+/// A wait the endpoint runs after it closed its sink and released its lock:
+/// see [`Sink::drain`].
+///
+/// # Examples
+///
+/// ```
+/// let mut done = false;
+/// let drain = rpc_io::Drain::new(move || done = true);
+/// drain.wait();
+/// ```
+pub struct Drain(Box<dyn FnOnce() + Send>);
+
+impl Drain {
+    /// A wait that runs `wait`.
+    ///
+    /// # Examples
+    ///
+    /// See [`Drain`].
+    #[must_use]
+    pub fn new(wait: impl FnOnce() + Send + 'static) -> Self {
+        Self(Box::new(wait))
+    }
+
+    /// Runs the wait.
+    ///
+    /// # Examples
+    ///
+    /// See [`Drain`].
+    pub fn wait(self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for Drain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Drain").finish_non_exhaustive()
     }
 }
 

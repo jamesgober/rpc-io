@@ -38,7 +38,7 @@ use crate::{
     message::{write_call, write_numbered_call, write_response},
     pending::Pending,
     raw::Json,
-    sink::Sink,
+    sink::{Drain, Sink},
     slot::{self, Outcome, Slot, Waiter},
     stats::{Stats, Tally, bump},
     text,
@@ -95,6 +95,7 @@ impl<K: Sink> Shared<K> {
                 timer,
                 closed_flag: closed,
                 sink,
+                sink_closed: false,
                 closed: false,
                 broken: None,
                 corked: false,
@@ -360,6 +361,8 @@ pub(crate) struct Inner<K> {
     /// Mirrors `closed` for `Shared::is_closed`.
     closed_flag: Arc<AtomicBool>,
     sink: K,
+    /// Whether `Sink::close` was called.
+    sink_closed: bool,
     closed: bool,
     /// The first failure of the sink, for the endpoint's thread to report.
     broken: Option<io::Error>,
@@ -494,16 +497,27 @@ impl<K: Sink> Inner<K> {
         self.broken.take()
     }
 
-    /// Closes the connection: closes the sink (flushing it), then tells
-    /// every waiter it is over.
-    pub(crate) fn close(&mut self) {
+    /// Closes the connection: closes the sink (flushing it), tells every
+    /// waiter it is over, and returns what the caller waits for once it has
+    /// released the lock (the sink's [`Drain`]).
+    pub(crate) fn close(&mut self) -> Option<Drain> {
         if self.closed {
-            return;
+            return None;
         }
-        if let Err(error) = guard(|| self.sink.close()) {
+        if let Err(error) = self.close_sink() {
             let _closed = self.fail(error);
         }
         self.shut();
+        let drain = panic::catch_unwind(AssertUnwindSafe(|| self.sink.drain()));
+        drain.unwrap_or(None)
+    }
+
+    /// Closes the sink, once: at the close, or after a send failed.
+    fn close_sink(&mut self) -> io::Result<()> {
+        if mem::replace(&mut self.sink_closed, true) {
+            return Ok(());
+        }
+        guard(|| self.sink.close())
     }
 
     /// Marks the connection closed and releases everything waiting on it.

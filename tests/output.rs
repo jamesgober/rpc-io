@@ -259,3 +259,50 @@ fn test_outbox_task_is_woken_by_a_message_and_by_the_close() {
     assert_eq!(count.0.load(Ordering::SeqCst), 2);
     assert!(matches!(outbox.poll_chunk(&mut cx), Poll::Ready([])));
 }
+
+#[test]
+fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
+    // Found by the verifier (RPC2-001): closing drained the queue under the
+    // endpoint's lock, so a worker answering during the close waited for the
+    // whole drain, and forever with no write timeout.
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::from_millis(600));
+    let (sink, release, _written) = stalled(limits);
+    let router =
+        Router::<Vec<rpc_io::Responder>>::new().deferred("later", |held, _, _, r| held.push(r));
+    let mut endpoint = Endpoint::new(sink, router, Vec::new());
+    assert!(
+        endpoint
+            .handle(br#"{"jsonrpc":"2.0","id":1,"method":"later"}"#)
+            .is_ok()
+    );
+    assert!(endpoint.peer().notify("stuck", ()).is_ok()); // the writer blocks on it
+    let Some(responder) = endpoint.state_mut().pop() else {
+        panic!("no responder")
+    };
+    let (closing, closed) = mpsc::channel();
+    let closer = thread::spawn(move || {
+        let started = Instant::now();
+        endpoint.close();
+        let _sent = closing.send(started.elapsed());
+        endpoint
+    });
+    thread::sleep(Duration::from_millis(100));
+    // While the close waits for the stuck writer, the worker's answer is
+    // refused at once instead of waiting for the lock.
+    let answered = within(Duration::from_millis(300), move || responder.ok(1));
+    assert!(
+        matches!(answered, Some(Err(Error::Closed))),
+        "a worker was held up by the close: {answered:?}"
+    );
+    // And the close itself is bounded by the close timeout.
+    let waited = closed.recv_timeout(Duration::from_secs(5));
+    assert!(
+        waited
+            .is_ok_and(|took| took >= Duration::from_millis(500) && took < Duration::from_secs(3)),
+        "the close was not bounded"
+    );
+    drop(release);
+    assert!(closer.join().is_ok());
+}
