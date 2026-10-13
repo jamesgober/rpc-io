@@ -530,7 +530,7 @@ assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id
 
 ## `Call`
 
-One of our requests. Ends in exactly one outcome. Dropping it does not cancel the request. A `Future` on any executor (`Output = Result<Raw<'static>, CallError>`), woken when the outcome arrives; polling it again after that returns `CallError::Closed`.
+One of our requests. Ends in exactly one outcome. Dropping it before its outcome cancels the request (frees its pending slot and tells the peer); `detach()` keeps it outstanding without a waiter instead. A `Future` on any executor (`Output = Result<Raw<'static>, CallError>`), woken when the outcome arrives; polling it again after that returns `CallError::Closed`.
 
 | Method | Description |
 |---|---|
@@ -540,6 +540,7 @@ One of our requests. Ends in exactly one outcome. Dropping it does not cancel th
 | `wait_typed<T>(self) -> Result<T, CallError>` | `wait`, then deserializes the result (`serde`). |
 | `try_wait(self) -> Result<Result<Raw<'static>, CallError>, Call>` | Never blocks; `Err(self)` while outstanding. |
 | `cancel(self) -> bool` | Cancels (sends the cancel notification); `false` if already ended. |
+| `detach(self)` | Keeps the request outstanding without a waiter: answered (and discarded), timed out, or evicted later. |
 | `canceller(&self) -> Canceller` | A handle that cancels from elsewhere. |
 
 ```rust

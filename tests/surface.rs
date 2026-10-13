@@ -324,8 +324,9 @@ fn test_router_and_context_surface() {
                 params.is_present(),
                 cx
             ));
-            let _call = cx.request("ask", ())?;
-            let _timed = cx.request_with_timeout("ask", (), Duration::from_secs(60))?;
+            cx.request("ask", ())?.detach();
+            cx.request_with_timeout("ask", (), Duration::from_secs(60))?
+                .detach();
             cx.peer().notify("via-peer", ())?;
             let kept = params.clone().into_owned();
             Ok(kept.raw().map(|r| r.as_str().to_owned()))

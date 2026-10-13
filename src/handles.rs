@@ -226,6 +226,7 @@ impl Peer {
             outcome: issued.outcome,
             deadline: issued.deadline,
             link: Arc::clone(&self.link),
+            detached: false,
         })
     }
 
@@ -280,8 +281,15 @@ impl fmt::Debug for Peer {
 /// One of our requests, awaiting its answer.
 ///
 /// Ends in exactly one outcome: the peer's result, or a [`CallError`]
-/// (rejected, timed out, cancelled, evicted, connection closed). Dropping a
-/// `Call` does not cancel the request; its answer is then discarded.
+/// (rejected, timed out, cancelled, evicted, connection closed).
+///
+/// Dropping a `Call` before its outcome cancels the request, as
+/// [`cancel`](Call::cancel) does: its pending slot is freed at once and the
+/// peer is sent the cancel notification. That is what a dropped future
+/// means in async code (a `select!` that took another branch), and it keeps
+/// abandoned calls from filling [`Config::max_pending`](crate::Config) and
+/// evicting live ones. To send a request and not wait for its answer, keep
+/// it outstanding with [`detach`](Call::detach), or send a notification.
 ///
 /// Wait for it by blocking ([`wait`](Call::wait)), by polling
 /// ([`try_wait`](Call::try_wait)), or by `.await`ing it: `Call` is a
@@ -308,6 +316,8 @@ pub struct Call {
     outcome: Arc<Slot>,
     deadline: Option<Instant>,
     link: Arc<dyn Link>,
+    /// Kept outstanding when dropped (see `detach`).
+    detached: bool,
 }
 
 impl Call {
@@ -417,6 +427,29 @@ impl Call {
         }
     }
 
+    /// Lets the request run without a waiter: it stays outstanding until it
+    /// is answered (the answer is then discarded), times out (the peer is
+    /// told to cancel), or is evicted. Dropping the `Call` instead would
+    /// cancel it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// endpoint.peer().request("index", ())?.detach();
+    /// assert_eq!(endpoint.stats().pending, 1); // still outstanding
+    /// endpoint.peer().request("cancel me", ())?; // dropped: cancelled
+    /// assert_eq!(endpoint.stats().pending, 1);
+    /// assert_eq!(rx.try_iter().count(), 3); // two requests, one cancel
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn detach(mut self) {
+        self.detached = true;
+    }
+
     /// Cancels the request: the peer is sent the cancel notification and the
     /// outcome becomes [`CallError::Cancelled`]. Returns `false` if the
     /// request had already ended.
@@ -461,6 +494,16 @@ impl Call {
         Canceller {
             id: self.id,
             link: Arc::clone(&self.link),
+        }
+    }
+}
+
+impl Drop for Call {
+    /// Cancels the request if it has no outcome yet and was not detached.
+    fn drop(&mut self) {
+        if !self.detached && !self.outcome.is_filled() {
+            // `false` when it ended meanwhile: nothing left to cancel.
+            let _cancelled = self.link.cancel(self.id);
         }
     }
 }
@@ -533,8 +576,10 @@ impl Canceller {
     /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
     /// let endpoint = rpc_io::Endpoint::new(tx, rpc_io::Router::new(), ()); // keep it: dropping an endpoint closes it
     /// let peer = endpoint.peer();
-    /// let canceller = peer.request("x", ())?.canceller();
+    /// let call = peer.request("x", ())?;
+    /// let canceller = call.canceller();
     /// assert!(canceller.cancel());
+    /// # drop(call);
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn cancel(&self) -> bool {

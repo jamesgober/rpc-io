@@ -316,10 +316,43 @@ fn test_waiting_inside_a_handler_would_deadlock() {
             .is_ok()
     );
     let replies = sent(&rx);
+    // `wait` consumed the call, so the call is dropped and cancelled before the
+    // handler returns.
     assert_eq!(
         replies[1],
+        r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#
+    );
+    assert_eq!(
+        replies[2],
         r#"{"jsonrpc":"2.0","id":1,"result":"Err(WouldDeadlock)"}"#
     );
+}
+
+#[test]
+fn test_a_dropped_call_frees_its_slot_and_a_detached_one_does_not() {
+    let (e, rx) = endpoint(Router::new(), ());
+    let mut e = e.with_config(Config::new().with_max_pending(1));
+    for _ in 0..10 {
+        drop(e.peer().request("abandoned", ()).ok());
+    }
+    assert_eq!(e.stats().pending, 0);
+    assert_eq!(e.stats().evicted, 0);
+    let replies = sent(&rx);
+    assert_eq!(replies.len(), 20, "a request and a cancel for each");
+    assert!(replies[1].contains("$/cancelRequest"), "{}", replies[1]);
+    // A detached call stays outstanding and sends no cancel.
+    if let Ok(call) = e.peer().request("kept", ()) {
+        call.detach();
+    }
+    assert_eq!(e.stats().pending, 1);
+    assert_eq!(sent(&rx).len(), 1, "only the request");
+    // An answered call has nothing left to cancel when dropped.
+    assert!(e.handle(br#"{"jsonrpc":"2.0","id":11,"result":1}"#).is_ok());
+    assert_eq!(e.stats().pending, 0);
+    let answered = e.peer().request("answered", ());
+    assert!(e.handle(br#"{"jsonrpc":"2.0","id":12,"result":2}"#).is_ok());
+    drop(answered);
+    assert_eq!(sent(&rx).len(), 1, "only the request, no cancel");
 }
 
 #[test]

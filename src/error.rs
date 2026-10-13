@@ -155,8 +155,9 @@ pub enum CallError {
     /// The connection closed before an answer arrived.
     Closed,
     /// Waiting here would block the thread that reads the answer: a handler
-    /// cannot wait for a request it sent. Use [`Call::try_wait`](crate::Call::try_wait)
-    /// later, or wait on another thread.
+    /// cannot wait for a request it sent. The call, consumed by `wait`, is
+    /// cancelled. Use [`Call::try_wait`](crate::Call::try_wait) later, or wait
+    /// on another thread.
     WouldDeadlock,
 }
 

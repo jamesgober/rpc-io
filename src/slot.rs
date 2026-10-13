@@ -64,6 +64,11 @@ impl Slot {
         }
     }
 
+    /// Whether an outcome was written (and maybe taken since).
+    pub(crate) fn is_filled(&self) -> bool {
+        self.lock().filled
+    }
+
     /// The outcome, if it was written: once, and `Closed` on later reads.
     pub(crate) fn try_take(&self) -> Option<Outcome> {
         let mut state = self.lock();
