@@ -6,8 +6,8 @@ mod common;
 
 use std::{
     io::{self, Write},
-    sync::mpsc,
-    task::{Context, Poll, Waker},
+    sync::{Arc, mpsc},
+    task::{Context, Poll, Wake, Waker},
     thread,
     time::{Duration, Instant},
 };
@@ -233,4 +233,29 @@ fn test_dropped_outbox_closes_the_endpoint() {
     drop(outbox);
     assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Io(_))));
     assert!(endpoint.is_closed());
+}
+
+#[test]
+fn test_outbox_task_is_woken_by_a_message_and_by_the_close() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            let _previous = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let (sink, mut outbox) = outbox(Framing::Newline, QueueLimits::new());
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(outbox.poll_chunk(&mut cx).is_pending());
+    assert!(endpoint.peer().notify("x", ()).is_ok());
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(outbox.poll_chunk(&mut cx), Poll::Ready(chunk) if !chunk.is_empty()));
+    outbox.consume(usize::MAX);
+    assert!(outbox.poll_chunk(&mut cx).is_pending());
+    drop(endpoint);
+    assert_eq!(count.0.load(Ordering::SeqCst), 2);
+    assert!(matches!(outbox.poll_chunk(&mut cx), Poll::Ready([])));
 }

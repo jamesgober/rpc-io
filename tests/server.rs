@@ -151,6 +151,11 @@ fn test_server_stopped_before_it_serves_returns_at_once() {
     );
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(server.connections(), 0);
+    let configured = Server::new(Framing::Newline)
+        .with_config(rpc_io::Config::new().with_limits(rpc_io::Limits::network()))
+        .with_queue(rpc_io::QueueLimits::new().with_max_bytes(1 << 20))
+        .with_max_connections(0);
+    assert_eq!(configured.max_connections(), 1);
     assert!(format!("{server:?} {:?}", server.stopper()).contains("max_connections: 256"));
 }
 

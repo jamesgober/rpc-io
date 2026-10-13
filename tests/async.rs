@@ -322,3 +322,50 @@ fn test_write_to_a_failing_writer_closes_the_endpoint() {
         assert!(endpoint.is_closed());
     }
 }
+
+#[test]
+fn test_write_to_a_writer_whose_flush_fails_closes_the_endpoint() {
+    struct NoFlush(Vec<u8>);
+    impl AsyncWrite for NoFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().0.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush")))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new());
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(endpoint.peer().notify("x", ()).is_ok());
+    let result = block_on(outbox.write_to(NoFlush(Vec::new())));
+    assert_eq!(
+        result.err().map(|e| e.kind()),
+        Some(io::ErrorKind::BrokenPipe)
+    );
+    assert!(endpoint.peer().notify("y", ()).is_err());
+}
+
+#[test]
+fn test_outbox_read_is_pending_until_a_message_is_sent() {
+    let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new());
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut buf = [0u8; 8];
+    assert!(
+        Pin::new(&mut outbox)
+            .poll_read(&mut cx, &mut buf)
+            .is_pending()
+    );
+    drop(sink);
+    assert!(matches!(
+        Pin::new(&mut outbox).poll_read(&mut cx, &mut buf),
+        Poll::Ready(Ok(0))
+    ));
+}
