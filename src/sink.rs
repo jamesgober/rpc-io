@@ -68,15 +68,18 @@ impl Sink for mpsc::Sender<String> {
 }
 
 /// Above this many buffered bytes a turn's output is written before the turn
-/// ends, so a handler that sends a great deal holds a bounded buffer.
+/// ends, so a handler that sends a great deal holds a bounded buffer: the
+/// default of [`Framed::with_flush_threshold`].
 const WRITE_AT: usize = 64 * 1024;
 
 /// A [`Sink`] that frames messages onto a byte stream: stdout, a socket, a
 /// pipe.
 ///
 /// Messages are framed into a reused buffer and written with one `write_all`
-/// and one `flush` per turn (and whenever more than 64 KiB is waiting), so a
-/// handler that sends ten notifications costs one system call, not ten.
+/// and one `flush` per turn (and whenever more than the flush threshold, 64
+/// KiB by default, is waiting), so a handler that sends ten notifications
+/// costs one system call, not ten. A buffer grown past twice the threshold
+/// by one large message is released once that message is written.
 ///
 /// # Examples
 ///
@@ -95,6 +98,7 @@ pub struct Framed<W> {
     writer: W,
     framing: Framing,
     out: Vec<u8>,
+    write_at: usize,
 }
 
 impl<W: Write> Framed<W> {
@@ -112,7 +116,44 @@ impl<W: Write> Framed<W> {
             writer,
             framing,
             out: Vec::new(),
+            write_at: WRITE_AT,
         }
+    }
+
+    /// Sets how many framed bytes may wait in the buffer before they are
+    /// written, even mid-turn (64 KiB by default; at least 1). Lower it to
+    /// bound memory per connection, raise it to batch more writes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framed, Framing, Sink};
+    ///
+    /// let mut framed = Framed::new(Vec::new(), Framing::Newline).with_flush_threshold(4);
+    /// assert_eq!(framed.flush_threshold(), 4);
+    /// framed.send("[1,2]")?; // 6 framed bytes: written at once
+    /// assert_eq!(framed.get_ref().as_slice(), b"[1,2]\n");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_flush_threshold(mut self, bytes: usize) -> Self {
+        self.write_at = bytes.max(1);
+        self
+    }
+
+    /// The flush threshold: buffered bytes that are written before a turn
+    /// ends.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let framed = rpc_io::Framed::new(Vec::<u8>::new(), rpc_io::Framing::Newline);
+    /// assert_eq!(framed.flush_threshold(), 64 * 1024);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn flush_threshold(&self) -> usize {
+        self.write_at
     }
 
     /// The framing.
@@ -176,6 +217,10 @@ impl<W: Write> Framed<W> {
         }
         let result = self.writer.write_all(&self.out);
         self.out.clear();
+        if self.out.capacity() > self.write_at.saturating_mul(2) {
+            // One large message grew the buffer; keep only the usual size.
+            self.out.shrink_to(self.write_at);
+        }
         result
     }
 }
@@ -183,7 +228,7 @@ impl<W: Write> Framed<W> {
 impl<W: Write + Send + 'static> Sink for Framed<W> {
     fn send(&mut self, message: &str) -> io::Result<()> {
         self.framing.encode(message.as_bytes(), &mut self.out);
-        if self.out.len() >= WRITE_AT {
+        if self.out.len() >= self.write_at {
             self.write_out()?;
         }
         Ok(())
@@ -207,6 +252,16 @@ mod tests {
         assert!(framed.send(&big).is_ok());
         assert_eq!(framed.get_ref().len(), WRITE_AT + 1);
         assert!(framed.out.is_empty());
+    }
+
+    #[test]
+    fn test_framed_releases_a_buffer_grown_by_one_large_message() {
+        let mut framed = Framed::new(io::sink(), Framing::ContentLength);
+        let big = "x".repeat(10 * WRITE_AT);
+        assert!(framed.send(&big).is_ok());
+        assert!(framed.out.capacity() <= 2 * WRITE_AT);
+        assert!(framed.send("{}").is_ok() && framed.flush().is_ok());
+        assert!(framed.out.capacity() <= 2 * WRITE_AT);
     }
 
     #[test]

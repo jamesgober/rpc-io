@@ -12,8 +12,13 @@ use core::{fmt, ops::Range};
 
 use crate::limits::Limits;
 
-/// Bytes offered for each read, and the read-ahead past a message's end.
+/// Bytes offered for each read, and the read-ahead past a message's end: the
+/// default of [`Decoder::with_read_chunk`].
 pub const READ_CHUNK: usize = 8 * 1024;
+
+/// A buffer this many read chunks long, or longer, is released once at most
+/// a quarter of it is needed (see [`Decoder::space`]).
+const SHRINK_CHUNKS: usize = 4;
 
 /// How messages are delimited on a byte stream.
 ///
@@ -265,8 +270,13 @@ enum Step {
 /// returned `Ok(None)`, which is what keeps its memory bounded no matter how
 /// the peer sends:
 ///
-/// - the buffer never exceeds one message plus [`READ_CHUNK`] bytes of
-///   read-ahead (`max(max_message_bytes + 1, max_header_bytes) + READ_CHUNK`);
+/// - the buffer never exceeds one message plus one read chunk
+///   ([`READ_CHUNK`] by default) of read-ahead
+///   (`max(max_message_bytes + 1, max_header_bytes) + read_chunk`, see
+///   [`memory_bound`](Decoder::memory_bound));
+/// - the buffer shrinks again once a large message has been taken (see
+///   [`space`](Decoder::space)), so memory follows the current message, not
+///   the largest one seen;
 /// - a Content-Length body is reserved as its bytes arrive, never all at once
 ///   from the header's word alone;
 /// - an oversized message is skipped as it arrives ([`FrameError::TooLarge`])
@@ -305,6 +315,8 @@ pub struct Decoder {
     max_message: usize,
     max_header_bytes: usize,
     max_headers: usize,
+    /// Bytes offered for each read.
+    chunk: usize,
     /// Initialized storage; bytes `start..end` are buffered and unconsumed.
     buf: Vec<u8>,
     start: usize,
@@ -338,6 +350,7 @@ impl Decoder {
             max_message: limits.max_message_bytes,
             max_header_bytes: limits.max_header_bytes,
             max_headers: limits.max_headers,
+            chunk: READ_CHUNK,
             buf: Vec::new(),
             start: 0,
             end: 0,
@@ -361,6 +374,73 @@ impl Decoder {
     #[must_use]
     pub const fn framing(&self) -> Framing {
         self.framing
+    }
+
+    /// Sets how many bytes [`space`](Decoder::space) offers for each read,
+    /// and so the read-ahead past a message (at least 1; [`READ_CHUNK`] by
+    /// default). Larger chunks mean fewer reads on fast streams; smaller ones
+    /// mean less memory per idle connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits};
+    ///
+    /// let mut d = Framing::Newline.decoder(&Limits::new()).with_read_chunk(512);
+    /// assert_eq!(d.space().len(), 512);
+    /// assert_eq!(d.read_chunk(), 512);
+    /// ```
+    #[must_use]
+    pub const fn with_read_chunk(mut self, bytes: usize) -> Self {
+        self.chunk = if bytes == 0 { 1 } else { bytes };
+        self
+    }
+
+    /// The bytes offered for each read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits, READ_CHUNK};
+    ///
+    /// assert_eq!(Framing::Newline.decoder(&Limits::new()).read_chunk(), READ_CHUNK);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn read_chunk(&self) -> usize {
+        self.chunk
+    }
+
+    /// The bytes the buffer holds allocated now. It grows while a large
+    /// message arrives and is released again once the message is taken (the
+    /// shrink policy of [`space`](Decoder::space)), so a connection's memory
+    /// follows the messages it is reading, not the largest it ever read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits, READ_CHUNK};
+    ///
+    /// let mut d = Framing::Newline.decoder(&Limits::new());
+    /// assert_eq!(d.capacity(), 0); // nothing until the first read
+    /// let mut line = vec![b'1'; 1 << 20];
+    /// line.push(b'\n');
+    /// let mut rest = line.as_slice();
+    /// while !rest.is_empty() {
+    ///     let n = d.feed(rest);
+    ///     rest = &rest[n..];
+    ///     while d.next_frame()?.is_some() {}
+    /// }
+    /// assert!(d.capacity() > 1 << 20); // it held the whole line
+    /// d.feed(b"2\n");
+    /// assert_eq!(d.next_frame()?, Some(&b"2"[..]));
+    /// assert!(d.capacity() <= 2 * READ_CHUNK); // and gave it back
+    /// # Ok::<(), rpc_io::FrameError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Bytes buffered and not yet returned or skipped.
@@ -399,7 +479,7 @@ impl Decoder {
         } else {
             self.max_header_bytes
         };
-        largest.saturating_add(READ_CHUNK)
+        largest.saturating_add(self.chunk)
     }
 
     /// Where to put the next bytes read from the stream; follow with
@@ -407,8 +487,15 @@ impl Decoder {
     ///
     /// Empty until [`next_frame`](Decoder::next_frame) has returned
     /// `Ok(None)` (every complete message taken), and after a fatal error.
-    /// The slice is at least [`READ_CHUNK`] bytes otherwise, more while a large
-    /// body arrives.
+    /// The slice is at least the [read chunk](Decoder::with_read_chunk)
+    /// otherwise, more while a large body arrives.
+    ///
+    /// Shrink policy: once a buffer of at least four read chunks needs at
+    /// most a quarter of its size for what is still buffered plus the next
+    /// read, it is cut down to that and the rest is returned to the
+    /// allocator. A
+    /// 64 MiB message therefore costs 64 MiB while it is read, not for the
+    /// rest of the connection's life.
     ///
     /// # Examples
     ///
@@ -433,31 +520,45 @@ impl Decoder {
             self.end = 0;
             self.scan = 0;
         }
+        let chunk = self.chunk;
+        let have = self.end - self.start;
         let want = match self.state {
             State::Body { length } => {
-                let have = self.end - self.start;
                 let need = length.saturating_sub(have);
                 // Grow as the body arrives (doubling), never to the announced
                 // length on the header's word alone.
-                if need <= READ_CHUNK {
-                    READ_CHUNK
+                if need <= chunk {
+                    chunk
                 } else {
-                    need.min(have.max(READ_CHUNK))
+                    need.min(have.max(chunk))
                 }
             }
-            _ => READ_CHUNK,
+            _ => chunk,
         };
+        let keep = have.saturating_add(want);
+        let held = self.buf.capacity();
+        if held >= chunk.saturating_mul(SHRINK_CHUNKS) && held / 4 >= keep {
+            // A large message has been taken: give its memory back. While a
+            // message grows, what is buffered is at least half the buffer,
+            // so this never undoes growth in progress.
+            self.compact();
+            self.buf.truncate(keep);
+            self.buf.shrink_to_fit();
+        }
         if self.buf.len() - self.end < want {
-            if self.start > 0 {
-                self.buf.copy_within(self.start..self.end, 0);
-                self.end -= self.start;
-                self.scan -= self.start;
-                self.start = 0;
-            }
+            self.compact();
             let missing = want.saturating_sub(self.buf.len() - self.end);
             if missing > 0 {
-                self.buf.reserve_exact(missing);
-                self.buf.resize(self.buf.len() + missing, 0);
+                let len = self.buf.len();
+                let target = len.saturating_add(missing);
+                if target > held {
+                    // Reserve geometrically, so a line that arrives a chunk at
+                    // a time costs amortized linear copying, but never past
+                    // the memory bound.
+                    let grown = len.saturating_mul(2).min(self.memory_bound()).max(target);
+                    self.buf.reserve_exact(grown - len);
+                }
+                self.buf.resize(target, 0);
             }
         }
         &mut self.buf[self.end..]
@@ -573,6 +674,16 @@ impl Decoder {
             Ok(Some(range)) => Ok(Some(&self.buf[range])),
             Ok(None) => Ok(None),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Moves the buffered bytes to the start of the buffer.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.scan -= self.start;
+            self.start = 0;
         }
     }
 
@@ -980,7 +1091,14 @@ mod tests {
         input: &[u8],
         chunk: usize,
     ) -> Vec<Result<Vec<u8>, FrameError>> {
-        let mut d = framing.decoder(limits);
+        frames_with(&mut framing.decoder(limits), input, chunk)
+    }
+
+    fn frames_with(
+        d: &mut Decoder,
+        input: &[u8],
+        chunk: usize,
+    ) -> Vec<Result<Vec<u8>, FrameError>> {
         let mut out = Vec::new();
         let mut rest = input;
         loop {
@@ -996,6 +1114,7 @@ mod tests {
                     }
                 }
                 assert!(d.buf.len() <= d.memory_bound());
+                assert!(d.buf.capacity() <= d.memory_bound());
             }
             if rest.is_empty() {
                 break;
@@ -1169,6 +1288,68 @@ mod tests {
         assert_eq!(d.next_frame(), Ok(None));
         // The header alone does not reserve 60 MB.
         assert!(d.space().len() <= 2 * READ_CHUNK);
+    }
+
+    #[test]
+    fn test_buffer_shrinks_after_a_large_message() {
+        for framing in [Framing::ContentLength, Framing::Newline] {
+            let mut d = framing.decoder(&Limits::new());
+            let mut wire = Vec::new();
+            framing.encode(&vec![b'7'; 10_000_000], &mut wire);
+            for _ in 0..1000 {
+                framing.encode(b"[1]", &mut wire);
+            }
+            let mut rest = wire.as_slice();
+            let mut frames = 0;
+            let mut peak = 0;
+            while !rest.is_empty() {
+                let n = d.feed(rest);
+                rest = &rest[n..];
+                peak = peak.max(d.capacity());
+                while let Ok(Some(_)) = d.next_frame() {
+                    frames += 1;
+                }
+            }
+            assert_eq!(frames, 1001, "{framing:?}");
+            assert!(peak >= 10_000_000, "{framing:?}: {peak}");
+            assert!(
+                d.capacity() <= 2 * READ_CHUNK,
+                "{framing:?}: {}",
+                d.capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_keeps_its_size_while_a_message_grows() {
+        // A line arriving a chunk at a time: the buffer must not be shrunk
+        // between reads (that would make the growth quadratic).
+        let mut d = Framing::Newline.decoder(&Limits::new());
+        let mut last = 0;
+        for _ in 0..64 {
+            let space = d.space();
+            let n = space.len().min(READ_CHUNK);
+            space[..n].fill(b'x');
+            d.commit(n);
+            assert_eq!(d.next_frame(), Ok(None));
+            assert!(d.capacity() >= last);
+            last = d.capacity();
+        }
+        assert!(d.buffered() >= 64 * READ_CHUNK - READ_CHUNK);
+    }
+
+    #[test]
+    fn test_read_chunk_is_configurable() {
+        let mut d = Framing::Newline.decoder(&Limits::new()).with_read_chunk(0);
+        assert_eq!(d.read_chunk(), 1);
+        assert_eq!(d.space().len(), 1);
+        let mut d = Framing::ContentLength
+            .decoder(&Limits::new().with_max_message_bytes(10))
+            .with_read_chunk(3);
+        assert_eq!(d.memory_bound(), Limits::new().max_header_bytes + 3);
+        let got = frames_with(&mut d, b"Content-Length: 2\r\n\r\nok", 100);
+        assert_eq!(got, vec![Ok(b"ok".to_vec())]);
+        assert!(d.capacity() <= d.memory_bound());
     }
 
     #[test]

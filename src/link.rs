@@ -32,6 +32,9 @@ use crate::{
     text,
 };
 
+/// The encoding buffer is released after a message that grew it past this.
+const SCRATCH_KEEP: usize = 64 * 1024;
+
 /// How one of our requests ended.
 pub(crate) type Outcome = Result<Raw<'static>, CallError>;
 
@@ -338,6 +341,10 @@ impl<K: Sink> Inner<K> {
         // wait for a handler that may run for seconds.
         if sent.is_ok() && (!self.corked || !self.on_endpoint_thread()) {
             sent = guard(|| self.sink.flush());
+        }
+        if self.scratch.capacity() > SCRATCH_KEEP {
+            // A large message or batch grew the buffer; keep the usual size.
+            self.scratch = String::new();
         }
         sent.map_err(|error| self.fail(error))
     }
