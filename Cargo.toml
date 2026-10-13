@@ -116,6 +116,10 @@ required-features = ["std"]
 name              = "pipe_pair"
 required-features = ["std"]
 
+[[example]]
+name              = "tcp_server"
+required-features = ["net"]
+
 
 # RELEASE PROFILE
 # #################################
