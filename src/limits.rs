@@ -18,8 +18,22 @@ use jsonx_lib::Parser;
 /// | `max_skip_bytes` | `u64::MAX` | the announced length of an oversized Content-Length message that is still skipped; above it the connection is closed |
 /// | `json` | `jsonx_lib::Limits::new()` | depth 128, 16 MiB strings, 1 KiB numbers, 4 Mi values |
 ///
-/// `#[non_exhaustive]`: start from [`Limits::new`] and chain the `with_*`
-/// methods, or assign the public fields of a `Limits::new()`.
+/// The defaults suit a local peer over stdio (an editor, an agent host).
+/// Every message is parsed under these budgets, and a handler that calls
+/// [`Params::parse`](crate::Params) builds a full value tree within them, so
+/// one 64 MiB array of small numbers can cost several times its size in
+/// memory. For peers across a network use [`Limits::network`] or
+/// [`Limits::strict`].
+///
+/// | Preset | Messages | Headers | Batch | Skip | JSON depth / strings / values |
+/// |---|---:|---:|---:|---:|---|
+/// | [`new`](Limits::new), [`lsp`](Limits::lsp) | 64 MiB | 8 KiB, 32 | 1024 | any | 128 / 16 MiB / 4 Mi |
+/// | [`mcp`](Limits::mcp) | 64 MiB | 8 KiB, 32 | off | any | 128 / 16 MiB / 4 Mi |
+/// | [`network`](Limits::network) | 4 MiB | 4 KiB, 16 | 128 | 64 MiB | 64 / 1 MiB / 256 Ki |
+/// | [`strict`](Limits::strict) | 1 MiB | 2 KiB, 8 | 16 | 4 MiB | 32 / 256 KiB / 64 Ki |
+///
+/// `#[non_exhaustive]`: start from [`Limits::new`] (or a preset) and chain
+/// the `with_*` methods, or assign the public fields of a `Limits::new()`.
 ///
 /// # Examples
 ///
@@ -71,6 +85,91 @@ impl Limits {
             max_batch: 1024,
             max_skip_bytes: u64::MAX,
             json: jsonx_lib::Limits::new(),
+        }
+    }
+
+    /// LSP over stdio: the defaults. Editors send whole files (`didOpen`),
+    /// so messages may be large; batches are allowed, though LSP clients do
+    /// not send them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Limits::lsp(), rpc_io::Limits::new());
+    /// ```
+    #[must_use]
+    pub const fn lsp() -> Self {
+        Self::new()
+    }
+
+    /// MCP over stdio: the defaults with batches off. MCP removed JSON-RPC
+    /// batching in its 2025-06-18 revision; a peer on the 2025-03-26 revision
+    /// may batch, and `with_max_batch` turns batches back on for it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Limits::mcp().max_batch, 0);
+    /// ```
+    #[must_use]
+    pub const fn mcp() -> Self {
+        Self::new().without_batches()
+    }
+
+    /// A peer across a network (a TCP service, a remote MCP server): 4 MiB
+    /// messages, 4 KiB header sections of at most 16 lines, batches of 128,
+    /// a body over 64 MiB announced is not skipped but closes the
+    /// connection, and the JSON budgets cut to depth 64, 1 MiB strings, 128
+    /// byte numbers, and 256 Ki values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let limits = rpc_io::Limits::network();
+    /// assert_eq!(limits.max_message_bytes, 4 << 20);
+    /// assert_eq!(limits.json.max_depth, 64);
+    /// ```
+    #[must_use]
+    pub const fn network() -> Self {
+        Self {
+            max_message_bytes: 4 * 1024 * 1024,
+            max_header_bytes: 4 * 1024,
+            max_headers: 16,
+            max_batch: 128,
+            max_skip_bytes: 64 * 1024 * 1024,
+            json: jsonx_lib::Limits::new()
+                .with_max_depth(64)
+                .with_max_string_bytes(1024 * 1024)
+                .with_max_number_bytes(128)
+                .with_max_elements(256 * 1024),
+        }
+    }
+
+    /// An untrusted peer with small messages (an authentication step, a
+    /// public endpoint): 1 MiB messages, 2 KiB header sections of at most 8
+    /// lines, batches of 16, a body over 4 MiB announced closes the
+    /// connection, and the JSON budgets cut to depth 32, 256 KiB strings, 64
+    /// byte numbers, and 64 Ki values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let limits = rpc_io::Limits::strict();
+    /// assert_eq!((limits.max_message_bytes, limits.max_batch), (1 << 20, 16));
+    /// ```
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            max_message_bytes: 1024 * 1024,
+            max_header_bytes: 2 * 1024,
+            max_headers: 8,
+            max_batch: 16,
+            max_skip_bytes: 4 * 1024 * 1024,
+            json: jsonx_lib::Limits::new()
+                .with_max_depth(32)
+                .with_max_string_bytes(256 * 1024)
+                .with_max_number_bytes(64)
+                .with_max_elements(64 * 1024),
         }
     }
 

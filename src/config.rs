@@ -201,6 +201,45 @@ impl Config {
     }
 }
 
+impl Config {
+    /// An LSP server: [`Limits::lsp`], [`Cancellation::lsp`], and
+    /// [`Gate::lsp`]. A client leaves the gate out (`with_gate(None)`): the
+    /// gate belongs on the side that receives `initialize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = rpc_io::Config::lsp();
+    /// assert_eq!(config.gate.map(|g| g.method), Some("initialize".into()));
+    /// assert_eq!(config.cancellation.map(|c| c.method), Some("$/cancelRequest".into()));
+    /// ```
+    #[must_use]
+    pub fn lsp() -> Self {
+        Self::new()
+            .with_limits(Limits::lsp())
+            .with_cancellation(Some(Cancellation::lsp()))
+            .with_gate(Some(Gate::lsp()))
+    }
+
+    /// An MCP server: [`Limits::mcp`] (batches off), [`Cancellation::mcp`],
+    /// and [`Gate::mcp`]. A client leaves the gate out (`with_gate(None)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = rpc_io::Config::mcp();
+    /// assert_eq!(config.limits.max_batch, 0);
+    /// assert_eq!(config.cancellation.map(|c| c.id_member), Some("requestId".into()));
+    /// ```
+    #[must_use]
+    pub fn mcp() -> Self {
+        Self::new()
+            .with_limits(Limits::mcp())
+            .with_cancellation(Some(Cancellation::mcp()))
+            .with_gate(Some(Gate::mcp()))
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self::new()
@@ -302,7 +341,8 @@ impl Cancellation {
 /// Until the opening request has been answered successfully:
 ///
 /// - other requests are answered with `code` (default
-///   [`SERVER_NOT_INITIALIZED`](ErrorCode::SERVER_NOT_INITIALIZED));
+///   [`SERVER_NOT_INITIALIZED`](ErrorCode::SERVER_NOT_INITIALIZED)), except
+///   the methods in `allow_requests` (MCP's `ping`);
 /// - notifications are dropped (reported as [`Event::Dropped`](crate::Event)),
 ///   except the methods in `allow` (LSP's `exit`);
 /// - everything this side sends other than responses (notifications and
@@ -344,6 +384,8 @@ pub struct Gate {
     pub code: ErrorCode,
     /// Notifications delivered even before the gate opens.
     pub allow: Vec<Cow<'static, str>>,
+    /// Requests served even before the gate opens (MCP's `ping`).
+    pub allow_requests: Vec<Cow<'static, str>>,
 }
 
 impl Gate {
@@ -360,7 +402,53 @@ impl Gate {
             method: method.into(),
             code: ErrorCode::SERVER_NOT_INITIALIZED,
             allow: Vec::new(),
+            allow_requests: Vec::new(),
         }
+    }
+
+    /// LSP's: `initialize`, with `exit` let through (a client may end a
+    /// server it never initialized).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Gate::lsp().allow, ["exit"]);
+    /// ```
+    #[must_use]
+    pub fn lsp() -> Self {
+        Self::new("initialize").allow("exit")
+    }
+
+    /// MCP's: `initialize`, with the `ping` request served before it (MCP
+    /// allows pings at any time).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Gate::mcp().allow_requests, ["ping"]);
+    /// ```
+    #[must_use]
+    pub fn mcp() -> Self {
+        Self::new("initialize").allow_request("ping")
+    }
+
+    /// Serves the request `method` before the gate opens.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let gate = rpc_io::Gate::new("auth").allow_request("version");
+    /// assert_eq!(gate.allow_requests, ["version"]);
+    /// ```
+    #[must_use]
+    pub fn allow_request(mut self, method: impl Into<Cow<'static, str>>) -> Self {
+        self.allow_requests.push(method.into());
+        self
+    }
+
+    /// Whether the request `method` is served before the gate opens.
+    pub(crate) fn allows_request(&self, method: &str) -> bool {
+        self.allow_requests.iter().any(|m| m == method)
     }
 
     /// Lets the notification `method` through before the gate opens.

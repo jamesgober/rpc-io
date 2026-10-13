@@ -858,6 +858,9 @@ impl<S, K: Sink> Endpoint<S, K> {
             return Admission::Admitted;
         };
         let opening = method == gate.method;
+        if !opening && inner.gate != GateState::Open && gate.allows_request(method) {
+            return Admission::Admitted;
+        }
         let refusal = match &inner.gate {
             GateState::Open if opening => {
                 ErrorObject::invalid_request(format!("`{}` was already received", clip(method)))
