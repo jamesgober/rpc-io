@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "JSON-RPC 2.0 engine with Content-Length and newline framings, a sans-IO core, and a blocking adapter: one transport for LSP, DAP, MCP, and service APIs."
+description = "JSON-RPC 2.0 engine for LSP, MCP, and service APIs: Content-Length and newline framings, a sans-IO core, blocking and async adapters, bounded non-blocking output, and hostile-input hardening."
 
 # Keywords (5 max)
 keywords = ["json-rpc", "rpc", "lsp", "mcp", "protocol"]

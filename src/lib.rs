@@ -1,12 +1,17 @@
 //! # rpc-io
 //!
-//! A JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP and
-//! DAP (Content-Length framing), MCP over stdio (newline framing), and service
-//! APIs. Build a [`Router`] of handlers, hand it a byte stream, and the crate
-//! does the rest: framing, the envelope, batches, id correlation, cancellation,
-//! and the error codes the specification prescribes, with bounded buffers and
-//! no panics on any input. JSON is [`jsonx_lib`], the family's own; there are
-//! no third-party runtime dependencies.
+//! A JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP
+//! (Content-Length framing), MCP over stdio (newline framing), and JSON-RPC
+//! service APIs. Build a [`Router`] of handlers, hand it a byte stream, and the
+//! crate does the rest: framing, the envelope, batches, id correlation,
+//! cancellation, deadlines, and the error codes the specification prescribes,
+//! with bounded buffers and no panics on any input. JSON is [`jsonx_lib`], the
+//! family's own; the default build has no third-party runtime dependency.
+//!
+//! The Content-Length framing ([`Framing::ContentLength`], [`Decoder`]) is
+//! also the base protocol of the Debug Adapter Protocol and cuts DAP messages
+//! as well. DAP's messages themselves (`seq`, `type`, `command`) are not
+//! JSON-RPC, so the endpoint does not serve DAP: only the framing applies.
 //!
 //! ## Quick start
 //!

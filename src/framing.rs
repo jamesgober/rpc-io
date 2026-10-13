@@ -42,8 +42,9 @@ const SHRINK_CHUNKS: usize = 4;
 #[non_exhaustive]
 pub enum Framing {
     /// `Content-Length: <n>\r\n\r\n` and then `n` bytes of body: the base
-    /// protocol of LSP and DAP. Other headers (`Content-Type`) are accepted and
-    /// ignored; header names match case-insensitively; a bare `\n` line end is
+    /// protocol of LSP (and of DAP, whose messages are not JSON-RPC: this
+    /// framing cuts them, the endpoint does not serve them). Other headers
+    /// (`Content-Type`) are accepted and ignored; header names match case-insensitively; a bare `\n` line end is
     /// accepted for `\r\n`. Blank lines before a header section (stray line
     /// ends between messages) are skipped and do not count against
     /// [`Limits::max_header_bytes`]: each is consumed as soon as its line end

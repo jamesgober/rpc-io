@@ -499,9 +499,9 @@ assert_eq!(mcp.max_pending, 1024);
 ```rust
 use rpc_io::{Cancellation, ErrorCode};
 
-// LexerSketch's API: `$/cancel {id}`, answered with error 1005.
-let studio = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
-assert_eq!(studio.method, "$/cancel");
+// A service API of your own: `$/cancel {id}`, answered with error 1005.
+let custom = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
+assert_eq!(custom.method, "$/cancel");
 ```
 
 ## `Gate`
@@ -571,7 +571,7 @@ assert_eq!(framed.get_ref().as_slice(), b"Content-Length: 2\r\n\r\n{}");
 
 ## `Framing`
 
-`#[non_exhaustive]`: `ContentLength` (LSP and DAP: `Content-Length: n\r\n\r\n` then `n` bytes; other headers ignored, names case-insensitive, bare `\n` accepted, names must be RFC 9110 tokens; blank lines between messages skipped and not counted against `max_header_bytes`) and `Newline` (MCP stdio, JSON Lines: one message per line, `\r` before `\n` dropped, blank lines skipped; every line, blank or not, counts against `max_message_bytes`). Either way the result does not depend on how the input was split into reads.
+`#[non_exhaustive]`: `ContentLength` (LSP's base protocol, and DAP's: `Content-Length: n\r\n\r\n` then `n` bytes; other headers ignored, names case-insensitive, bare `\n` accepted, names must be RFC 9110 tokens; blank lines between messages skipped and not counted against `max_header_bytes`) and `Newline` (MCP stdio, JSON Lines: one message per line, `\r` before `\n` dropped, blank lines skipped; every line, blank or not, counts against `max_message_bytes`). Either way the result does not depend on how the input was split into reads. DAP's messages are not JSON-RPC: the framing cuts them, the endpoint does not serve them.
 
 - `encode(self, body: &[u8], out: &mut Vec<u8>)` appends one framed message. For `Newline`, `\r` and `\n` in the body become spaces: JSON can only hold them as whitespace, so the message means the same and stays on one line.
 - `decoder(self, limits: &Limits) -> Decoder`.

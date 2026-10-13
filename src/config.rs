@@ -270,9 +270,9 @@ impl Default for Config {
 /// assert_eq!((lsp.method.as_ref(), lsp.id_member.as_ref()), ("$/cancelRequest", "id"));
 /// assert_eq!(lsp.reply, Some(ErrorCode::REQUEST_CANCELLED));
 ///
-/// // LexerSketch's API (specs/STUDIO.md §7.1): `$/cancel {id}`, error 1005.
-/// let studio = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
-/// assert_eq!(studio.reply, Some(ErrorCode(1005)));
+/// // A service API of your own: `$/cancel {id}`, answered with error 1005.
+/// let custom = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
+/// assert_eq!(custom.reply, Some(ErrorCode(1005)));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -336,7 +336,7 @@ impl Cancellation {
 }
 
 /// An opening request that must succeed before anything else is served (LSP's
-/// `initialize`, MCP's `initialize`, LexerSketch's `auth`).
+/// `initialize`, MCP's `initialize`, a service's own `auth`).
 ///
 /// Until the opening request has been answered successfully:
 ///

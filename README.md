@@ -18,10 +18,10 @@
 
 <div align="left">
     <p>
-        <strong>rpc-io</strong> is a JSON-RPC 2.0 engine for the protocols editors and tools speak: Content-Length framing for LSP and DAP, newline framing for MCP over stdio, and plain message bodies for anything else. Register handlers on a <code>Router</code>, hand it a byte stream, and the crate does the rest: framing, the envelope, batches, id correlation, cancellation in both directions, an opening-request gate, and the error codes the specification prescribes.
+        <strong>rpc-io</strong> is a JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP over Content-Length framing, MCP over newline framing (its stdio transport), and JSON-RPC service APIs over either. Register handlers on a <code>Router</code>, hand it a byte stream, and the crate does the rest: framing, the envelope, batches, id correlation, cancellation in both directions, an opening-request gate, deadlines, and the error codes the specification prescribes. Its Content-Length framing layer also cuts Debug Adapter Protocol messages, which use the same base protocol; DAP's messages are not JSON-RPC, so for DAP only the framing applies, not the engine.
     </p>
     <p>
-        It is built to take hostile input. Header sections, bodies, batches, and JSON nesting all have budgets checked before memory is spent; nothing recurses on input; every request gets exactly one response and no notification gets one; and a handler that panics is answered with <code>INTERNAL_ERROR</code> while the session carries on. It is the shared transport of the LexerSketch servers: <code>lsp-lang</code> 2.0, <code>dap-lang</code>, <code>mcp-io</code>, and the Studio backend.
+        It is built to take hostile input. Header sections, bodies, batches, and JSON nesting all have budgets checked before memory is spent; nothing recurses on input; every request gets exactly one response and no notification gets one; and a handler that panics is answered with <code>INTERNAL_ERROR</code> while the session carries on. It is the transport of <code>lsp-lang</code> 2.0; the other LexerSketch servers are planned to move onto it.
     </p>
     <br>
     <hr>
@@ -82,7 +82,7 @@ rpc-io = { version = "0.2", default-features = false }
 
 ## Quick start
 
-A server on stdin and stdout is one call. This one takes newline-delimited messages, as MCP's stdio transport does; LSP and DAP use `Framing::ContentLength`:
+A server on stdin and stdout is one call. This one takes newline-delimited messages, as MCP's stdio transport does; LSP uses `Framing::ContentLength`:
 
 ```rust
 use jsonx_lib::json;
@@ -181,7 +181,7 @@ Runnable programs in [`examples/`](./examples):
 
 | Example | What it shows |
 |---|---|
-| [`stdio_echo`](./examples/stdio_echo.rs) | A server on stdin and stdout, newline framing (MCP) or `--content-length` (LSP, DAP): `echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' \| cargo run --example stdio_echo` |
+| [`stdio_echo`](./examples/stdio_echo.rs) | A server on stdin and stdout, newline framing (MCP) or `--content-length` (LSP): `echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' \| cargo run --example stdio_echo` |
 | [`pipe_pair`](./examples/pipe_pair.rs) | A client and a server over an in-memory pipe, each on its own thread: concurrent requests correlated by id, a deferred answer with progress notifications, and a cancelled request. |
 
 <hr>
