@@ -243,20 +243,22 @@ Runnable programs in [`examples/`](./examples):
 
 Decoding is one pass of `jsonx-lib`'s pull reader over each body: the envelope members are read as raw slices, so `params` and `result` are validated once and never copied or decoded unless a handler asks. Method names and string ids borrow from the body when they have no escapes, and deferred requests are looked up without copying their ids. `Framed` frames messages into a reused buffer and writes once per turn, however many messages a handler sends; `Queued` writes each batch of queued messages with one `write_all` and one `flush`. The decoder reads straight into its own buffer, searches for line ends eight bytes at a time, resumes each search where the last one stopped, and grows geometrically while a large message arrives.
 
-Measured with the benchmarks in [`benches/`](./benches), x86_64 Windows, Rust stable, release profile, on LSP-shaped `textDocument/hover` requests (about 160 bytes each):
+Measured with the benchmarks in [`benches/`](./benches), x86_64 Windows, Rust stable, release profile, on LSP-shaped `textDocument/hover` requests (about 160 bytes each). The machine was under heavy background load, so treat these as indicative; run back to back in that session, 0.3.0 matched or beat 0.2.0 on every benchmark whose code it changed:
 
 | Benchmark | What it measures | Windows |
 |---|---|---:|
-| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | ~4.4 GiB/s (4.2 ms) |
-| `framing/decode_100k_Newline` | The same with newline framing. | ~6.6 GiB/s (2.8 ms) |
-| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | ~2.3 / ~1.7 GiB/s |
-| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | ~2.1 M/s (~470 ns each) |
-| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | ~350 µs |
-| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | ~2.4 M/s |
-| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params`, build a result, encode, frame, write. | ~560 K/s (~1.8 µs each) |
-| `endpoint/run_100k_framed_requests` | The same, read from one Content-Length stream by `run`. | ~520 K/s |
-| `endpoint/run_100k_queued` | The same through a `Queued` sink, written by its own thread. | ~480 K/s |
-| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | ~1.7 M pairs/s |
+| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | ~6.6 GiB/s (2.8 ms) |
+| `framing/decode_100k_Newline` | The same with newline framing. | ~8.9 GiB/s (1.9 ms) |
+| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | ~3.0 / ~2.0 GiB/s |
+| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | ~2.5 M/s (~400 ns each) |
+| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | ~320 µs |
+| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | ~3.0 M/s |
+| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params`, build a result, encode, frame, write. | ~685 K/s (~1.5 µs each) |
+| `endpoint/run_100k_framed_requests` | The same, read from one Content-Length stream by `run`, written by `Framed`. | ~650 K/s |
+| `endpoint/run_100k_queued` | The same through a `Queued` sink: a writer thread does the writes, and the time includes waiting for it to finish. | ~360 K/s |
+| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | ~2.0 M pairs/s |
+
+The queued path costs a hand-off to the writer thread per batch; it buys a sender that never waits on the peer. Use `Framed` for a peer that always reads (a local pipe), `Queued` for anything that might stall.
 
 ```bash
 cargo bench --bench bench
