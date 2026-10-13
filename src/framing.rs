@@ -172,6 +172,15 @@ pub enum FrameError {
     },
     /// The stream ended inside a message.
     Truncated,
+    /// A Content-Length header announced a body over both
+    /// [`Limits::max_message_bytes`] and [`Limits::max_skip_bytes`]: too
+    /// large to read, and too large to skip.
+    TooLargeToSkip {
+        /// The length the header announced.
+        length: u64,
+        /// The skip limit, in bytes.
+        limit: u64,
+    },
 }
 
 impl FrameError {
@@ -224,6 +233,10 @@ impl fmt::Display for FrameError {
                 write!(f, "a message exceeds the limit of {limit} bytes")
             }
             FrameError::Truncated => f.write_str("the stream ended inside a message"),
+            FrameError::TooLargeToSkip { length, limit } => write!(
+                f,
+                "a message of {length} bytes is over the skip limit of {limit}"
+            ),
         }
     }
 }
@@ -315,6 +328,7 @@ pub struct Decoder {
     max_message: usize,
     max_header_bytes: usize,
     max_headers: usize,
+    max_skip: u64,
     /// Bytes offered for each read.
     chunk: usize,
     /// Initialized storage; bytes `start..end` are buffered and unconsumed.
@@ -350,6 +364,7 @@ impl Decoder {
             max_message: limits.max_message_bytes,
             max_header_bytes: limits.max_header_bytes,
             max_headers: limits.max_headers,
+            max_skip: limits.max_skip_bytes,
             chunk: READ_CHUNK,
             buf: Vec::new(),
             start: 0,
@@ -908,6 +923,10 @@ impl Decoder {
                 self.state = State::Body { length: n };
                 Ok(())
             }
+            _ if length > self.max_skip => Err(self.fail(FrameError::TooLargeToSkip {
+                length,
+                limit: self.max_skip,
+            })),
             _ => {
                 self.state = State::Skip { remaining: length };
                 Err(FrameError::TooLarge {
@@ -1242,6 +1261,35 @@ mod tests {
                 }),
                 Ok(b"ok".to_vec())
             ]
+        );
+    }
+
+    #[test]
+    fn test_body_over_the_skip_limit_is_fatal() {
+        let limits = Limits::new()
+            .with_max_message_bytes(4)
+            .with_max_skip_bytes(10);
+        let mut input = b"Content-Length: 10\r\n\r\n0123456789".to_vec();
+        input.extend_from_slice(b"Content-Length: 11\r\n\r\n");
+        let got = frames(Framing::ContentLength, &limits, &input, 5);
+        let error = FrameError::TooLargeToSkip {
+            length: 11,
+            limit: 10,
+        };
+        assert_eq!(
+            got,
+            vec![
+                Err(FrameError::TooLarge {
+                    length: Some(10),
+                    limit: 4
+                }),
+                Err(error)
+            ]
+        );
+        assert!(!error.is_recoverable());
+        assert_eq!(
+            alloc::string::ToString::to_string(&error),
+            "a message of 11 bytes is over the skip limit of 10"
         );
     }
 

@@ -15,6 +15,7 @@ use jsonx_lib::Parser;
 /// | `max_header_bytes` | 8 KiB | one Content-Length header section, terminators included |
 /// | `max_headers` | 32 | header lines in one header section |
 /// | `max_batch` | 1024 | messages in one batch |
+/// | `max_skip_bytes` | `u64::MAX` | the announced length of an oversized Content-Length message that is still skipped; above it the connection is closed |
 /// | `json` | `jsonx_lib::Limits::new()` | depth 128, 16 MiB strings, 1 KiB numbers, 4 Mi values |
 ///
 /// `#[non_exhaustive]`: start from [`Limits::new`] and chain the `with_*`
@@ -40,6 +41,12 @@ pub struct Limits {
     pub max_headers: usize,
     /// Most messages in one batch.
     pub max_batch: usize,
+    /// The largest announced Content-Length the decoder still skips when it
+    /// is over `max_message_bytes`. A larger one is a fatal
+    /// [`FrameError::TooLargeToSkip`](crate::FrameError::TooLargeToSkip):
+    /// a peer that announces a huge body would otherwise keep the connection
+    /// discarding its input for as long as it likes.
+    pub max_skip_bytes: u64,
     /// The JSON parser's budgets (depth, string and number length, value
     /// count). Its `max_input_bytes` is ignored: `max_message_bytes` applies.
     pub json: jsonx_lib::Limits,
@@ -60,6 +67,7 @@ impl Limits {
             max_header_bytes: 8 * 1024,
             max_headers: 32,
             max_batch: 1024,
+            max_skip_bytes: u64::MAX,
             json: jsonx_lib::Limits::new(),
         }
     }
@@ -113,6 +121,19 @@ impl Limits {
     #[must_use]
     pub const fn with_max_batch(mut self, count: usize) -> Self {
         self.max_batch = count;
+        self
+    }
+
+    /// Sets `max_skip_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Limits::new().with_max_skip_bytes(1 << 30).max_skip_bytes, 1 << 30);
+    /// ```
+    #[must_use]
+    pub const fn with_max_skip_bytes(mut self, bytes: u64) -> Self {
+        self.max_skip_bytes = bytes;
         self
     }
 
