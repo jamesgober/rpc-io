@@ -30,6 +30,10 @@ const WAKE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const TICK: Duration = Duration::from_millis(250);
 
+/// While a connection has work in flight it is not idle; this is how often
+/// its reader looks again, to start the idle clock once the work is done.
+const IDLE_POLL: Duration = Duration::from_secs(1);
+
 /// The first and the longest pause of the accept loop when the system is
 /// out of descriptors or memory.
 const BACKOFF: (Duration, Duration) = (Duration::from_millis(10), Duration::from_secs(1));
@@ -59,14 +63,14 @@ pub struct Connection {
 /// | `queue` | [`QueueLimits::new`] with 8 MiB and 4,096 messages | every connection's outgoing queue |
 /// | `max_connections` | 256 | connections served at once; the next is not accepted until one ends |
 /// | `message_timeout` | 30 s | how long a message may take to arrive once it has begun, and a new connection to send its first one |
-/// | `idle_timeout` | 300 s | how long a connection may stay silent between messages |
+/// | `idle_timeout` | 300 s | how long a connection may stay idle: no traffic either way, and nothing in flight |
 ///
 /// Concurrency is bounded: at `max_connections`, the loop stops accepting
 /// (the operating system queues further connections in its backlog) until a
 /// connection ends. So is the time a connection can hold a slot without
 /// doing anything: a connection that does not complete a message within
-/// `message_timeout` of starting it (or of connecting), or sends nothing for
-/// `idle_timeout` between messages, is closed. The message deadline is per
+/// `message_timeout` of starting it (or of connecting), or stays idle (no
+/// traffic either way and nothing in flight) for `idle_timeout`, is closed. The message deadline is per
 /// message: it starts with the read that brings a message's first bytes and
 /// restarts each time a message completes, so a client streaming messages
 /// back to back is never cut off, while one message trickled in forever is.
@@ -392,6 +396,8 @@ fn serve_connection<T: Stream, S>(
     // message: connecting and sending nothing does not hold a slot for long.
     let mut busy_since = Some(Instant::now());
     let mut last_read = Instant::now();
+    let mut last_active = last_read;
+    let mut sent = 0;
     let mut done = 0;
     loop {
         match endpoint.next_read(framing) {
@@ -409,14 +415,36 @@ fn serve_connection<T: Stream, S>(
             // Part of a message: due `message_timeout` after its first bytes.
             busy_since = busy_since.or(Some(last_read));
         }
+        // Idle means no traffic either way and nothing outstanding: no
+        // deferred request of the peer's being answered, and no request of
+        // ours waiting for the peer.
+        let stats = endpoint.stats();
+        let working = stats.in_flight > 0 || stats.pending > 0;
+        let now = Instant::now();
+        if working || stats.bodies_out != sent {
+            sent = stats.bodies_out;
+            last_active = now;
+        }
+        last_active = last_active.max(last_read);
         let deadline = match busy_since {
             Some(since) => deadlines.message.and_then(|t| since.checked_add(t)),
-            None => deadlines.idle.and_then(|t| last_read.checked_add(t)),
+            None if working => deadlines
+                .idle
+                .and_then(|t| now.checked_add(t.min(IDLE_POLL))),
+            None => deadlines.idle.and_then(|t| last_active.checked_add(t)),
         };
+        if stopped() {
+            return Ending::Stopped;
+        }
+        if deadline.is_some_and(|at| at <= now) {
+            return Ending::Late;
+        }
         match stream.wait_readable(deadline, &stopped) {
             Ok(true) => {}
             Ok(false) if stopped() => return Ending::Stopped,
-            Ok(false) => return Ending::Late,
+            // The deadline passed: the next turn decides whether it still
+            // holds (work may have started or ended meanwhile).
+            Ok(false) => continue,
             Err(error) => return Ending::Failed(Error::Io(error)),
         }
         let Ok(Next::Read(buf)) = endpoint.next_read(framing) else {
@@ -434,14 +462,16 @@ fn serve_connection<T: Stream, S>(
                 last_read = Instant::now();
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            // A read that timed out leaves the socket undefined on some
-            // platforms: the connection is closed, never read again.
+            // A receive that timed out leaves a Windows socket undefined: the
+            // connection is closed, never read again. Elsewhere it is safe to
+            // read again, and the next turn decides whether a deadline passed.
             Err(error) if is_timeout(&error) => {
-                return if stopped() {
-                    Ending::Stopped
-                } else {
-                    Ending::Late
-                };
+                if stopped() {
+                    return Ending::Stopped;
+                }
+                if cfg!(windows) {
+                    return Ending::Late;
+                }
             }
             Err(error) => return Ending::Failed(Error::Io(error)),
         }
@@ -495,8 +525,12 @@ impl Server {
         self
     }
 
-    /// Sets how long a connection may stay silent between messages (`None`:
-    /// no limit). A connection past it is closed.
+    /// Sets how long a connection may stay idle (`None`: no limit): no
+    /// traffic in either direction, no deferred request of the peer's being
+    /// answered, and no request of ours waiting for the peer. A connection
+    /// idle past it is closed. Long-lived sessions whose peer may be quiet
+    /// for a long time (an editor's LSP client, an MCP host between tool
+    /// calls) may want `None`.
     ///
     /// # Examples
     ///

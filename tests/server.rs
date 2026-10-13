@@ -327,6 +327,50 @@ fn test_a_client_streaming_past_the_message_deadline_is_served() {
 }
 
 #[test]
+fn test_a_client_waiting_on_an_answer_is_not_idle() {
+    // Found by the verifier (RPC3-002): a client waiting quietly for a slow
+    // deferred answer was closed as idle, and the answer was lost.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline).with_idle_timeout(Some(Duration::from_millis(300)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().deferred("slow", |_: &mut (), _, _, responder| {
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(1200));
+                        let _answered = responder.ok("done");
+                    });
+                }),
+                (),
+            )
+        })
+    });
+    let (mut client, mut reader) = connect(addr);
+    let answer = ask(
+        &mut client,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"slow"}"#,
+    );
+    assert_eq!(
+        answer,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"done\"}
+"
+    );
+    // Idle once answered: closed after the idle timeout.
+    let started = Instant::now();
+    let mut rest = String::new();
+    assert!(matches!(reader.read_line(&mut rest), Ok(0)), "{rest}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
 fn test_idle_and_unfinished_connections_are_closed() {
     let (listener, addr) = listener();
     let server = Server::new(Framing::Newline)
