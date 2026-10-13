@@ -596,6 +596,33 @@ impl<S, K: Sink> Endpoint<S, K> {
         }
     }
 
+    /// Bytes read from the stream and kept in the endpoint's decoder: after
+    /// [`next_read`](Endpoint::next_read) has returned `Next::Read`, the
+    /// start of a message that has not fully arrived (0 between messages).
+    /// A server reading with deadlines uses it to tell an idle connection
+    /// from one in the middle of a message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Framing, Next, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// let partial = b"{\"jsonrpc\":";
+    /// if let Next::Read(buf) = endpoint.next_read(Framing::Newline)? {
+    ///     buf[..partial.len()].copy_from_slice(partial);
+    /// }
+    /// endpoint.commit(partial.len());
+    /// let _next = endpoint.next_read(Framing::Newline)?;
+    /// assert_eq!(endpoint.buffered_input(), partial.len());
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn buffered_input(&self) -> usize {
+        self.input.as_ref().map_or(0, Decoder::buffered)
+    }
+
     /// Ends the input: handles what is left buffered (a last line without
     /// its `\n`), then closes the endpoint, unless a handler stops it first.
     ///
