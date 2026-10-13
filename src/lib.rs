@@ -110,6 +110,8 @@ mod handles;
 #[cfg(feature = "std")]
 mod link;
 #[cfg(feature = "std")]
+mod queue;
+#[cfg(feature = "std")]
 mod router;
 #[cfg(feature = "std")]
 mod sink;
@@ -138,6 +140,9 @@ pub use error::{CallError, Error};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use handles::{Call, CancelToken, Canceller, Peer, Responder};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use queue::{Outbox, OutboxSink, QueueLimits, Queued, outbox};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use router::{Context, Event, Params, Router};

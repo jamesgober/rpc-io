@@ -11,13 +11,21 @@ use crate::framing::Framing;
 /// or a batch, compact JSON, no framing); the sink frames and transmits it.
 /// [`flush`](Sink::flush) is called after each incoming message has been
 /// handled, and after each message sent from another thread, so a sink may
-/// buffer within a turn and write once.
+/// buffer within a turn and write once. [`close`](Sink::close) is called once,
+/// when the endpoint closes.
 ///
 /// The endpoint calls the sink with its internal lock held, from whichever
-/// thread sends: a sink must not call back into the endpoint or its handles.
+/// thread sends: a sink must not call back into the endpoint or its handles,
+/// and a sink that blocks (a write to a peer that is not reading) blocks
+/// every sender for as long. [`Queued`](crate::Queued) and
+/// [`outbox`](crate::outbox) never block: they queue, within limits, and
+/// write from elsewhere.
 ///
-/// Implemented for [`Framed`] (a byte stream) and `mpsc::Sender<String>`
-/// (one `String` per message, for message-oriented transports and tests).
+/// Implemented for [`Framed`] (a byte stream, written by the sender),
+/// [`Queued`](crate::Queued) (a byte stream, written by its own thread),
+/// [`OutboxSink`](crate::OutboxSink) (written by an async task), and
+/// `mpsc::Sender<String>` (one `String` per message, for message-oriented
+/// transports and tests).
 ///
 /// # Examples
 ///
@@ -53,6 +61,18 @@ pub trait Sink: Send + 'static {
     /// Any I/O error, with the same effect as from [`send`](Sink::send).
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Ends the output: transmits anything buffered and releases what the
+    /// sink holds. Called once, when the endpoint closes; nothing is sent
+    /// after it. The default flushes.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error. The endpoint is closing either way; the error is
+    /// reported like one from [`send`](Sink::send).
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()
     }
 }
 

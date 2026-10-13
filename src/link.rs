@@ -21,7 +21,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io, mem,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -73,16 +76,21 @@ pub(crate) struct Issued {
 pub(crate) struct Shared<K> {
     inner: Mutex<Inner<K>>,
     timer: Arc<Timer>,
+    /// `Inner::closed`, readable without the lock.
+    closed: Arc<AtomicBool>,
 }
 
 impl<K: Sink> Shared<K> {
     pub(crate) fn new(sink: K, config: &Config) -> Arc<Self> {
         let timer = Arc::new(Timer::default());
+        let closed = Arc::new(AtomicBool::new(false));
         Arc::new_cyclic(|me| Self {
             timer: Arc::clone(&timer),
+            closed: Arc::clone(&closed),
             inner: Mutex::new(Inner {
                 me: Weak::clone(me),
                 timer,
+                closed_flag: closed,
                 sink,
                 closed: false,
                 broken: None,
@@ -110,6 +118,12 @@ impl<K: Sink> Shared<K> {
     /// [`Sink`]; the state is still usable, so the poison is ignored.
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner<K>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the connection is closed, without taking the lock: a sender
+    /// stuck in a slow sink does not hold this up.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -154,7 +168,7 @@ impl<K: Sink> Link for Shared<K> {
     }
 
     fn is_closed(&self) -> bool {
-        self.lock().closed
+        Shared::is_closed(self)
     }
 }
 
@@ -332,6 +346,8 @@ pub(crate) struct Inner<K> {
     /// The state this sits in, for the timer thread.
     me: Weak<Shared<K>>,
     timer: Arc<Timer>,
+    /// Mirrors `closed` for `Shared::is_closed`.
+    closed_flag: Arc<AtomicBool>,
     sink: K,
     closed: bool,
     /// The first failure of the sink, for the endpoint's thread to report.
@@ -442,12 +458,13 @@ impl<K: Sink> Inner<K> {
         self.broken.take()
     }
 
-    /// Closes the connection: flushes, then tells every waiter it is over.
+    /// Closes the connection: closes the sink (flushing it), then tells
+    /// every waiter it is over.
     pub(crate) fn close(&mut self) {
         if self.closed {
             return;
         }
-        if let Err(error) = guard(|| self.sink.flush()) {
+        if let Err(error) = guard(|| self.sink.close()) {
             let _closed = self.fail(error);
         }
         self.shut();
@@ -456,6 +473,7 @@ impl<K: Sink> Inner<K> {
     /// Marks the connection closed and releases everything waiting on it.
     fn shut(&mut self) {
         self.closed = true;
+        self.closed_flag.store(true, Ordering::Release);
         self.timer.stop();
         for (_, waiter) in self.pending.drain() {
             waiter.send(Err(CallError::Closed));

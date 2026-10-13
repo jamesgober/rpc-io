@@ -28,9 +28,10 @@ use crate::{
     message::{
         Entry, Incoming, Invalid, Message, Notification, Request, Response, decode, read_member_id,
     },
+    queue::Queued,
     raw::{Json, Raw},
     router::{Context, Event, EventFn, Params, RequestHandler, Router},
-    sink::{Framed, Sink},
+    sink::Sink,
 };
 
 /// Whether to keep going after a message.
@@ -271,7 +272,7 @@ impl<S, K: Sink> Endpoint<S, K> {
     }
 
     /// Runs `f` on the sink, under the endpoint's lock: to inspect what a
-    /// [`Framed`] over a `Vec` has written, for example. `f` must not use the
+    /// [`Framed`](crate::Framed) over a `Vec` has written, for example. `f` must not use the
     /// endpoint or its handles.
     ///
     /// # Examples
@@ -302,14 +303,14 @@ impl<S, K: Sink> Endpoint<S, K> {
     /// ```
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.shared.lock().is_closed()
+        self.shared.is_closed()
     }
 
-    /// Closes the connection: flushes the sink, ends every outstanding
-    /// [`Call`](crate::Call) with [`CallError::Closed`], and sets the
-    /// [`CancelToken`](crate::CancelToken) of every deferred request still
-    /// being answered. Every later send fails with [`Error::Closed`].
-    /// Idempotent.
+    /// Closes the connection: closes the sink (which writes what it holds;
+    /// see [`Sink::close`]), ends every outstanding [`Call`](crate::Call) with
+    /// [`CallError::Closed`], and sets the [`CancelToken`](crate::CancelToken)
+    /// of every deferred request still being answered. Every later send fails
+    /// with [`Error::Closed`]. Idempotent.
     ///
     /// # Examples
     ///
@@ -975,9 +976,16 @@ impl<S, K: Sink> fmt::Debug for Endpoint<S, K> {
 /// calls [`Context::stop`] ([`End::Stopped`]). Uses the default [`Config`];
 /// for state, settings, or sending to the peer, build an [`Endpoint`].
 ///
+/// Output goes through a [`Queued`](crate::Queued) sink under the default
+/// [`QueueLimits`](crate::QueueLimits): a writer thread does the writes, so a
+/// peer that stops reading stalls no handler or worker, and closes the
+/// connection once the queue's limits are reached. Before returning, `serve`
+/// waits for what is queued to be written (as long as the writes make
+/// progress).
+///
 /// # Errors
 ///
-/// As [`Endpoint::run`].
+/// As [`Endpoint::run`]; [`Error::Io`] if the writer thread cannot start.
 ///
 /// # Examples
 ///
@@ -1004,7 +1012,8 @@ where
     R: Read,
     W: Write + Send + 'static,
 {
-    Endpoint::new(Framed::new(output, framing), router, ()).run(input, framing)
+    let sink = Queued::new(output, framing)?;
+    Endpoint::new(sink, router, ()).run(input, framing)
 }
 
 /// What [`Endpoint::admit`] decided about a request.
