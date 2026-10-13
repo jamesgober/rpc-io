@@ -1,0 +1,193 @@
+//! The serving helpers: `Server` over TCP (and Unix domain sockets on Unix),
+//! with bounded connections and a stopper.
+#![cfg(feature = "net")]
+
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use rpc_io::{Framing, Router, Server};
+
+fn listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) => panic!("{error}"),
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => panic!("{error}"),
+    };
+    (listener, addr)
+}
+
+fn ask(client: &mut TcpStream, reader: &mut BufReader<TcpStream>, body: &str) -> String {
+    assert!(client.write_all(body.as_bytes()).is_ok());
+    assert!(client.write_all(b"\n").is_ok());
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).is_ok());
+    line
+}
+
+fn connect(addr: std::net::SocketAddr) -> (TcpStream, BufReader<TcpStream>) {
+    let client = match TcpStream::connect(addr) {
+        Ok(client) => client,
+        Err(error) => panic!("{error}"),
+    };
+    let _timeout = client.set_read_timeout(Some(Duration::from_secs(10)));
+    let reader = match client.try_clone() {
+        Ok(reader) => BufReader::new(reader),
+        Err(error) => panic!("{error}"),
+    };
+    (client, reader)
+}
+
+#[test]
+fn test_tcp_server_serves_connections_with_their_own_state_and_stops() {
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline);
+    let stopper = server.stopper();
+    let (seen, connections) = mpsc::channel();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, move |connection| {
+            let _sent = seen.send(connection.clone());
+            let router = Router::new().request("whoami", |me: &mut u64, _, _| Ok(*me));
+            (router, connection.id)
+        })
+    });
+    let mut clients: Vec<_> = (0..3).map(|_| connect(addr)).collect();
+    let mut answers = Vec::new();
+    for (client, reader) in &mut clients {
+        answers.push(ask(
+            client,
+            reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"whoami"}"#,
+        ));
+    }
+    answers.sort();
+    assert_eq!(
+        answers,
+        [
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":0}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":1}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":2}\n",
+        ]
+    );
+    let first = connections.recv_timeout(Duration::from_secs(5));
+    assert!(first.is_ok_and(|c| c.id == 0 && c.addr.starts_with("127.0.0.1:")));
+    let started = Instant::now();
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stopping took {:?}",
+        started.elapsed()
+    );
+    // Every client sees its stream end.
+    for (_client, reader) in &mut clients {
+        let mut rest = String::new();
+        assert!(matches!(reader.read_line(&mut rest), Ok(0)), "{rest}");
+    }
+    assert!(stopper.is_stopped());
+}
+
+#[test]
+fn test_tcp_server_bounds_its_connections() {
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline).with_max_connections(1);
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    let (mut a, mut a_reader) = connect(addr);
+    assert!(
+        ask(
+            &mut a,
+            &mut a_reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        )
+        .contains("pong")
+    );
+    // The second connection waits in the backlog: no answer while `a` is open.
+    let (mut b, b_reader) = connect(addr);
+    assert!(
+        b.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+            .is_ok()
+    );
+    let (answered, answer) = mpsc::channel();
+    let waiting = thread::spawn(move || {
+        let mut reader = b_reader;
+        let mut line = String::new();
+        let _read = reader.read_line(&mut line);
+        let _sent = answered.send(line);
+    });
+    assert!(answer.recv_timeout(Duration::from_millis(300)).is_err());
+    drop((a, a_reader));
+    let line = answer.recv_timeout(Duration::from_secs(10));
+    assert!(line.is_ok_and(|l| l.contains("pong")));
+    assert!(waiting.join().is_ok());
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
+fn test_server_stopped_before_it_serves_returns_at_once() {
+    let (listener, _addr) = listener();
+    let server = Server::new(Framing::ContentLength);
+    server.stopper().stop();
+    let started = Instant::now();
+    assert!(
+        server
+            .serve_tcp(listener, |_| (Router::<()>::new(), ()))
+            .is_ok()
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(server.connections(), 0);
+    assert!(format!("{server:?} {:?}", server.stopper()).contains("max_connections: 256"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_unix_server_serves_and_stops() {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let path = std::env::temp_dir().join(format!("rpc-io-test-{}.sock", std::process::id()));
+    let _stale = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => panic!("{error}"),
+    };
+    let server = Server::new(Framing::Newline);
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_unix(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    let mut client = match UnixStream::connect(&path) {
+        Ok(client) => client,
+        Err(error) => panic!("{error}"),
+    };
+    assert!(
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .is_ok()
+    );
+    let mut line = String::new();
+    let reader = client.try_clone().map(BufReader::new);
+    assert!(reader.is_ok_and(|mut r| r.read_line(&mut line).is_ok()));
+    assert_eq!(line, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n");
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+    let _removed = std::fs::remove_file(&path);
+}

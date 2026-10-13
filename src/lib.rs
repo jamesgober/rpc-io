@@ -117,6 +117,8 @@ mod progress;
 mod queue;
 #[cfg(feature = "std")]
 mod router;
+#[cfg(feature = "net")]
+mod server;
 #[cfg(feature = "std")]
 mod sink;
 #[cfg(feature = "std")]
@@ -159,6 +161,9 @@ pub use queue::{Outbox, OutboxSink, QueueLimits, Queued, outbox};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use router::{Context, Event, Params, Router};
+#[cfg(feature = "net")]
+#[cfg_attr(docsrs, doc(cfg(feature = "net")))]
+pub use server::{Connection, Server, Stopper};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use sink::{Framed, Sink};
