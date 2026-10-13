@@ -693,6 +693,17 @@ pub fn outbox(framing: Framing, limits: QueueLimits) -> (OutboxSink, Outbox) {
 }
 
 /// The sending half of an [`outbox`]: a [`Sink`] for an endpoint.
+///
+/// # Examples
+///
+/// ```
+/// use rpc_io::{Framing, QueueLimits, Sink};
+///
+/// let (mut sink, outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new());
+/// sink.send("{}")?;
+/// assert_eq!(outbox.pending_bytes(), 3); // framed, waiting for the task
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct OutboxSink {
     core: Arc<Core>,
 }
@@ -751,6 +762,30 @@ impl fmt::Debug for OutboxSink {
 /// how many with [`consume`](Outbox::consume), the way a buffered reader is
 /// drained. An empty chunk means the end: the endpoint closed and everything
 /// was yielded (or the queue failed).
+///
+/// # Examples
+///
+/// ```
+/// use std::task::{Context, Poll, Waker};
+/// use rpc_io::{Endpoint, Framing, QueueLimits, Router};
+///
+/// let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new());
+/// let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+/// endpoint.peer().notify("bye", ())?;
+/// endpoint.close();
+/// let mut cx = Context::from_waker(Waker::noop());
+/// let mut written = Vec::new();
+/// while let Poll::Ready(chunk) = outbox.poll_chunk(&mut cx) {
+///     if chunk.is_empty() {
+///         break; // closed and drained
+///     }
+///     written.extend_from_slice(chunk);
+///     let n = chunk.len();
+///     outbox.consume(n);
+/// }
+/// assert_eq!(written, b"{\"jsonrpc\":\"2.0\",\"method\":\"bye\"}\n");
+/// # Ok::<(), rpc_io::Error>(())
+/// ```
 pub struct Outbox {
     core: Arc<Core>,
     /// The batch being written, and how much of it is.

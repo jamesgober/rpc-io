@@ -1,6 +1,6 @@
 # rpc-io &mdash; API Reference
 
-> Complete reference for every public item in `rpc-io`, with examples.
+> Complete reference for every public item in `rpc-io`; each section has an example.
 > **Status: pre-1.0 (0.3.0).** The surface is refined across the 0.x series and
 > frozen at `1.0.0`, after lsp-lang and mcp-io have run on it (LexerSketch
 > decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
@@ -326,6 +326,21 @@ assert_eq!(end, End::Eof);
 ## `Flow`, `End`, and `Next`
 
 `Flow` (`Continue`, `Stop`) is what `handle` returns: `Stop` after a handler called `Context::stop`. `End` (`#[non_exhaustive]`: `Eof`, `Stopped`) is why `run` returned without an error: the input ended (the endpoint is closed), or a handler stopped it (the endpoint is still open, and keeps what it read ahead). `Next` (`Read(&mut [u8])`, `Stopped`) is what `next_read` needs.
+
+```rust
+use rpc_io::{End, Endpoint, Flow, Framing, Next, Router};
+
+let router = Router::new().notification("pause", |_: &mut (), _, cx| cx.stop());
+let (tx, _rx) = std::sync::mpsc::channel::<String>();
+let mut endpoint = Endpoint::new(tx, router, ());
+assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"pause"}"#)?, Flow::Stop);
+let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}\n";
+assert_eq!(endpoint.run(input, Framing::Newline)?, End::Stopped); // still open
+assert!(matches!(endpoint.next_read(Framing::Newline)?, Next::Read(_)));
+assert_eq!(endpoint.finish()?, End::Eof); // now closed
+assert!(endpoint.is_closed());
+# Ok::<(), rpc_io::Error>(())
+```
 
 ## `Router`
 
@@ -973,9 +988,28 @@ assert_eq!(r.params.as_ref().map(|p| p.as_str()), Some("[2, 3]"));
 
 `Entry<'a> = Result<Message<'a>, Invalid<'a>>`. `Incoming` is `Single(Entry)` or `Batch(Vec<Entry>)` (never empty).
 
+```rust
+use rpc_io::{decode, Incoming, Limits};
+
+let Incoming::Batch(entries) = decode(br#"[{"jsonrpc":"2.0","method":"a"}, 7]"#, &Limits::new()) else { panic!() };
+assert!(entries[0].is_ok());
+assert!(entries[1].as_ref().is_err_and(|invalid| invalid.reply().is_some())); // answered with -32600
+```
+
 ## `Message`
 
 `Request(Request)`, `Notification(Notification)`, `Response(Response)`. Methods: `id()`, `method()`, `write(&self, out: &mut String)` (compact JSON), `into_owned()`; `Display` writes the JSON.
+
+```rust
+use rpc_io::{decode, Incoming, Limits, Message};
+
+let body = br#"{"jsonrpc":"2.0","id":7,"method":"hover"}"#;
+let Incoming::Single(Ok(message)) = decode(body, &Limits::new()) else { panic!() };
+assert_eq!(message.method(), Some("hover"));
+assert_eq!(message.id().and_then(|id| id.as_i64()), Some(7));
+let owned: Message<'static> = message.into_owned();
+assert_eq!(owned.to_string(), r#"{"jsonrpc":"2.0","id":7,"method":"hover"}"#);
+```
 
 ## `Request`, `Notification`, `Response`
 
@@ -1008,6 +1042,15 @@ assert_eq!((invalid.id().and_then(|i| i.as_i64()), invalid.error().code()), (Som
 ## `write_batch`
 
 `write_batch(out: &mut String, messages: &[Message])` appends a JSON array of the messages (`[]` for none, which JSON-RPC forbids sending).
+
+```rust
+use rpc_io::{write_batch, Message, Notification};
+
+let ping = Message::Notification(Notification { method: "ping".into(), params: None });
+let mut out = String::new();
+write_batch(&mut out, &[ping.clone(), ping]);
+assert_eq!(out, r#"[{"jsonrpc":"2.0","method":"ping"},{"jsonrpc":"2.0","method":"ping"}]"#);
+```
 
 ## `Id`
 
@@ -1046,6 +1089,15 @@ assert_eq!(Json::from(()).to_string(), "null");
 
 `ErrorCode(pub i64)` with the constants in [Error codes](#error-codes); `name()` for those, `is_reserved()` for `-32768..=-32000`; `Display` as `"-32601 (method not found)"`. With `serde`, `Serialize` and `Deserialize` as the integer.
 
+```rust
+use rpc_io::ErrorCode;
+
+assert_eq!(ErrorCode::METHOD_NOT_FOUND.to_string(), "-32601 (method not found)");
+assert_eq!(ErrorCode(-32601), ErrorCode::METHOD_NOT_FOUND);
+assert_eq!(ErrorCode(1001).name(), None);
+assert!(ErrorCode::SERVER_OVERLOADED.is_reserved() && !ErrorCode(1).is_reserved());
+```
+
 ## `ErrorObject`
 
 The `error` member: `new(code, message)`, `with_data(impl Into<Json>)`, `parse_error`, `invalid_request`, `method_not_found(method)` (clipped to 128 bytes), `invalid_params`, `internal_error`, `code()`, `message()`, `data()`. `From<jsonx_lib::Error>` gives `INVALID_PARAMS`; `From<Error>` gives `INTERNAL_ERROR` (for `Error::Io`, only "the transport failed": the operating system's text stays on this side). A peer's error message is clipped to 4 KiB.
@@ -1078,9 +1130,30 @@ assert_eq!(pending.pop_expired(Duration::from_secs(5)), Some((b, "second")));
 
 `#[non_exhaustive]`: `Io(io::Error)` (the transport failed; closed), `Frame(FrameError)` (the input lost its framing; closed), `Closed`, `InvalidParams(Kind)` (outgoing params not an array, object, or null; nothing sent), `AlreadyAnswered` (a deferred request was answered or cancelled first; nothing sent), `Backlog` (the gate is shut and `max_held_bytes` is spent; nothing sent, the connection stays open), `Serialize(String)` (a value is not JSON: a non-finite progress number, or a typed send with `serde`; nothing sent). Implements `std::error::Error`.
 
+```rust
+use rpc_io::{Endpoint, Error, Router};
+
+let (tx, _rx) = std::sync::mpsc::channel::<String>();
+let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+assert!(matches!(endpoint.peer().notify("x", 1), Err(Error::InvalidParams(_)))); // params must be structured
+endpoint.close();
+assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Closed)));
+```
+
 ## `CallError`
 
-`#[non_exhaustive]`, why one of our requests produced no result: `Rejected(ErrorObject)` (the peer's error), `InvalidResponse(ErrorObject)` (a broken answer, or one that does not fit `wait_typed`'s type), `TimedOut`, `Cancelled`, `Evicted` (over `max_pending`), `Closed`, `WouldDeadlock` (waited on the endpoint's own thread).
+`#[non_exhaustive]`, why one of our requests produced no result: `Rejected(ErrorObject)` (the peer's error), `InvalidResponse(ErrorObject)` (a broken answer, or one that does not fit `wait_typed`'s type), `TimedOut`, `Cancelled`, `Evicted` (over `max_pending`), `Closed`, `WouldDeadlock` (waited on the endpoint's own thread; the call, consumed by `wait`, is cancelled).
+
+```rust
+use rpc_io::{CallError, Endpoint, Router};
+
+let (tx, _rx) = std::sync::mpsc::channel::<String>();
+let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+let call = endpoint.peer().request("x", ())?;
+endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"no"}}"#)?;
+assert!(matches!(call.wait(), Err(CallError::Rejected(e)) if e.message() == "no"));
+# Ok::<(), rpc_io::Error>(())
+```
 
 ## Feature flags
 
