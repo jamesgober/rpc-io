@@ -123,6 +123,8 @@ mod slot;
 mod stats;
 #[cfg(feature = "std")]
 mod trace;
+#[cfg(feature = "serde")]
+mod typed;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};

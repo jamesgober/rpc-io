@@ -21,7 +21,10 @@ pub(crate) type RequestFn<S> = Box<
 >;
 pub(crate) type DeferredFn<S> =
     Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>, Responder) + Send>;
-pub(crate) type NotificationFn<S> = Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>) + Send>;
+/// A notification handler; `Err` when it could not read its params (a typed
+/// handler), which is reported, not answered.
+pub(crate) type NotificationFn<S> =
+    Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<(), ErrorObject> + Send>;
 pub(crate) type EventFn<S> = Box<dyn FnMut(&mut S, &Event<'_>) + Send>;
 
 /// How a request method is answered.
@@ -179,9 +182,20 @@ impl<S> Router<S> {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     #[must_use]
-    pub fn notification<F>(mut self, method: &str, handler: F) -> Self
+    pub fn notification<F>(self, method: &str, mut handler: F) -> Self
     where
         F: FnMut(&mut S, Params<'_>, &mut Context<'_>) + Send + 'static,
+    {
+        self.notification_with(method, move |state, params, cx| {
+            handler(state, params, cx);
+            Ok(())
+        })
+    }
+
+    /// Registers a notification handler that may refuse its params.
+    pub(crate) fn notification_with<F>(mut self, method: &str, handler: F) -> Self
+    where
+        F: FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<(), ErrorObject> + Send + 'static,
     {
         let _replaced = self.notifications.insert(method.into(), Box::new(handler));
         self
@@ -659,5 +673,14 @@ pub enum Event<'a> {
     Cancelled {
         /// The cancelled request's id.
         id: &'a Id<'a>,
+    },
+    /// A notification's params did not fit what its handler takes (a
+    /// [typed](Router::notification_typed) handler, with the `serde`
+    /// feature); the handler was not called.
+    InvalidParams {
+        /// The method.
+        method: &'a str,
+        /// What did not fit, as an `INVALID_PARAMS` error.
+        error: &'a ErrorObject,
     },
 }

@@ -55,6 +55,10 @@ tracing = ["std", "dep:tracing"]
 # The async adapter over `futures-io`'s traits: `Endpoint::run_async`, and
 # `Outbox` as an `AsyncRead`/`AsyncBufRead` with `write_to`.
 futures-io = ["std", "dep:futures-io"]
+# Typed params and results through `serde`: `Params::deserialize`,
+# `Router::request_typed`, `Peer::request_typed`, `Call::wait_typed`, and
+# `Serialize`/`Deserialize` for `Id` and `ErrorCode`.
+serde = ["std", "dep:serde", "dep:serde_json"]
 
 
 # DEPENDENCIES
@@ -70,6 +74,12 @@ tracing = { version = "0.1.41", optional = true, default-features = false, featu
 # runtime-agnostic I/O traits (no dependencies of its own, no runtime), which
 # smol and async-std implement and tokio reaches through `tokio-util` compat.
 futures-io = { version = "0.3.31", optional = true, default-features = false, features = ["std"] }
+# Optional, off by default: the `serde` feature, for interop with protocol
+# type crates (`lsp-types`, MCP schemas) written against serde. `serde_json`
+# reads values from the text the endpoint has already validated within its
+# JSON budgets, and writes results; jsonx-lib has no serde support of its own.
+serde = { version = "1.0.200", optional = true, default-features = false, features = ["std"] }
+serde_json = { version = "1.0.120", optional = true, default-features = false, features = ["std"] }
 
 
 # DEV DEPENDENCIES
@@ -77,6 +87,8 @@ futures-io = { version = "0.3.31", optional = true, default-features = false, fe
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+# `#[derive(Serialize, Deserialize)]` in the `serde` feature's tests and docs.
+serde     = { version = "1.0.200", features = ["derive"] }
 
 
 # BENCHMARKS

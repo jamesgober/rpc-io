@@ -42,6 +42,10 @@ pub enum Error {
     /// already reach [`Config::max_held_bytes`](crate::Config). This one was
     /// not sent or held; the connection is still open.
     Backlog,
+    /// A value could not be written as JSON (the `serde` feature's typed
+    /// sends: a map whose keys are not strings, or a `Serialize` that
+    /// failed); this says why. Nothing was sent.
+    Serialize(String),
 }
 
 impl fmt::Display for Error {
@@ -63,6 +67,7 @@ impl fmt::Display for Error {
             Error::Backlog => f.write_str(
                 "too much is already held until the opening request succeeds; nothing was sent",
             ),
+            Error::Serialize(why) => write!(f, "the value is not JSON: {why}"),
         }
     }
 }

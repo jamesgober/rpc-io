@@ -922,16 +922,27 @@ impl<S, K: Sink> Endpoint<S, K> {
         let params = Params::new(params, self.parser);
         let state = &mut self.state;
         let mut cx = Context::new(&self.link, stop, None, &method);
-        if let Err(payload) = contain(|| handler(state, params, &mut cx)) {
-            self.shared.lock().count_panic();
-            report(
+        match contain(|| handler(state, params, &mut cx)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => report(
                 &mut self.router.on_event,
                 &mut self.state,
-                &Event::Panicked {
+                &Event::InvalidParams {
                     method: &method,
-                    message: &panic_message(payload.as_ref()),
+                    error: &error,
                 },
-            );
+            ),
+            Err(payload) => {
+                self.shared.lock().count_panic();
+                report(
+                    &mut self.router.on_event,
+                    &mut self.state,
+                    &Event::Panicked {
+                        method: &method,
+                        message: &panic_message(payload.as_ref()),
+                    },
+                );
+            }
         }
     }
 
@@ -1118,6 +1129,9 @@ fn trace_event(event: &Event<'_>) {
         }
         Event::Cancelled { id } => {
             event!(debug, id = %id, "the peer cancelled a request");
+        }
+        Event::InvalidParams { method, error } => {
+            event!(debug, method = %method, message = %error.message(), "a notification's params did not fit its handler");
         }
     }
 }
