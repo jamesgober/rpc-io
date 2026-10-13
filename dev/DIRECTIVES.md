@@ -7,13 +7,13 @@
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is an `-io` pipeline in the owner's net-collection, shared by LexerSketch's LSP, DAP, MCP and API servers.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is an `-io` pipeline in the owner's net-collection: the JSON-RPC transport of LexerSketch's LSP, MCP and API servers. DAP is not JSON-RPC; it shares only the Content-Length framing.
 
 ---
 
 ## 1. What this is
 
-rpc-io owns message framing, the JSON-RPC envelope, id correlation, and cancellation plumbing. Method semantics belong to the protocol crates on top (lsp-lang, dap-lang, mcp-io).
+rpc-io owns message framing, the JSON-RPC envelope, id correlation, and cancellation plumbing. Method semantics belong to the protocol crates on top (lsp-lang, mcp-io); dap-lang uses the framing alone.
 
 Four LexerSketch servers would otherwise each reimplement the same transport; lsp-lang's hard-won robustness fixes (M74/M75) belong in one shared place.
 
@@ -21,7 +21,7 @@ Four LexerSketch servers would otherwise each reimplement the same transport; ls
 
 ## 2. Engineering law (non-negotiable)
 
-- **Ours, not rented.** No third-party runtime dependency. First-party `-lang` crates only, wired when first used. Dev-only test tooling is allowed.
+- **Ours, not rented.** No third-party runtime dependency in the default build. First-party `-lang` crates only, wired when first used. Dev-only test tooling is allowed. Integrations with the ecosystem (`serde`/`serde_json`, `futures-io`, `tracing`) are optional features, off by default (owner's decision, 2026-10 upgrade cycle).
 - **Performance.** Peak is the baseline: allocation-free hot paths where feasible, dense ids instead of maps, no "faster" claim without `criterion` numbers at realistic scale (100k+ items).
 - **Correctness.** Every invariant in section 4 is covered by property tests, cross-checked against a simple reference implementation wherever one can be written.
 - **Hostile-input hardening.** Any input this crate accepts may be adversarial: explicit budgets (depth, size, steps), iterative algorithms, no quadratic paths, no reachable panics.
@@ -51,3 +51,14 @@ Four LexerSketch servers would otherwise each reimplement the same transport; ls
 - Framing is robust to hostile input: bounded header and body sizes, overflow-checked lengths, precise errors, never a panic.
 - Every request gets exactly one response; malformed envelopes with a valid id are answered with that id.
 - Handler panics are contained and answered with INTERNAL_ERROR; the session survives.
+- A peer that stops reading costs bounded memory and time, and stalls no other thread (`Queued`, `outbox`).
+
+---
+
+## 5. Recorded waivers and decisions
+
+- **`thiserror`** (REPS Error Handling): waived. The error types are hand-written, `#[non_exhaustive]`, and documented per variant; a proc-macro dependency for four `Display` impls would break "ours, not rented".
+- **`#![deny(warnings)]` in source** (audit RPC-CQ-01 suggests CI-only): kept, as REPS requires it. To explore stricter lint groups without it failing the build, pass `--cap-lints warn` to the crate: `cargo clippy -- --cap-lints warn -W clippy::pedantic`.
+- **`clippy::undocumented_unsafe_functions`** (REPS crate-root list): not a lint clippy knows (it would trip `unknown_lints` under `deny(warnings)`); `clippy::missing_safety_doc` and `clippy::undocumented_unsafe_blocks` cover it, and `forbid(unsafe_code)` makes all three moot.
+- **loom** (REPS Testing, "where feasible"): see ROADMAP v0.3.0, deferred to v0.9.0 with the reason.
+- **Fixed clip lengths** (128 bytes for peer text quoted in our errors, 4 KiB for a peer's error message): security caps on peer-controlled text, not tuning knobs, so not configurable. The read chunk and the flush threshold are (`Decoder::with_read_chunk`, `Framed::with_flush_threshold`).
