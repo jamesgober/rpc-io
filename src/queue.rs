@@ -78,6 +78,7 @@ pub struct QueueLimits {
     pub write_timeout: Option<Duration>,
     /// The longest closing waits for what is queued to be written, after
     /// which the writer is left to finish (or fail) on its own.
+    /// `Duration::MAX` waits for as long as the writes make progress.
     pub close_timeout: Duration,
 }
 
@@ -275,11 +276,13 @@ impl Core {
     /// no longer once it has made no progress for `write_timeout`; `false`
     /// if it gave up.
     fn wait_drained(&self) -> bool {
+        // A timeout too large to add to the clock (`Duration::MAX`) is no
+        // deadline at all.
         let deadline = Instant::now().checked_add(self.limits.close_timeout);
         let mut state = self.lock();
         while !state.finished {
             let now = Instant::now();
-            let late = deadline.is_none_or(|at| now >= at);
+            let late = deadline.is_some_and(|at| now >= at);
             if late || state.stalled(&self.limits).is_some() {
                 return false;
             }

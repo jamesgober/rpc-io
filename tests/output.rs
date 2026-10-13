@@ -281,6 +281,34 @@ fn test_outbox_task_is_woken_by_a_message_and_by_the_close() {
 }
 
 #[test]
+fn test_an_unbounded_close_timeout_drains_everything() {
+    // Found by the verifier (RPC3-003): `Duration::MAX` overflowed the
+    // deadline, which was then read as already passed, and closing waited
+    // for nothing.
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::MAX);
+    let (sink, release, written) = stalled(limits);
+    let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    for _ in 0..3 {
+        assert!(endpoint.peer().notify("queued", ()).is_ok());
+    }
+    let (closing, closed) = mpsc::channel();
+    let closer = thread::spawn(move || {
+        endpoint.close();
+        let _sent = closing.send(());
+    });
+    // Still waiting while the writer is stuck.
+    assert!(closed.recv_timeout(Duration::from_millis(300)).is_err());
+    for _ in 0..10 {
+        let _go = release.send(());
+    }
+    assert!(closed.recv_timeout(Duration::from_secs(30)).is_ok());
+    assert!(closer.join().is_ok());
+    assert_eq!(written.text().lines().count(), 3, "{}", written.text());
+}
+
+#[test]
 fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
     // Found by the verifier (RPC2-001): closing drained the queue under the
     // endpoint's lock, so a worker answering during the close waited for the
