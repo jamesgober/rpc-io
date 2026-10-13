@@ -43,8 +43,9 @@
 //! ## Layers
 //!
 //! - **Framing** ([`Framing`], [`Decoder`]): cuts message bodies out of a
-//!   byte stream and frames them back. The decoder is sans-IO and holds at
-//!   most one message plus a read chunk, whatever the peer sends.
+//!   byte stream and frames them back. The decoder is sans-IO, holds at most
+//!   one message plus a read chunk whatever the peer sends, and gives memory
+//!   back after a large message.
 //! - **Messages** ([`decode`], [`Message`], [`Incoming`], [`Invalid`]):
 //!   one pass of `jsonx_lib`'s pull reader per body; `params` and `result`
 //!   stay borrowed slices ([`Raw`]) until a handler parses them.
@@ -52,13 +53,22 @@
 //!   deadlines and a capacity, every operation `O(log n)`.
 //! - **Endpoint** (`Endpoint`, `Router`, `Peer`, `Call`, `Responder`): the
 //!   dispatcher, both directions, with cancellation (`Cancellation`,
-//!   `CancelToken`) and an opening-request `Gate`. Needs `std`.
+//!   `CancelToken`), an opening-request `Gate`, self-firing deadlines, an
+//!   interceptor, and `Stats`. `run` reads a blocking stream; `next_read`,
+//!   `commit`, and `finish` take it apart for any other kind; `run_async`
+//!   reads an async one (`futures-io`). `Call` is a `Future`. Needs `std`.
+//! - **Output** (`Sink`, `Framed`, `Queued`, `outbox`): where messages go.
+//!   `Queued` writes from its own thread and `outbox` from an async task,
+//!   behind `QueueLimits`, so a peer that stops reading blocks no sender.
+//!   Needs `std`.
+//! - **Serving** (`serve`, and `Server` with the `net` feature): one call
+//!   over a byte stream, or an accept loop over TCP and Unix sockets.
 //!
 //! ## Policies
 //!
-//! - **Every request gets exactly one response; no notification gets one.**
-//!   A malformed message is answered under its own id when that id could be
-//!   read, and under `null` otherwise, as JSON-RPC 2.0 requires.
+//! - **Every request gets exactly one response; no valid notification gets
+//!   one.** A malformed message is answered under its own id when that id
+//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires.
 //! - **Handler panics are contained.** A request whose handler panics is
 //!   answered with `INTERNAL_ERROR` (the panic message goes to the event
 //!   hook, never to the peer), and the endpoint keeps serving. This needs
@@ -68,9 +78,20 @@
 //!
 //! ## Features
 //!
-//! - `std` (default): the endpoint, its handles, and the blocking adapter.
-//!   Without it the crate is `no_std` (needs `alloc`): framing, the message
-//!   model, and the correlation map.
+//! - `std` (default): the endpoint, its handles, `serve`, the queued and
+//!   async-drained sinks, and the progress helpers. Without it the crate is
+//!   `no_std` (needs `alloc`): framing, the message model, and the
+//!   correlation map.
+//! - `serde`: typed params and results ([`Router::request_typed`],
+//!   `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed`),
+//!   through `serde` and `serde_json`.
+//! - `futures-io`: the async adapter over `futures-io`'s traits
+//!   (`Endpoint::run_async`, `Outbox::write_to`); runtime-agnostic.
+//! - `tracing`: spans for every call and events for what the endpoint does
+//!   on its own; without it the instrumentation compiles to nothing.
+//! - `net`: `Server`, an accept loop over TCP and Unix domain sockets.
+//!
+//! Every optional feature is off by default and adds only what it names.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
