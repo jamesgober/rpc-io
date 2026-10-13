@@ -245,6 +245,16 @@ enum State {
     Discard,
 }
 
+/// What one step of the decoder's state machine found.
+enum Step {
+    /// The state changed; take another step.
+    Again,
+    /// Nothing complete is buffered: more bytes are needed.
+    Wait,
+    /// A complete message body, at this range of the buffer.
+    Frame(Range<usize>),
+}
+
 /// Cuts message bodies out of a byte stream (sans-IO).
 ///
 /// Bytes go in through [`space`](Decoder::space) and
@@ -620,128 +630,158 @@ impl Decoder {
             return Err(error);
         }
         loop {
-            match self.state {
+            let step = match self.state {
                 State::Headers {
                     lines,
                     bytes,
                     length,
-                } => {
-                    let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
-                        self.scan = self.end;
-                        let pending = self.end - self.start;
-                        if bytes.saturating_add(pending) > self.max_header_bytes {
-                            return Err(self.fail(FrameError::HeaderTooLarge {
-                                limit: self.max_header_bytes,
-                            }));
-                        }
-                        return Ok(self.wait());
-                    };
-                    let line_end = self.scan + at + 1;
-                    let line_len = line_end - self.start;
-                    let line = trim_line(&self.buf, self.start..line_end - 1);
-                    if line.is_empty() {
-                        self.start = line_end;
-                        self.scan = line_end;
-                        if lines == 0 {
-                            // Stray blank lines between messages are skipped.
-                            continue;
-                        }
-                        self.end_headers(length)?;
-                        continue;
-                    }
-                    let bytes = bytes.saturating_add(line_len);
-                    if bytes > self.max_header_bytes {
-                        return Err(self.fail(FrameError::HeaderTooLarge {
-                            limit: self.max_header_bytes,
-                        }));
-                    }
-                    let lines = lines + 1;
-                    if lines > self.max_headers {
-                        return Err(self.fail(FrameError::TooManyHeaders {
-                            limit: self.max_headers,
-                        }));
-                    }
-                    let length = match parse_header(&self.buf[line]) {
-                        Header::ContentLength(_) if length.is_some() => {
-                            return Err(self.fail(FrameError::DuplicateContentLength));
-                        }
-                        Header::ContentLength(n) => Some(n),
-                        Header::Other => length,
-                        Header::Invalid(error) => return Err(self.fail(error)),
-                    };
-                    self.start = line_end;
-                    self.scan = line_end;
-                    self.state = State::Headers {
-                        lines,
-                        bytes,
-                        length,
-                    };
-                }
-                State::Body { length } => {
-                    if self.end - self.start < length {
-                        return Ok(self.wait());
-                    }
-                    let body = self.start..self.start + length;
-                    self.start += length;
-                    self.scan = self.start;
-                    self.state = Self::fresh(self.framing);
-                    return Ok(Some(body));
-                }
-                State::Skip { remaining } => {
-                    let available = (self.end - self.start) as u64;
-                    let take = available.min(remaining);
-                    // `take` is at most `available`, a `usize`.
-                    self.start += take as usize;
-                    self.scan = self.start;
-                    if take == remaining {
-                        self.state = Self::fresh(self.framing);
-                        continue;
-                    }
-                    self.state = State::Skip {
-                        remaining: remaining - take,
-                    };
-                    return Ok(self.wait());
-                }
-                State::Line => {
-                    let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
-                        self.scan = self.end;
-                        // The line so far, plus an `\r` that may precede its end.
-                        if self.end - self.start > self.max_message.saturating_add(1) {
-                            self.start = self.end;
-                            self.scan = self.end;
-                            self.state = State::Discard;
-                            return Err(self.line_too_large());
-                        }
-                        return Ok(self.wait());
-                    };
-                    let newline = self.scan + at;
-                    let line = trim_line(&self.buf, self.start..newline);
-                    self.start = newline + 1;
-                    self.scan = self.start;
-                    // Length before blankness, and no length in the error: a
-                    // line that arrives in pieces is judged on its length
-                    // alone (above), so a whole one must be too, or the
-                    // result would depend on how the input was split.
-                    if line.len() > self.max_message {
-                        return Err(self.line_too_large());
-                    }
-                    if is_blank(&self.buf[line.clone()]) {
-                        continue;
-                    }
-                    return Ok(Some(line));
-                }
-                State::Discard => match find_newline(&self.buf[self.scan..self.end]) {
-                    Some(at) => {
-                        self.start = self.scan + at + 1;
-                        self.scan = self.start;
-                        self.state = State::Line;
-                    }
-                    None => {
-                        self.start = self.end;
-                        self.scan = self.end;
-                        return Ok(self.wait());
-                    }
-                },
+                } => self.step_headers(lines, bytes, length)?,
+                State::Body { length } => self.step_body(length),
+                State::Skip { remaining } => self.step_skip(remaining),
+                State::Line => self.step_line()?,
+                State::Discard => self.step_discard(),
+            };
+            match step {
+                Step::Again => {}
+                Step::Wait => return Ok(self.wait()),
+                Step::Frame(range) => return Ok(Some(range)),
+            }
+        }
+    }
+
+    /// One line of a Content-Length header section, or the blank line that
+    /// ends it.
+    fn step_headers(
+        &mut self,
+        lines: usize,
+        bytes: usize,
+        length: Option<u64>,
+    ) -> Result<Step, FrameError> {
+        let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
+            self.scan = self.end;
+            let pending = self.end - self.start;
+            if bytes.saturating_add(pending) > self.max_header_bytes {
+                return Err(self.fail(FrameError::HeaderTooLarge {
+                    limit: self.max_header_bytes,
+                }));
+            }
+            return Ok(Step::Wait);
+        };
+        let line_end = self.scan + at + 1;
+        let line_len = line_end - self.start;
+        let line = trim_line(&self.buf, self.start..line_end - 1);
+        if line.is_empty() {
+            self.start = line_end;
+            self.scan = line_end;
+            // Stray blank lines between messages are skipped; after a header
+            // line, a blank line ends the section.
+            if lines > 0 {
+                self.end_headers(length)?;
+            }
+            return Ok(Step::Again);
+        }
+        let bytes = bytes.saturating_add(line_len);
+        if bytes > self.max_header_bytes {
+            return Err(self.fail(FrameError::HeaderTooLarge {
+                limit: self.max_header_bytes,
+            }));
+        }
+        let lines = lines + 1;
+        if lines > self.max_headers {
+            return Err(self.fail(FrameError::TooManyHeaders {
+                limit: self.max_headers,
+            }));
+        }
+        let length = match parse_header(&self.buf[line]) {
+            Header::ContentLength(_) if length.is_some() => {
+                return Err(self.fail(FrameError::DuplicateContentLength));
+            }
+            Header::ContentLength(n) => Some(n),
+            Header::Other => length,
+            Header::Invalid(error) => return Err(self.fail(error)),
+        };
+        self.start = line_end;
+        self.scan = line_end;
+        self.state = State::Headers {
+            lines,
+            bytes,
+            length,
+        };
+        Ok(Step::Again)
+    }
+
+    /// A Content-Length body, once all of it is buffered.
+    fn step_body(&mut self, length: usize) -> Step {
+        if self.end - self.start < length {
+            return Step::Wait;
+        }
+        let body = self.start..self.start + length;
+        self.start += length;
+        self.scan = self.start;
+        self.state = Self::fresh(self.framing);
+        Step::Frame(body)
+    }
+
+    /// Drops what is buffered of an oversized Content-Length body.
+    fn step_skip(&mut self, remaining: u64) -> Step {
+        let available = (self.end - self.start) as u64;
+        let take = available.min(remaining);
+        // `take` is at most `available`, a `usize`.
+        self.start += take as usize;
+        self.scan = self.start;
+        if take == remaining {
+            self.state = Self::fresh(self.framing);
+            return Step::Again;
+        }
+        self.state = State::Skip {
+            remaining: remaining - take,
+        };
+        Step::Wait
+    }
+
+    /// One newline-delimited line.
+    fn step_line(&mut self) -> Result<Step, FrameError> {
+        let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
+            self.scan = self.end;
+            // The line so far, plus an `\r` that may precede its end.
+            if self.end - self.start > self.max_message.saturating_add(1) {
+                self.start = self.end;
+                self.scan = self.end;
+                self.state = State::Discard;
+                return Err(self.line_too_large());
+            }
+            return Ok(Step::Wait);
+        };
+        let newline = self.scan + at;
+        let line = trim_line(&self.buf, self.start..newline);
+        self.start = newline + 1;
+        self.scan = self.start;
+        // Length before blankness, and no length in the error: a line that
+        // arrives in pieces is judged on its length alone (above), so a whole
+        // one must be too, or the result would depend on how the input was
+        // split.
+        if line.len() > self.max_message {
+            return Err(self.line_too_large());
+        }
+        if is_blank(&self.buf[line.clone()]) {
+            return Ok(Step::Again);
+        }
+        Ok(Step::Frame(line))
+    }
+
+    /// Drops the rest of an oversized line, up to and including its `\n`.
+    fn step_discard(&mut self) -> Step {
+        match find_newline(&self.buf[self.scan..self.end]) {
+            Some(at) => {
+                self.start = self.scan + at + 1;
+                self.scan = self.start;
+                self.state = State::Line;
+                Step::Again
+            }
+            None => {
+                self.start = self.end;
+                self.scan = self.end;
+                Step::Wait
             }
         }
     }
