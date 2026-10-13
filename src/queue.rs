@@ -742,6 +742,23 @@ impl Outbox {
     pub fn pending_bytes(&self) -> usize {
         self.core.pending().0
     }
+
+    /// The part of the last chunk not yet consumed.
+    #[cfg(feature = "futures-io")]
+    pub(crate) fn current(&self) -> &[u8] {
+        &self.batch[self.at..]
+    }
+
+    /// Fails the queue because writing to the peer failed with `error`, so
+    /// the endpoint closes; returns the error.
+    #[cfg(feature = "futures-io")]
+    pub(crate) fn abandon(&mut self, error: io::Error) -> io::Error {
+        let _failed = self
+            .core
+            .lock()
+            .fail(error.kind(), format!("writing to the peer failed: {error}"));
+        error
+    }
 }
 
 impl Drop for Outbox {

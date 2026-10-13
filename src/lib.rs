@@ -90,6 +90,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "futures-io")]
+mod aio;
 mod error_object;
 mod framing;
 mod id;

@@ -52,6 +52,9 @@ std = ["jsonx-lib/std"]
 # Spans for every call handled and events for what the endpoint does on its
 # own, through `tracing`. Off, the instrumentation compiles to nothing.
 tracing = ["std", "dep:tracing"]
+# The async adapter over `futures-io`'s traits: `Endpoint::run_async`, and
+# `Outbox` as an `AsyncRead`/`AsyncBufRead` with `write_to`.
+futures-io = ["std", "dep:futures-io"]
 
 
 # DEPENDENCIES
@@ -63,6 +66,10 @@ jsonx-lib = { version = "0.2", default-features = false }
 # ecosystem's standard facade (no runtime of its own); default features off,
 # so no proc-macro crate is pulled in.
 tracing = { version = "0.1.41", optional = true, default-features = false, features = ["std"] }
+# Optional, off by default: the `futures-io` feature's async adapter. Only the
+# runtime-agnostic I/O traits (no dependencies of its own, no runtime), which
+# smol and async-std implement and tokio reaches through `tokio-util` compat.
+futures-io = { version = "0.3.31", optional = true, default-features = false, features = ["std"] }
 
 
 # DEV DEPENDENCIES
