@@ -135,7 +135,10 @@ pub enum Next<'a> {
 ///   the default; under `panic = "abort"` there is nothing to contain).
 ///
 /// Handlers run on the thread that calls `handle` or `run`, one at a time, in
-/// arrival order. The endpoint's lock is never held while user code runs.
+/// arrival order. The endpoint's lock is never held while a handler, the
+/// interceptor, or the event hook runs; it is held while the [`Sink`] takes a
+/// message, so a sink that blocks blocks every sender (see
+/// [`Queued`](crate::Queued)).
 /// Dropping the endpoint closes it.
 ///
 /// # Examples
