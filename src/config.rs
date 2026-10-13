@@ -11,6 +11,7 @@ use crate::{error_object::ErrorCode, limits::Limits};
 /// | `limits` | [`Limits::new`] | budgets on incoming messages |
 /// | `max_pending` | 1024 | our requests awaiting answers; one more evicts the oldest |
 /// | `max_in_flight` | 1024 | deferred requests being answered; more are refused with `SERVER_OVERLOADED` |
+/// | `max_held_bytes` | 4 MiB | messages this side sends while the gate is shut, held until it opens |
 /// | `request_timeout` | none | deadline for our requests that set none themselves |
 /// | `cancellation` | [`Cancellation::lsp`] | the cancel notification, both ways; `None` turns cancellation off |
 /// | `gate` | none | an opening request every other request must wait for |
@@ -40,6 +41,10 @@ pub struct Config {
     pub max_pending: usize,
     /// Most deferred requests being answered at once.
     pub max_in_flight: usize,
+    /// Most bytes of messages held back while the [`Gate`] is shut. A send
+    /// past it fails with [`Error::Backlog`](crate::Error::Backlog) and is
+    /// not held.
+    pub max_held_bytes: usize,
     /// The deadline for our requests that do not set their own.
     pub request_timeout: Option<Duration>,
     /// How cancellation is spelled, or `None` for none.
@@ -74,6 +79,7 @@ impl Config {
             limits: Limits::new(),
             max_pending: 1024,
             max_in_flight: 1024,
+            max_held_bytes: 4 * 1024 * 1024,
             request_timeout: None,
             cancellation: Some(Cancellation::lsp()),
             gate: None,
@@ -120,6 +126,19 @@ impl Config {
     #[must_use]
     pub fn with_max_in_flight(mut self, count: usize) -> Self {
         self.max_in_flight = count;
+        self
+    }
+
+    /// Sets `max_held_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Config::new().with_max_held_bytes(1 << 10).max_held_bytes, 1 << 10);
+    /// ```
+    #[must_use]
+    pub fn with_max_held_bytes(mut self, bytes: usize) -> Self {
+        self.max_held_bytes = bytes;
         self
     }
 
@@ -302,8 +321,10 @@ impl Cancellation {
 /// receives the opening request; on the side that sends it, it would hold that
 /// side's own messages forever.
 ///
-/// Held messages are kept in memory without a limit (only requests are
-/// bounded, by [`Config::max_pending`]): send little before the gate opens.
+/// Held messages are bounded by [`Config::max_held_bytes`]: a send that would
+/// take them past it fails with [`Error::Backlog`](crate::Error::Backlog)
+/// (and a request that fails so is not outstanding). Held requests also count
+/// against [`Config::max_pending`].
 ///
 /// # Examples
 ///

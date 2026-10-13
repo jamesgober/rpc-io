@@ -445,6 +445,40 @@ fn test_failed_opening_request_discards_held_traffic_and_stays_shut() {
 }
 
 #[test]
+fn test_messages_held_behind_the_gate_are_bounded() {
+    // RPC-SEC-05: what this side sends before the gate opens is held in
+    // memory; the budget bounds it.
+    let router = Router::new().request("initialize", |_: &mut (), _, _| Ok(json!({})));
+    let (e, rx) = endpoint(router, ());
+    let mut e = e.with_config(
+        Config::new()
+            .with_gate(Some(Gate::new("initialize")))
+            .with_max_held_bytes(100),
+    );
+    let peer = e.peer();
+    // `{"jsonrpc":"2.0","method":"held"}` is 33 bytes: three fit, the fourth does not.
+    let results: Vec<_> = (0..4).map(|_| peer.notify("held", ())).collect();
+    assert!(results[..3].iter().all(Result::is_ok));
+    assert!(matches!(results[3], Err(Error::Backlog)));
+    assert!(matches!(peer.request("ask", ()), Err(Error::Backlog)));
+    assert!(!peer.is_closed());
+    assert_eq!(
+        Error::Backlog.to_string(),
+        "too much is already held until the opening request succeeds; nothing was sent"
+    );
+    // The opening request goes through; the held messages follow it, and the
+    // budget is free again.
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .is_ok()
+    );
+    let replies = sent(&rx);
+    assert_eq!(replies.len(), 4, "{replies:?}"); // the response, then the 3 held
+    assert_eq!(replies.iter().filter(|r| r.contains("held")).count(), 3);
+    assert!(peer.notify("after", ()).is_ok());
+}
+
+#[test]
 fn test_opening_request_in_a_batch_is_refused() {
     let (mut e, rx) = gated();
     assert!(

@@ -38,6 +38,10 @@ pub enum Error {
     /// connection answered it for a panicking handler). This reply was not
     /// sent.
     AlreadyAnswered,
+    /// The [`Gate`](crate::Gate) is shut and the messages held behind it
+    /// already reach [`Config::max_held_bytes`](crate::Config). This one was
+    /// not sent or held; the connection is still open.
+    Backlog,
 }
 
 impl fmt::Display for Error {
@@ -56,6 +60,9 @@ impl fmt::Display for Error {
                 }
             ),
             Error::AlreadyAnswered => f.write_str("the request was already answered"),
+            Error::Backlog => f.write_str(
+                "too much is already held until the opening request succeeds; nothing was sent",
+            ),
         }
     }
 }

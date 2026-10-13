@@ -106,6 +106,7 @@ impl<K: Sink> Shared<K> {
                     GateState::Open
                 },
                 held: Vec::new(),
+                held_bytes: 0,
                 held_requests: BTreeSet::new(),
                 settings: Settings::from(config),
                 epoch: Instant::now(),
@@ -177,6 +178,7 @@ pub(crate) struct Settings {
     pub(crate) cancellation: Option<Cancellation>,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) max_in_flight: usize,
+    pub(crate) max_held_bytes: usize,
     pub(crate) timer: bool,
 }
 
@@ -186,6 +188,7 @@ impl From<&Config> for Settings {
             cancellation: config.cancellation.clone(),
             request_timeout: config.request_timeout,
             max_in_flight: config.max_in_flight,
+            max_held_bytes: config.max_held_bytes,
             timer: config.timer,
         }
     }
@@ -363,6 +366,8 @@ pub(crate) struct Inner<K> {
     next_batch: u64,
     pub(crate) gate: GateState,
     held: Vec<Held>,
+    /// The bytes of the bodies in `held`.
+    held_bytes: usize,
     /// Ids of our requests in `held` and not abandoned since: lookups stay
     /// `O(log n)` however much is held.
     held_requests: BTreeSet<u64>,
@@ -485,6 +490,7 @@ impl<K: Sink> Inner<K> {
         self.batches.clear();
         self.held.clear();
         self.held_requests.clear();
+        self.held_bytes = 0;
     }
 
     /// Records a sink failure and closes; returns the error for the sender.
@@ -503,6 +509,11 @@ impl<K: Sink> Inner<K> {
             return Err(Error::Closed);
         }
         if self.gate != GateState::Open && !matches!(sending, Sending::Response) {
+            let bytes = self.held_bytes.saturating_add(self.scratch.len());
+            if bytes > self.settings.max_held_bytes {
+                return Err(Error::Backlog);
+            }
+            self.held_bytes = bytes;
             let request = match sending {
                 Sending::Request(id) => Some(id),
                 _ => None,
@@ -694,6 +705,7 @@ impl<K: Sink> Inner<K> {
     fn settle_gate(&mut self, succeeded: bool) {
         let held = mem::take(&mut self.held);
         let live = mem::take(&mut self.held_requests);
+        self.held_bytes = 0;
         if succeeded {
             self.gate = GateState::Open;
             for message in held {
