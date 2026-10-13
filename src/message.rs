@@ -459,9 +459,10 @@ pub type Entry<'a> = Result<Message<'a>, Invalid<'a>>;
 
 /// A decoded message body: one message, or a batch.
 ///
-/// A body that is not valid JSON, an empty batch, and a batch over
-/// [`Limits::max_batch`] are each a single [`Invalid`] (answered with one
-/// error, as JSON-RPC 2.0 prescribes), never a batch.
+/// A body that is not valid JSON, an empty batch, a batch over
+/// [`Limits::max_batch`], and any batch while batches are off are each a
+/// single [`Invalid`] (answered with one error, as JSON-RPC 2.0 prescribes),
+/// never a batch.
 ///
 /// # Examples
 ///
@@ -486,7 +487,12 @@ pub enum Incoming<'a> {
 ///
 /// The body is validated as JSON in full before anything is returned, so a
 /// batch with a syntax error anywhere is a single `PARSE_ERROR`, as JSON-RPC
-/// 2.0 requires. Envelope rules, beyond the specification's:
+/// 2.0 requires; with two exceptions, both refused early so that a batch's
+/// size cannot drive the work done: a batch is refused with one
+/// `INVALID_REQUEST` as soon as it passes [`Limits::max_batch`] (the rest is
+/// not read, so a syntax error after that point is not reported), and at its
+/// `[` when batches are off (`max_batch` 0). Envelope rules, beyond the
+/// specification's:
 ///
 /// - `"jsonrpc"` must be exactly `"2.0"`; unknown members are ignored; a
 ///   repeated envelope member makes the message invalid (two readers could
@@ -550,6 +556,13 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
 
 /// Decodes the elements of a batch, the reader just past its `[`.
 fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Incoming<'a> {
+    if max == 0 {
+        // Batches are off: refused at the `[`, unread.
+        return Incoming::Single(Err(Invalid::request(
+            None,
+            ErrorObject::invalid_request("batches are not accepted"),
+        )));
+    }
     let mut entries = Vec::new();
     loop {
         let event = match reader.next_event() {

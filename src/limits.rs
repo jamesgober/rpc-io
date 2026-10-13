@@ -39,7 +39,9 @@ pub struct Limits {
     pub max_header_bytes: usize,
     /// Most header lines in one Content-Length header section.
     pub max_headers: usize,
-    /// Most messages in one batch.
+    /// Most messages in one batch; `0` turns batches off, so any batch is
+    /// refused at its `[` (MCP since the 2025-06-18 revision has no
+    /// batching).
     pub max_batch: usize,
     /// The largest announced Content-Length the decoder still skips when it
     /// is over `max_message_bytes`. A larger one is a fatal
@@ -70,6 +72,26 @@ impl Limits {
             max_skip_bytes: u64::MAX,
             json: jsonx_lib::Limits::new(),
         }
+    }
+
+    /// Turns batches off (`max_batch` 0): any batch is answered with one
+    /// `INVALID_REQUEST`, "batches are not accepted", without reading it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{decode, ErrorCode, Incoming, Limits};
+    ///
+    /// let limits = Limits::new().without_batches();
+    /// let Incoming::Single(Err(refused)) = decode(br#"[{"jsonrpc":"2.0","method":"x"}]"#, &limits) else {
+    ///     panic!("a batch was accepted");
+    /// };
+    /// assert_eq!(refused.error().code(), ErrorCode::INVALID_REQUEST);
+    /// assert_eq!(refused.error().message(), "batches are not accepted");
+    /// ```
+    #[must_use]
+    pub const fn without_batches(self) -> Self {
+        self.with_max_batch(0)
     }
 
     /// Sets `max_message_bytes`.
