@@ -79,7 +79,7 @@ impl<K: Sink> Shared<K> {
                 corked: false,
                 scratch: String::new(),
                 pending: Pending::new(config.max_pending),
-                in_flight: BTreeMap::new(),
+                in_flight: IdMap::default(),
                 batches: BTreeMap::new(),
                 next_batch: 0,
                 gate: if config.gate.is_some() {
@@ -176,6 +176,54 @@ struct InFlight {
     batch: Option<u64>,
 }
 
+/// Deferred requests by id. Integer and string ids are kept apart, so a
+/// lookup borrows the id it is given (`&str` for a string) instead of copying
+/// it into an owned key.
+struct IdMap<V> {
+    numbers: BTreeMap<i64, V>,
+    strings: BTreeMap<Box<str>, V>,
+}
+
+impl<V> Default for IdMap<V> {
+    fn default() -> Self {
+        Self {
+            numbers: BTreeMap::new(),
+            strings: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> IdMap<V> {
+    fn len(&self) -> usize {
+        self.numbers.len() + self.strings.len()
+    }
+
+    fn contains(&self, id: &Id<'_>) -> bool {
+        match id {
+            Id::Number(n) => self.numbers.contains_key(n),
+            Id::String(s) => self.strings.contains_key(&**s),
+        }
+    }
+
+    fn insert(&mut self, id: Id<'_>, value: V) -> Option<V> {
+        match id {
+            Id::Number(n) => self.numbers.insert(n, value),
+            Id::String(s) => self.strings.insert(s.into_owned().into_boxed_str(), value),
+        }
+    }
+
+    fn remove(&mut self, id: &Id<'_>) -> Option<V> {
+        match id {
+            Id::Number(n) => self.numbers.remove(n),
+            Id::String(s) => self.strings.remove(&**s),
+        }
+    }
+
+    fn into_values(self) -> impl Iterator<Item = V> {
+        self.numbers.into_values().chain(self.strings.into_values())
+    }
+}
+
 /// A batch being answered: responses so far, and how many are still owed.
 struct Batch {
     remaining: usize,
@@ -207,7 +255,7 @@ pub(crate) struct Inner<K> {
     /// Reused buffer every message is encoded in.
     scratch: String,
     pending: Pending<mpsc::Sender<Outcome>>,
-    in_flight: BTreeMap<Id<'static>, InFlight>,
+    in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
     next_batch: u64,
     pub(crate) gate: GateState,
@@ -297,7 +345,7 @@ impl<K: Sink> Inner<K> {
             // A waiter that dropped its `Call` has nothing to be told.
             let _gone = waiter.send(Err(CallError::Closed));
         }
-        for (_, request) in mem::take(&mut self.in_flight) {
+        for request in mem::take(&mut self.in_flight).into_values() {
             // Workers still answering see the cancellation and can stop.
             request.token.cancel();
         }
@@ -550,8 +598,7 @@ impl<K: Sink> Inner<K> {
 
     /// Whether a deferred request with this id is being answered.
     pub(crate) fn in_flight(&self, id: &Id<'_>) -> bool {
-        // Most sessions defer nothing: no copy of the id is made then.
-        !self.in_flight.is_empty() && self.in_flight.contains_key(&id.clone().into_owned())
+        self.in_flight.contains(id)
     }
 
     /// Records a deferred request; `None` when too many are in flight.
@@ -590,7 +637,7 @@ impl<K: Sink> Inner<K> {
     /// The peer cancelled its request `id`: sets its token and answers it as
     /// the cancellation settings say. `false` if it is not in flight.
     pub(crate) fn cancel_incoming(&mut self, id: &Id<'_>) -> bool {
-        let Some(request) = self.in_flight.remove(&id.clone().into_owned()) else {
+        let Some(request) = self.in_flight.remove(id) else {
             return false;
         };
         request.token.cancel();
