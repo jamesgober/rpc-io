@@ -72,6 +72,10 @@ impl Subscriber for Handle {
 fn test_tracing_records_calls_and_events_without_params() {
     quiet_deliberate_panics();
     let recorder = Arc::new(Recorder::default());
+    let forged = format!(
+        r#"{{"jsonrpc":"2.0","method":"forged\nERROR rpc_io fake{}"}}"#,
+        "x".repeat(10_000)
+    );
     let lines = tracing::subscriber::with_default(Handle(Arc::clone(&recorder)), || {
         let (e, _rx) = endpoint(router(), Vec::new());
         // Deadlines expire here, on the recorded thread, not the timer's.
@@ -81,6 +85,7 @@ fn test_tracing_records_calls_and_events_without_params() {
             br#"{"jsonrpc":"2.0","id":2,"method":"boom"}"#,
             br#"{"jsonrpc":"2.0","method":"nobody"}"#,
             b"{oops",
+            forged.as_bytes(),
         ] {
             assert!(e.handle(body).is_ok());
         }
@@ -95,8 +100,16 @@ fn test_tracing_records_calls_and_events_without_params() {
             .clone()
     });
     let all = lines.join("\n");
-    assert!(all.contains("span request method=ok id=1"), "{all}");
-    assert!(all.contains("span notification method=nobody"), "{all}");
+    assert!(all.contains("span request method=\"ok\" id=\"1\""), "{all}");
+    assert!(all.contains("span notification method=\"nobody\""), "{all}");
+    // A peer-chosen method is escaped (no raw line break reaches the log)
+    // and clipped.
+    assert!(!all.contains("forged\nERROR"), "{all}");
+    assert!(all.contains(r"forged\nERROR"), "{all}");
+    assert!(
+        !all.contains(&"x".repeat(200)),
+        "an unclipped method was recorded"
+    );
     assert!(
         all.contains("ERROR rpc_io") && all.contains("a handler panicked"),
         "{all}"

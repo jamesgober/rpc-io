@@ -1185,19 +1185,19 @@ fn not_initialized(gate: &Gate) -> ErrorObject {
 fn trace_event(event: &Event<'_>) {
     match event {
         Event::Panicked { method, message } => {
-            event!(error, method = %method, panic = %message, "a handler panicked");
+            event!(error, method = ?clip(method), panic = ?message, "a handler panicked");
         }
         Event::Invalid { error, answered } => {
-            event!(debug, code = error.code().0, message = %error.message(), answered, "a malformed message");
+            event!(debug, code = error.code().0, message = ?error.message(), answered, "a malformed message");
         }
         Event::UnknownNotification { method } => {
-            event!(debug, method = %method, "a notification with no handler");
+            event!(debug, method = ?clip(method), "a notification with no handler");
         }
         Event::Dropped { method } => {
-            event!(debug, method = %method, "a notification dropped before the gate opened");
+            event!(debug, method = ?clip(method), "a notification dropped before the gate opened");
         }
         Event::Unmatched { id } => {
-            event!(debug, id = %id, "a response to no outstanding request");
+            event!(debug, id = ?clip(&id.to_string()), "a response to no outstanding request");
         }
         Event::PeerError { error } => {
             event!(
@@ -1210,13 +1210,13 @@ fn trace_event(event: &Event<'_>) {
             event!(warn, error = %error, "an oversized message was skipped");
         }
         Event::Cancelled { id } => {
-            event!(debug, id = %id, "the peer cancelled a request");
+            event!(debug, id = ?clip(&id.to_string()), "the peer cancelled a request");
         }
         Event::Refused { method, error } => {
-            event!(debug, method = %method, code = error.code().0, "a notification was refused by the interceptor");
+            event!(debug, method = ?clip(method), code = error.code().0, "a notification was refused by the interceptor");
         }
         Event::InvalidParams { method, error } => {
-            event!(debug, method = %method, message = %error.message(), "a notification's params did not fit its handler");
+            event!(debug, method = ?clip(method), message = ?error.message(), "a notification's params did not fit its handler");
         }
     }
 }
