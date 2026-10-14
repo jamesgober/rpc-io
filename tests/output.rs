@@ -374,17 +374,19 @@ fn test_a_slow_steady_reader_is_not_timed_out() {
     // Found by the verifier (RPC2-004): the write timeout counted from the
     // start of a batch, so a peer that kept reading, slowly, was cut off.
     let written = Shared::default();
-    let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(100)));
+    // Writes 5 ms apart against a 500 ms timeout: a wide margin for a
+    // loaded machine's scheduling.
+    let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(500)));
     let sink = Queued::with_limits(Trickle(written.clone()), Framing::Newline, limits);
     let Ok(sink) = sink else {
         panic!("no writer thread")
     };
     let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
     let peer = endpoint.peer();
-    let big = "x".repeat(4096); // ~64 writes of 64 bytes: ~320 ms, past the timeout
+    let big = "x".repeat(16 * 1024); // ~256 writes of 64 bytes: over 1.2 s, past the timeout
     assert!(peer.notify("big", jsonx_lib::json!([big])).is_ok());
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(400) {
+    while started.elapsed() < Duration::from_millis(1500) {
         assert!(
             peer.notify("small", ()).is_ok(),
             "a steady reader was cut off"

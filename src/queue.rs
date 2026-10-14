@@ -1093,6 +1093,13 @@ mod tests {
                 Err(error) => panic!("{error}"),
             };
         assert!(sink.send("x").is_ok());
+        // The timeout runs from when the writer takes the batch: wait for
+        // that, then sleep past it, however loaded the machine.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while sink.core.lock().progressed.is_none() {
+            assert!(Instant::now() < deadline, "the writer never took the batch");
+            thread::sleep(Duration::from_millis(1));
+        }
         thread::sleep(Duration::from_millis(60));
         assert_eq!(
             sink.send("y").err().map(|e| e.kind()),
