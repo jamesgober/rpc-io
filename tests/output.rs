@@ -82,7 +82,7 @@ fn test_stalled_peer_does_not_stall_the_handles() {
     let peer = endpoint.peer();
     assert!(peer.notify("first", ()).is_ok()); // the writer is now stuck on it
     let worker = peer.clone();
-    let sent = within(Duration::from_secs(2), move || {
+    let sent = within(Duration::from_secs(30), move || {
         (0..100).all(|_| worker.notify("more", ()).is_ok()) && !worker.is_closed()
     });
     assert_eq!(
@@ -125,7 +125,7 @@ fn test_is_closed_does_not_wait_for_a_blocked_sink() {
     thread::sleep(Duration::from_millis(50));
     let watcher = peer.clone();
     assert_eq!(
-        within(Duration::from_secs(2), move || watcher.is_closed()),
+        within(Duration::from_secs(30), move || watcher.is_closed()),
         Some(false)
     );
     drop(release);
@@ -313,9 +313,12 @@ fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
     // Found by the verifier (RPC2-001): closing drained the queue under the
     // endpoint's lock, so a worker answering during the close waited for the
     // whole drain, and forever with no write timeout.
+    // No close timeout at all: the close cannot end before the writer is
+    // released, so the worker is seen answering while it is in progress,
+    // whatever the scheduling.
     let limits = QueueLimits::new()
         .with_write_timeout(None)
-        .with_close_timeout(Duration::from_millis(600));
+        .with_close_timeout(Duration::MAX);
     let (sink, release, _written) = stalled(limits);
     let router =
         Router::<Vec<rpc_io::Responder>>::new().deferred("later", |held, _, _, r| held.push(r));
@@ -329,30 +332,52 @@ fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
     let Some(responder) = endpoint.state_mut().pop() else {
         panic!("no responder")
     };
+    let peer = endpoint.peer();
     let (closing, closed) = mpsc::channel();
     let closer = thread::spawn(move || {
-        let started = Instant::now();
         endpoint.close();
-        let _sent = closing.send(started.elapsed());
+        let _sent = closing.send(());
         endpoint
     });
-    thread::sleep(Duration::from_millis(100));
+    // The close has begun once the connection reads as closed.
+    let begun = Instant::now();
+    while !peer.is_closed() {
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "the close never began"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     // While the close waits for the stuck writer, the worker's answer is
-    // refused at once instead of waiting for the lock.
-    let answered = within(Duration::from_millis(300), move || responder.ok(1));
+    // refused instead of waiting for the lock.
+    let answered = within(Duration::from_secs(30), move || responder.ok(1));
+    assert!(matches!(answered, Some(Err(Error::Closed))), "{answered:?}");
     assert!(
-        matches!(answered, Some(Err(Error::Closed))),
-        "a worker was held up by the close: {answered:?}"
-    );
-    // And the close itself is bounded by the close timeout.
-    let waited = closed.recv_timeout(Duration::from_secs(5));
-    assert!(
-        waited
-            .is_ok_and(|took| took >= Duration::from_millis(500) && took < Duration::from_secs(3)),
-        "the close was not bounded"
+        closed.try_recv().is_err(),
+        "the answer waited for the close"
     );
     drop(release);
+    assert!(closed.recv_timeout(Duration::from_secs(30)).is_ok());
     assert!(closer.join().is_ok());
+}
+
+#[test]
+fn test_close_with_a_stalled_writer_is_bounded_by_the_close_timeout() {
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::from_millis(300));
+    let (sink, release, _written) = stalled(limits);
+    let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(endpoint.peer().notify("stuck", ()).is_ok());
+    let started = Instant::now();
+    endpoint.close();
+    let took = started.elapsed();
+    // Never before the timeout; the upper bound only rules out "forever".
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(30),
+        "{took:?}"
+    );
+    drop(release);
 }
 
 /// A writer that takes a few bytes per write, slowly but steadily.

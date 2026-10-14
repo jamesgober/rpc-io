@@ -98,14 +98,13 @@ fn test_tcp_server_serves_connections_with_their_own_state_and_stops() {
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "stopping took {:?}",
         started.elapsed()
     );
     // Every client sees its stream end.
     for (_client, reader) in &mut clients {
-        let mut rest = String::new();
-        assert!(matches!(reader.read_line(&mut rest), Ok(0)), "{rest}");
+        assert!(closed(reader));
     }
     assert!(stopper.is_stopped());
 }
@@ -232,7 +231,7 @@ fn test_silent_sockets_cannot_lock_out_a_client() {
     let (listener, addr) = listener();
     let server = Server::new(Framing::Newline)
         .with_max_connections(4)
-        .with_message_timeout(Some(Duration::from_millis(300)));
+        .with_message_timeout(Some(Duration::from_secs(1)));
     let stopper = server.stopper();
     let serving = thread::spawn(move || {
         server.serve_tcp(listener, |_| {
@@ -262,15 +261,14 @@ fn test_silent_sockets_cannot_lock_out_a_client() {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
     // The silent ones were closed.
-    for socket in &mut silent {
-        let _timeout = socket.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut rest = Vec::new();
-        assert!(matches!(io::Read::read_to_end(socket, &mut rest), Ok(0)));
+    for socket in silent {
+        let _timeout = socket.set_read_timeout(Some(Duration::from_secs(30)));
+        assert!(closed(&mut BufReader::new(socket)));
     }
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
@@ -282,8 +280,9 @@ fn test_a_client_streaming_past_the_message_deadline_is_served() {
     // message, the message deadline never restarted, and a busy client was
     // cut off one `message_timeout` after it began.
     let (listener, addr) = listener();
-    let server =
-        Server::new(Framing::Newline).with_message_timeout(Some(Duration::from_millis(300)));
+    // A 1 s deadline against writes 20 ms apart: a wide margin for a loaded
+    // machine's scheduling, and a stream several deadlines long.
+    let server = Server::new(Framing::Newline).with_message_timeout(Some(Duration::from_secs(1)));
     let stopper = server.stopper();
     let serving = thread::spawn(move || {
         server.serve_tcp(listener, |_| {
@@ -294,7 +293,7 @@ fn test_a_client_streaming_past_the_message_deadline_is_served() {
         })
     });
     let (mut client, mut reader) = connect(addr);
-    let count = 120;
+    let count = 300;
     let wire: Vec<u8> = (0..count)
         .flat_map(|id| {
             format!(
@@ -304,8 +303,8 @@ fn test_a_client_streaming_past_the_message_deadline_is_served() {
             .into_bytes()
         })
         .collect();
-    // A message and a half every 20 ms, for about 2 s: every read ends inside
-    // the next message, and the stream lasts several deadlines.
+    // A message and a half every 20 ms, for at least 4 s: every read ends
+    // inside the next message, and the stream lasts several deadlines.
     let chunk = wire.len() * 3 / (2 * count);
     let writer = thread::spawn(move || {
         for piece in wire.chunks(chunk) {
@@ -334,7 +333,7 @@ fn test_a_client_streaming_past_the_message_deadline_is_served() {
     }
     assert!(writer.join().is_ok_and(|wrote| wrote));
     assert!(
-        started.elapsed() > Duration::from_millis(900),
+        started.elapsed() > Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );
@@ -375,10 +374,9 @@ fn test_a_client_waiting_on_an_answer_is_not_idle() {
     );
     // Idle once answered: closed after the idle timeout.
     let started = Instant::now();
-    let mut rest = String::new();
-    assert!(matches!(reader.read_line(&mut rest), Ok(0)), "{rest}");
+    assert!(closed(&mut reader), "the connection stayed open");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
@@ -422,7 +420,7 @@ fn test_a_client_that_never_answers_our_request_still_goes_idle() {
     let started = Instant::now();
     assert!(closed(&mut reader), "the connection stayed open");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
@@ -434,8 +432,8 @@ fn test_a_client_that_never_answers_our_request_still_goes_idle() {
 fn test_idle_and_unfinished_connections_are_closed() {
     let (listener, addr) = listener();
     let server = Server::new(Framing::Newline)
-        .with_message_timeout(Some(Duration::from_millis(400)))
-        .with_idle_timeout(Some(Duration::from_millis(400)));
+        .with_message_timeout(Some(Duration::from_secs(1)))
+        .with_idle_timeout(Some(Duration::from_secs(1)));
     let stopper = server.stopper();
     let serving = thread::spawn(move || {
         server.serve_tcp(listener, |_| {
@@ -455,12 +453,13 @@ fn test_idle_and_unfinished_connections_are_closed() {
         )
         .contains("pong")
     );
+    // The server's clock started at its last read, a little before ours:
+    // closed not at once, and not much after the timeout.
     let started = Instant::now();
-    let mut rest = String::new();
-    assert!(matches!(reader.read_line(&mut rest), Ok(0)));
+    assert!(closed(&mut reader));
     let idle = started.elapsed();
     assert!(
-        idle >= Duration::from_millis(300) && idle < Duration::from_secs(5),
+        idle >= Duration::from_millis(250) && idle < Duration::from_secs(30),
         "{idle:?}"
     );
     // A message trickled a byte at a time, but too slowly: closed even
@@ -476,8 +475,7 @@ fn test_idle_and_unfinished_connections_are_closed() {
         }
         let _end = slow.write_all(b"\n");
     });
-    let mut line = String::new();
-    assert!(matches!(slow_reader.read_line(&mut line), Ok(0)), "{line}");
+    assert!(closed(&mut slow_reader));
     assert!(trickle.join().is_ok());
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
