@@ -101,7 +101,8 @@ jobs:
         working-directory: fuzz
         run: |
           for target in content_length newline message batch endpoint; do
-            cargo fuzz run -O "$target" -- -max_total_time=30 -rss_limit_mb=2048
+            # The prebuilt cargo-fuzz defaults to musl, which ASan cannot link.
+            cargo fuzz run -O --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30 -rss_limit_mb=2048
           done
 
   semver:
