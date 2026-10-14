@@ -32,6 +32,22 @@ fn ask(client: &mut TcpStream, reader: &mut BufReader<TcpStream>, body: &str) ->
     line
 }
 
+/// Whether the server has closed the connection: the next read ends the
+/// stream, or reports a reset or an abort (Windows resets a connection that
+/// is closed with input left unread). Data, a timeout, or another error is
+/// not a close.
+fn closed(reader: &mut impl BufRead) -> bool {
+    let mut rest = String::new();
+    match reader.read_line(&mut rest) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        ),
+    }
+}
+
 fn connect(addr: std::net::SocketAddr) -> (TcpStream, BufReader<TcpStream>) {
     let client = match TcpStream::connect(addr) {
         Ok(client) => client,
@@ -361,6 +377,50 @@ fn test_a_client_waiting_on_an_answer_is_not_idle() {
     let started = Instant::now();
     let mut rest = String::new();
     assert!(matches!(reader.read_line(&mut rest), Ok(0)), "{rest}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
+fn test_a_client_that_never_answers_our_request_still_goes_idle() {
+    // Found by the verifier (RPC4-001): a request of ours with no timeout
+    // kept the connection out of the idle timeout for as long as the client
+    // chose not to answer it.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline).with_idle_timeout(Some(Duration::from_millis(300)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().notification("hello", |_: &mut (), _, cx| {
+                    if let Ok(call) = cx.request("question", ()) {
+                        call.detach();
+                    }
+                }),
+                (),
+            )
+        })
+    });
+    let (mut client, mut reader) = connect(addr);
+    assert!(
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"hello\"}
+"
+            )
+            .is_ok()
+    );
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).is_ok_and(|n| n > 0));
+    assert!(line.contains("question"), "{line}");
+    // Never answered: closed as idle all the same.
+    let started = Instant::now();
+    assert!(closed(&mut reader), "the connection stayed open");
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",

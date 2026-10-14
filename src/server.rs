@@ -417,9 +417,12 @@ fn serve_connection<T: Stream, S>(
         }
         // Idle means no traffic either way and nothing outstanding: no
         // deferred request of the peer's being answered, and no request of
-        // ours waiting for the peer.
+        // ours waiting for the peer within its deadline. One of ours with no
+        // deadline does not count: the peer could hold the connection open
+        // forever by never answering it.
         let stats = endpoint.stats();
-        let working = stats.in_flight > 0 || stats.pending > 0;
+        let working =
+            stats.in_flight > 0 || (stats.pending > 0 && endpoint.next_deadline().is_some());
         let now = Instant::now();
         if working || stats.bodies_out != sent {
             sent = stats.bodies_out;
@@ -527,7 +530,9 @@ impl Server {
 
     /// Sets how long a connection may stay idle (`None`: no limit): no
     /// traffic in either direction, no deferred request of the peer's being
-    /// answered, and no request of ours waiting for the peer. A connection
+    /// answered, and no request of ours waiting for the peer within its
+    /// deadline (one sent without a timeout does not count, so a peer cannot
+    /// hold the connection open by never answering it). A connection
     /// idle past it is closed. Long-lived sessions whose peer may be quiet
     /// for a long time (an editor's LSP client, an MCP host between tool
     /// calls) may want `None`.
