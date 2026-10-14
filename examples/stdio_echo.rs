@@ -1,5 +1,5 @@
 //! A JSON-RPC server on stdin and stdout: the shape of an MCP server (newline
-//! framing, the default) or an LSP or DAP server (`--content-length`).
+//! framing, the default) or an LSP server (`--content-length`).
 //!
 //! ```text
 //! $ echo '{"jsonrpc":"2.0","id":1,"method":"echo","params":["hi"]}' | cargo run --example stdio_echo

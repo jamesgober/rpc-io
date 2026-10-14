@@ -38,6 +38,15 @@ pub enum Error {
     /// connection answered it for a panicking handler). This reply was not
     /// sent.
     AlreadyAnswered,
+    /// The [`Gate`](crate::Gate) is shut and the messages held behind it
+    /// already reach [`Config::max_held_bytes`](crate::Config). This one was
+    /// not sent or held; the connection is still open.
+    Backlog,
+    /// A value could not be written as JSON (a [`Progress`](crate::Progress)
+    /// number that is not finite; with the `serde` feature, a map whose keys
+    /// are not strings, or a `Serialize` that failed); this says why. Nothing
+    /// was sent.
+    Serialize(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +65,10 @@ impl fmt::Display for Error {
                 }
             ),
             Error::AlreadyAnswered => f.write_str("the request was already answered"),
+            Error::Backlog => f.write_str(
+                "too much is already held until the opening request succeeds; nothing was sent",
+            ),
+            Error::Serialize(why) => write!(f, "the value is not JSON: {why}"),
         }
     }
 }
@@ -86,6 +99,10 @@ impl From<Error> for ErrorObject {
     /// An `-32603` internal error saying what failed, so a handler can apply
     /// `?` to a send through its [`Context`](crate::Context).
     ///
+    /// An [`Error::Io`] says only that the transport failed: the operating
+    /// system's text (which can name paths and hosts) stays on this side. Log
+    /// the [`Error`] itself for the detail.
+    ///
     /// # Examples
     ///
     /// ```
@@ -94,9 +111,15 @@ impl From<Error> for ErrorObject {
     /// let e = ErrorObject::from(Error::Closed);
     /// assert_eq!(e.code(), ErrorCode::INTERNAL_ERROR);
     /// assert_eq!(e.message(), "the connection is closed");
+    ///
+    /// let io = std::io::Error::other("C:\\secret\\path is locked");
+    /// assert_eq!(ErrorObject::from(Error::Io(io)).message(), "the transport failed");
     /// ```
     fn from(error: Error) -> Self {
-        ErrorObject::internal_error(error.to_string())
+        match error {
+            Error::Io(_) => ErrorObject::internal_error("the transport failed"),
+            other => ErrorObject::internal_error(other.to_string()),
+        }
     }
 }
 
@@ -132,8 +155,9 @@ pub enum CallError {
     /// The connection closed before an answer arrived.
     Closed,
     /// Waiting here would block the thread that reads the answer: a handler
-    /// cannot wait for a request it sent. Use [`Call::try_wait`](crate::Call::try_wait)
-    /// later, or wait on another thread.
+    /// cannot wait for a request it sent. The call, consumed by `wait`, is
+    /// cancelled. Use [`Call::try_wait`](crate::Call::try_wait) later, or wait
+    /// on another thread.
     WouldDeadlock,
 }
 

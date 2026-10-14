@@ -10,10 +10,10 @@ use crate::{
 
 /// A JSON-RPC error code.
 ///
-/// The constants are the five codes JSON-RPC 2.0 defines, plus three the
-/// crate itself answers with. Any integer is a valid code; protocols define
-/// their own (LSP's `ContentModified` is `-32801`, LexerSketch's "stale
-/// version" is `1001`), and a peer's code is passed through as it was sent.
+/// The constants are the five codes JSON-RPC 2.0 defines, three the crate
+/// itself answers with, and three more of LSP's for handlers to answer with.
+/// Any integer is a valid code; protocols define their own, and a peer's code
+/// is passed through as it was sent.
 ///
 /// # Examples
 ///
@@ -50,6 +50,14 @@ impl ErrorCode {
     /// `-32800`: the request was cancelled by its sender (LSP's
     /// `RequestCancelled`); see [`Cancellation`](crate::Cancellation).
     pub const REQUEST_CANCELLED: ErrorCode = ErrorCode(-32800);
+    /// `-32801`: the document changed while the request was being answered,
+    /// so the answer would be stale (LSP's `ContentModified`).
+    pub const CONTENT_MODIFIED: ErrorCode = ErrorCode(-32801);
+    /// `-32802`: the server cancelled the request itself (LSP's
+    /// `ServerCancelled`, for requests that declare it retriable).
+    pub const SERVER_CANCELLED: ErrorCode = ErrorCode(-32802);
+    /// `-32803`: the request was valid but failed (LSP's `RequestFailed`).
+    pub const REQUEST_FAILED: ErrorCode = ErrorCode(-32803);
 
     /// A short name for the codes this crate defines, `None` for others.
     ///
@@ -69,6 +77,9 @@ impl ErrorCode {
             -32000 => "server overloaded",
             -32002 => "server not initialized",
             -32800 => "request cancelled",
+            -32801 => "content modified",
+            -32802 => "server cancelled",
+            -32803 => "request failed",
             _ => return None,
         })
     }
@@ -313,11 +324,16 @@ impl From<jsonx_lib::Error> for ErrorObject {
 /// At most the first 128 bytes of `text` (on a character boundary), with an
 /// ellipsis when cut, so peer-controlled text quoted in a message stays short.
 pub(crate) fn clip(text: &str) -> Cow<'_, str> {
-    const MAX: usize = 128;
-    if text.len() <= MAX {
+    clip_to(text, 128)
+}
+
+/// At most the first `max` bytes of `text` (on a character boundary), with an
+/// ellipsis when cut.
+pub(crate) fn clip_to(text: &str, max: usize) -> Cow<'_, str> {
+    if text.len() <= max {
         return Cow::Borrowed(text);
     }
-    let mut end = MAX;
+    let mut end = max;
     while !text.is_char_boundary(end) {
         end -= 1;
     }

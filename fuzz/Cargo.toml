@@ -1,0 +1,60 @@
+# Fuzz targets for every parser of untrusted input (cargo-fuzz layout).
+#
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run content_length -- -max_total_time=60
+#
+# Not published, and not part of the crate's package. The checks live in
+# `../tests/harness/mod.rs`, shared with `tests/fuzz_harness.rs`, which runs
+# them on arbitrary bytes in plain `cargo test`.
+[package]
+name    = "rpc-io-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+jsonx-lib     = "0.2"
+libfuzzer-sys = "0.4"
+rpc-io        = { path = ".." }
+
+# Its own workspace: kept out of the crate's builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name  = "content_length"
+path  = "fuzz_targets/content_length.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "newline"
+path  = "fuzz_targets/newline.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "message"
+path  = "fuzz_targets/message.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "batch"
+path  = "fuzz_targets/batch.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "endpoint"
+path  = "fuzz_targets/endpoint.rs"
+test  = false
+doc   = false
+bench = false

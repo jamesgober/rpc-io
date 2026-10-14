@@ -12,8 +12,13 @@ use core::{fmt, ops::Range};
 
 use crate::limits::Limits;
 
-/// Bytes offered for each read, and the read-ahead past a message's end.
+/// Bytes offered for each read, and the read-ahead past a message's end: the
+/// default of [`Decoder::with_read_chunk`].
 pub const READ_CHUNK: usize = 8 * 1024;
+
+/// A buffer this many read chunks long, or longer, is released once at most
+/// a quarter of it is needed (see [`Decoder::space`]).
+const SHRINK_CHUNKS: usize = 4;
 
 /// How messages are delimited on a byte stream.
 ///
@@ -37,8 +42,9 @@ pub const READ_CHUNK: usize = 8 * 1024;
 #[non_exhaustive]
 pub enum Framing {
     /// `Content-Length: <n>\r\n\r\n` and then `n` bytes of body: the base
-    /// protocol of LSP and DAP. Other headers (`Content-Type`) are accepted and
-    /// ignored; header names match case-insensitively; a bare `\n` line end is
+    /// protocol of LSP (and of DAP, whose messages are not JSON-RPC: this
+    /// framing cuts them, the endpoint does not serve them). Other headers
+    /// (`Content-Type`) are accepted and ignored; header names match case-insensitively; a bare `\n` line end is
     /// accepted for `\r\n`. Blank lines before a header section (stray line
     /// ends between messages) are skipped and do not count against
     /// [`Limits::max_header_bytes`]: each is consumed as soon as its line end
@@ -167,6 +173,15 @@ pub enum FrameError {
     },
     /// The stream ended inside a message.
     Truncated,
+    /// A Content-Length header announced a body over both
+    /// [`Limits::max_message_bytes`] and [`Limits::max_skip_bytes`]: too
+    /// large to read, and too large to skip.
+    TooLargeToSkip {
+        /// The length the header announced.
+        length: u64,
+        /// The skip limit, in bytes.
+        limit: u64,
+    },
 }
 
 impl FrameError {
@@ -219,6 +234,10 @@ impl fmt::Display for FrameError {
                 write!(f, "a message exceeds the limit of {limit} bytes")
             }
             FrameError::Truncated => f.write_str("the stream ended inside a message"),
+            FrameError::TooLargeToSkip { length, limit } => write!(
+                f,
+                "a message of {length} bytes is over the skip limit of {limit}"
+            ),
         }
     }
 }
@@ -245,6 +264,16 @@ enum State {
     Discard,
 }
 
+/// What one step of the decoder's state machine found.
+enum Step {
+    /// The state changed; take another step.
+    Again,
+    /// Nothing complete is buffered: more bytes are needed.
+    Wait,
+    /// A complete message body, at this range of the buffer.
+    Frame(Range<usize>),
+}
+
 /// Cuts message bodies out of a byte stream (sans-IO).
 ///
 /// Bytes go in through [`space`](Decoder::space) and
@@ -255,8 +284,13 @@ enum State {
 /// returned `Ok(None)`, which is what keeps its memory bounded no matter how
 /// the peer sends:
 ///
-/// - the buffer never exceeds one message plus [`READ_CHUNK`] bytes of
-///   read-ahead (`max(max_message_bytes + 1, max_header_bytes) + READ_CHUNK`);
+/// - the buffer never exceeds one message plus one read chunk
+///   ([`READ_CHUNK`] by default) of read-ahead
+///   (`max(max_message_bytes + 1, max_header_bytes) + read_chunk`, see
+///   [`memory_bound`](Decoder::memory_bound));
+/// - the buffer shrinks again once a large message has been taken (see
+///   [`space`](Decoder::space)), so memory follows the current message, not
+///   the largest one seen;
 /// - a Content-Length body is reserved as its bytes arrive, never all at once
 ///   from the header's word alone;
 /// - an oversized message is skipped as it arrives ([`FrameError::TooLarge`])
@@ -295,6 +329,9 @@ pub struct Decoder {
     max_message: usize,
     max_header_bytes: usize,
     max_headers: usize,
+    max_skip: u64,
+    /// Bytes offered for each read.
+    chunk: usize,
     /// Initialized storage; bytes `start..end` are buffered and unconsumed.
     buf: Vec<u8>,
     start: usize,
@@ -328,6 +365,8 @@ impl Decoder {
             max_message: limits.max_message_bytes,
             max_header_bytes: limits.max_header_bytes,
             max_headers: limits.max_headers,
+            max_skip: limits.max_skip_bytes,
+            chunk: READ_CHUNK,
             buf: Vec::new(),
             start: 0,
             end: 0,
@@ -353,6 +392,73 @@ impl Decoder {
         self.framing
     }
 
+    /// Sets how many bytes [`space`](Decoder::space) offers for each read,
+    /// and so the read-ahead past a message (at least 1; [`READ_CHUNK`] by
+    /// default). Larger chunks mean fewer reads on fast streams; smaller ones
+    /// mean less memory per idle connection.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits};
+    ///
+    /// let mut d = Framing::Newline.decoder(&Limits::new()).with_read_chunk(512);
+    /// assert_eq!(d.space().len(), 512);
+    /// assert_eq!(d.read_chunk(), 512);
+    /// ```
+    #[must_use]
+    pub const fn with_read_chunk(mut self, bytes: usize) -> Self {
+        self.chunk = if bytes == 0 { 1 } else { bytes };
+        self
+    }
+
+    /// The bytes offered for each read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits, READ_CHUNK};
+    ///
+    /// assert_eq!(Framing::Newline.decoder(&Limits::new()).read_chunk(), READ_CHUNK);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn read_chunk(&self) -> usize {
+        self.chunk
+    }
+
+    /// The bytes the buffer holds allocated now. It grows while a large
+    /// message arrives and is released again once the message is taken (the
+    /// shrink policy of [`space`](Decoder::space)), so a connection's memory
+    /// follows the messages it is reading, not the largest it ever read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framing, Limits, READ_CHUNK};
+    ///
+    /// let mut d = Framing::Newline.decoder(&Limits::new());
+    /// assert_eq!(d.capacity(), 0); // nothing until the first read
+    /// let mut line = vec![b'1'; 1 << 20];
+    /// line.push(b'\n');
+    /// let mut rest = line.as_slice();
+    /// while !rest.is_empty() {
+    ///     let n = d.feed(rest);
+    ///     rest = &rest[n..];
+    ///     while d.next_frame()?.is_some() {}
+    /// }
+    /// assert!(d.capacity() > 1 << 20); // it held the whole line
+    /// d.feed(b"2\n");
+    /// assert_eq!(d.next_frame()?, Some(&b"2"[..]));
+    /// assert!(d.capacity() <= 2 * READ_CHUNK); // and gave it back
+    /// # Ok::<(), rpc_io::FrameError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Bytes buffered and not yet returned or skipped.
     ///
     /// # Examples
@@ -369,6 +475,22 @@ impl Decoder {
     #[must_use]
     pub const fn buffered(&self) -> usize {
         self.end - self.start
+    }
+
+    /// Whether the decoder is inside a message: holding part of one, past
+    /// its headers, or skipping the rest of an oversized one.
+    #[cfg(feature = "net")]
+    pub(crate) fn in_message(&self) -> bool {
+        let fresh = match self.state {
+            State::Headers {
+                lines,
+                bytes,
+                length,
+            } => lines == 0 && bytes == 0 && length.is_none(),
+            State::Line => true,
+            State::Body { .. } | State::Skip { .. } | State::Discard => false,
+        };
+        self.buffered() > 0 || !fresh
     }
 
     /// The most memory the buffer can ever hold under these limits.
@@ -389,7 +511,7 @@ impl Decoder {
         } else {
             self.max_header_bytes
         };
-        largest.saturating_add(READ_CHUNK)
+        largest.saturating_add(self.chunk)
     }
 
     /// Where to put the next bytes read from the stream; follow with
@@ -397,8 +519,15 @@ impl Decoder {
     ///
     /// Empty until [`next_frame`](Decoder::next_frame) has returned
     /// `Ok(None)` (every complete message taken), and after a fatal error.
-    /// The slice is at least [`READ_CHUNK`] bytes otherwise, more while a large
-    /// body arrives.
+    /// The slice is at least the [read chunk](Decoder::with_read_chunk)
+    /// otherwise, more while a large body arrives.
+    ///
+    /// Shrink policy: once a buffer of at least four read chunks needs at
+    /// most a quarter of its size for what is still buffered plus the next
+    /// read, it is cut down to that and the rest is returned to the
+    /// allocator. A
+    /// 64 MiB message therefore costs 64 MiB while it is read, not for the
+    /// rest of the connection's life.
     ///
     /// # Examples
     ///
@@ -423,31 +552,45 @@ impl Decoder {
             self.end = 0;
             self.scan = 0;
         }
+        let chunk = self.chunk;
+        let have = self.end - self.start;
         let want = match self.state {
             State::Body { length } => {
-                let have = self.end - self.start;
                 let need = length.saturating_sub(have);
                 // Grow as the body arrives (doubling), never to the announced
                 // length on the header's word alone.
-                if need <= READ_CHUNK {
-                    READ_CHUNK
+                if need <= chunk {
+                    chunk
                 } else {
-                    need.min(have.max(READ_CHUNK))
+                    need.min(have.max(chunk))
                 }
             }
-            _ => READ_CHUNK,
+            _ => chunk,
         };
+        let keep = have.saturating_add(want);
+        let held = self.buf.capacity();
+        if held >= chunk.saturating_mul(SHRINK_CHUNKS) && held / 4 >= keep {
+            // A large message has been taken: give its memory back. While a
+            // message grows, what is buffered is at least half the buffer,
+            // so this never undoes growth in progress.
+            self.compact();
+            self.buf.truncate(keep);
+            self.buf.shrink_to_fit();
+        }
         if self.buf.len() - self.end < want {
-            if self.start > 0 {
-                self.buf.copy_within(self.start..self.end, 0);
-                self.end -= self.start;
-                self.scan -= self.start;
-                self.start = 0;
-            }
+            self.compact();
             let missing = want.saturating_sub(self.buf.len() - self.end);
             if missing > 0 {
-                self.buf.reserve_exact(missing);
-                self.buf.resize(self.buf.len() + missing, 0);
+                let len = self.buf.len();
+                let target = len.saturating_add(missing);
+                if target > held {
+                    // Reserve geometrically, so a line that arrives a chunk at
+                    // a time costs amortized linear copying, but never past
+                    // the memory bound.
+                    let grown = len.saturating_mul(2).min(self.memory_bound()).max(target);
+                    self.buf.reserve_exact(grown - len);
+                }
+                self.buf.resize(target, 0);
             }
         }
         &mut self.buf[self.end..]
@@ -566,6 +709,31 @@ impl Decoder {
         }
     }
 
+    /// A decoder for `framing` under `limits` that starts with the bytes this
+    /// one holds unread, when it stands between messages (as it does when a
+    /// handler stopped the endpoint); empty otherwise.
+    #[cfg(feature = "std")]
+    pub(crate) fn carried(&self, framing: Framing, limits: &Limits) -> Decoder {
+        let mut next = Decoder::new(framing, limits).with_read_chunk(self.chunk);
+        let between = self.failed.is_none() && self.state == Self::fresh(self.framing);
+        if between && self.start < self.end {
+            next.buf = self.buf[self.start..self.end].to_vec();
+            next.end = next.buf.len();
+            next.drained = false;
+        }
+        next
+    }
+
+    /// Moves the buffered bytes to the start of the buffer.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.scan -= self.start;
+            self.start = 0;
+        }
+    }
+
     fn fresh(framing: Framing) -> State {
         match framing {
             Framing::ContentLength => State::Headers {
@@ -620,128 +788,174 @@ impl Decoder {
             return Err(error);
         }
         loop {
-            match self.state {
+            let step = match self.state {
                 State::Headers {
                     lines,
                     bytes,
                     length,
-                } => {
-                    let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
-                        self.scan = self.end;
-                        let pending = self.end - self.start;
-                        if bytes.saturating_add(pending) > self.max_header_bytes {
-                            return Err(self.fail(FrameError::HeaderTooLarge {
-                                limit: self.max_header_bytes,
-                            }));
-                        }
-                        return Ok(self.wait());
-                    };
-                    let line_end = self.scan + at + 1;
-                    let line_len = line_end - self.start;
-                    let line = trim_line(&self.buf, self.start..line_end - 1);
-                    if line.is_empty() {
-                        self.start = line_end;
-                        self.scan = line_end;
-                        if lines == 0 {
-                            // Stray blank lines between messages are skipped.
-                            continue;
-                        }
-                        self.end_headers(length)?;
-                        continue;
-                    }
-                    let bytes = bytes.saturating_add(line_len);
-                    if bytes > self.max_header_bytes {
-                        return Err(self.fail(FrameError::HeaderTooLarge {
-                            limit: self.max_header_bytes,
-                        }));
-                    }
-                    let lines = lines + 1;
-                    if lines > self.max_headers {
-                        return Err(self.fail(FrameError::TooManyHeaders {
-                            limit: self.max_headers,
-                        }));
-                    }
-                    let length = match parse_header(&self.buf[line]) {
-                        Header::ContentLength(_) if length.is_some() => {
-                            return Err(self.fail(FrameError::DuplicateContentLength));
-                        }
-                        Header::ContentLength(n) => Some(n),
-                        Header::Other => length,
-                        Header::Invalid(error) => return Err(self.fail(error)),
-                    };
-                    self.start = line_end;
-                    self.scan = line_end;
-                    self.state = State::Headers {
-                        lines,
-                        bytes,
-                        length,
-                    };
+                } => self.step_headers(lines, bytes, length)?,
+                State::Body { length } => self.step_body(length),
+                State::Skip { remaining } => self.step_skip(remaining),
+                State::Line => self.step_line()?,
+                State::Discard => self.step_discard(),
+            };
+            match step {
+                Step::Again => {}
+                Step::Wait => return Ok(self.wait()),
+                Step::Frame(range) => return Ok(Some(range)),
+            }
+        }
+    }
+
+    /// One line of a Content-Length header section, or the blank line that
+    /// ends it.
+    fn step_headers(
+        &mut self,
+        lines: usize,
+        bytes: usize,
+        length: Option<u64>,
+    ) -> Result<Step, FrameError> {
+        let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
+            self.scan = self.end;
+            let pending = &self.buf[self.start..self.end];
+            // A lone `\r` before the first header line may be a stray blank
+            // line, which is not counted (below); anything else is.
+            let pending = if lines == 0 && pending == b"\r" {
+                0
+            } else {
+                pending.len()
+            };
+            if bytes.saturating_add(pending) > self.max_header_bytes {
+                return Err(self.fail(FrameError::HeaderTooLarge {
+                    limit: self.max_header_bytes,
+                }));
+            }
+            return Ok(Step::Wait);
+        };
+        let line_end = self.scan + at + 1;
+        let line_len = line_end - self.start;
+        let line = trim_line(&self.buf, self.start..line_end - 1);
+        // Every line of the section counts, its line end included, and so
+        // does the blank line that ends it: in pieces it is counted above
+        // as it arrives, so whole it must be too, or the outcome would
+        // depend on how the input was split.
+        let bytes = bytes.saturating_add(line_len);
+        if line.is_empty() {
+            self.start = line_end;
+            self.scan = line_end;
+            // Stray blank lines between messages are skipped, uncounted;
+            // after a header line, a blank line ends the section.
+            if lines > 0 {
+                if bytes > self.max_header_bytes {
+                    return Err(self.fail(FrameError::HeaderTooLarge {
+                        limit: self.max_header_bytes,
+                    }));
                 }
-                State::Body { length } => {
-                    if self.end - self.start < length {
-                        return Ok(self.wait());
-                    }
-                    let body = self.start..self.start + length;
-                    self.start += length;
-                    self.scan = self.start;
-                    self.state = Self::fresh(self.framing);
-                    return Ok(Some(body));
-                }
-                State::Skip { remaining } => {
-                    let available = (self.end - self.start) as u64;
-                    let take = available.min(remaining);
-                    // `take` is at most `available`, a `usize`.
-                    self.start += take as usize;
-                    self.scan = self.start;
-                    if take == remaining {
-                        self.state = Self::fresh(self.framing);
-                        continue;
-                    }
-                    self.state = State::Skip {
-                        remaining: remaining - take,
-                    };
-                    return Ok(self.wait());
-                }
-                State::Line => {
-                    let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
-                        self.scan = self.end;
-                        // The line so far, plus an `\r` that may precede its end.
-                        if self.end - self.start > self.max_message.saturating_add(1) {
-                            self.start = self.end;
-                            self.scan = self.end;
-                            self.state = State::Discard;
-                            return Err(self.line_too_large());
-                        }
-                        return Ok(self.wait());
-                    };
-                    let newline = self.scan + at;
-                    let line = trim_line(&self.buf, self.start..newline);
-                    self.start = newline + 1;
-                    self.scan = self.start;
-                    // Length before blankness, and no length in the error: a
-                    // line that arrives in pieces is judged on its length
-                    // alone (above), so a whole one must be too, or the
-                    // result would depend on how the input was split.
-                    if line.len() > self.max_message {
-                        return Err(self.line_too_large());
-                    }
-                    if is_blank(&self.buf[line.clone()]) {
-                        continue;
-                    }
-                    return Ok(Some(line));
-                }
-                State::Discard => match find_newline(&self.buf[self.scan..self.end]) {
-                    Some(at) => {
-                        self.start = self.scan + at + 1;
-                        self.scan = self.start;
-                        self.state = State::Line;
-                    }
-                    None => {
-                        self.start = self.end;
-                        self.scan = self.end;
-                        return Ok(self.wait());
-                    }
-                },
+                self.end_headers(length)?;
+            }
+            return Ok(Step::Again);
+        }
+        if bytes > self.max_header_bytes {
+            return Err(self.fail(FrameError::HeaderTooLarge {
+                limit: self.max_header_bytes,
+            }));
+        }
+        let lines = lines + 1;
+        if lines > self.max_headers {
+            return Err(self.fail(FrameError::TooManyHeaders {
+                limit: self.max_headers,
+            }));
+        }
+        let length = match parse_header(&self.buf[line]) {
+            Header::ContentLength(_) if length.is_some() => {
+                return Err(self.fail(FrameError::DuplicateContentLength));
+            }
+            Header::ContentLength(n) => Some(n),
+            Header::Other => length,
+            Header::Invalid(error) => return Err(self.fail(error)),
+        };
+        self.start = line_end;
+        self.scan = line_end;
+        self.state = State::Headers {
+            lines,
+            bytes,
+            length,
+        };
+        Ok(Step::Again)
+    }
+
+    /// A Content-Length body, once all of it is buffered.
+    fn step_body(&mut self, length: usize) -> Step {
+        if self.end - self.start < length {
+            return Step::Wait;
+        }
+        let body = self.start..self.start + length;
+        self.start += length;
+        self.scan = self.start;
+        self.state = Self::fresh(self.framing);
+        Step::Frame(body)
+    }
+
+    /// Drops what is buffered of an oversized Content-Length body.
+    fn step_skip(&mut self, remaining: u64) -> Step {
+        let available = (self.end - self.start) as u64;
+        let take = available.min(remaining);
+        // `take` is at most `available`, a `usize`.
+        self.start += take as usize;
+        self.scan = self.start;
+        if take == remaining {
+            self.state = Self::fresh(self.framing);
+            return Step::Again;
+        }
+        self.state = State::Skip {
+            remaining: remaining - take,
+        };
+        Step::Wait
+    }
+
+    /// One newline-delimited line.
+    fn step_line(&mut self) -> Result<Step, FrameError> {
+        let Some(at) = find_newline(&self.buf[self.scan..self.end]) else {
+            self.scan = self.end;
+            // The line so far, plus an `\r` that may precede its end.
+            if self.end - self.start > self.max_message.saturating_add(1) {
+                self.start = self.end;
+                self.scan = self.end;
+                self.state = State::Discard;
+                return Err(self.line_too_large());
+            }
+            return Ok(Step::Wait);
+        };
+        let newline = self.scan + at;
+        let line = trim_line(&self.buf, self.start..newline);
+        self.start = newline + 1;
+        self.scan = self.start;
+        // Length before blankness, and no length in the error: a line that
+        // arrives in pieces is judged on its length alone (above), so a whole
+        // one must be too, or the result would depend on how the input was
+        // split.
+        if line.len() > self.max_message {
+            return Err(self.line_too_large());
+        }
+        if is_blank(&self.buf[line.clone()]) {
+            return Ok(Step::Again);
+        }
+        Ok(Step::Frame(line))
+    }
+
+    /// Drops the rest of an oversized line, up to and including its `\n`.
+    fn step_discard(&mut self) -> Step {
+        match find_newline(&self.buf[self.scan..self.end]) {
+            Some(at) => {
+                self.start = self.scan + at + 1;
+                self.scan = self.start;
+                self.state = State::Line;
+                Step::Again
+            }
+            None => {
+                self.start = self.end;
+                self.scan = self.end;
+                Step::Wait
             }
         }
     }
@@ -757,6 +971,10 @@ impl Decoder {
                 self.state = State::Body { length: n };
                 Ok(())
             }
+            _ if length > self.max_skip => Err(self.fail(FrameError::TooLargeToSkip {
+                length,
+                limit: self.max_skip,
+            })),
             _ => {
                 self.state = State::Skip { remaining: length };
                 Err(FrameError::TooLarge {
@@ -940,7 +1158,14 @@ mod tests {
         input: &[u8],
         chunk: usize,
     ) -> Vec<Result<Vec<u8>, FrameError>> {
-        let mut d = framing.decoder(limits);
+        frames_with(&mut framing.decoder(limits), input, chunk)
+    }
+
+    fn frames_with(
+        d: &mut Decoder,
+        input: &[u8],
+        chunk: usize,
+    ) -> Vec<Result<Vec<u8>, FrameError>> {
         let mut out = Vec::new();
         let mut rest = input;
         loop {
@@ -956,6 +1181,7 @@ mod tests {
                     }
                 }
                 assert!(d.buf.len() <= d.memory_bound());
+                assert!(d.buf.capacity() <= d.memory_bound());
             }
             if rest.is_empty() {
                 break;
@@ -1087,6 +1313,35 @@ mod tests {
     }
 
     #[test]
+    fn test_body_over_the_skip_limit_is_fatal() {
+        let limits = Limits::new()
+            .with_max_message_bytes(4)
+            .with_max_skip_bytes(10);
+        let mut input = b"Content-Length: 10\r\n\r\n0123456789".to_vec();
+        input.extend_from_slice(b"Content-Length: 11\r\n\r\n");
+        let got = frames(Framing::ContentLength, &limits, &input, 5);
+        let error = FrameError::TooLargeToSkip {
+            length: 11,
+            limit: 10,
+        };
+        assert_eq!(
+            got,
+            vec![
+                Err(FrameError::TooLarge {
+                    length: Some(10),
+                    limit: 4
+                }),
+                Err(error)
+            ]
+        );
+        assert!(!error.is_recoverable());
+        assert_eq!(
+            alloc::string::ToString::to_string(&error),
+            "a message of 11 bytes is over the skip limit of 10"
+        );
+    }
+
+    #[test]
     fn test_newline_basic() {
         let input = b"\n  \r\n{\"a\":1}\r\n[2]\n\n3";
         let got = frames(Framing::Newline, &Limits::new(), input, 2);
@@ -1129,6 +1384,68 @@ mod tests {
         assert_eq!(d.next_frame(), Ok(None));
         // The header alone does not reserve 60 MB.
         assert!(d.space().len() <= 2 * READ_CHUNK);
+    }
+
+    #[test]
+    fn test_buffer_shrinks_after_a_large_message() {
+        for framing in [Framing::ContentLength, Framing::Newline] {
+            let mut d = framing.decoder(&Limits::new());
+            let mut wire = Vec::new();
+            framing.encode(&vec![b'7'; 10_000_000], &mut wire);
+            for _ in 0..1000 {
+                framing.encode(b"[1]", &mut wire);
+            }
+            let mut rest = wire.as_slice();
+            let mut frames = 0;
+            let mut peak = 0;
+            while !rest.is_empty() {
+                let n = d.feed(rest);
+                rest = &rest[n..];
+                peak = peak.max(d.capacity());
+                while let Ok(Some(_)) = d.next_frame() {
+                    frames += 1;
+                }
+            }
+            assert_eq!(frames, 1001, "{framing:?}");
+            assert!(peak >= 10_000_000, "{framing:?}: {peak}");
+            assert!(
+                d.capacity() <= 2 * READ_CHUNK,
+                "{framing:?}: {}",
+                d.capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_keeps_its_size_while_a_message_grows() {
+        // A line arriving a chunk at a time: the buffer must not be shrunk
+        // between reads (that would make the growth quadratic).
+        let mut d = Framing::Newline.decoder(&Limits::new());
+        let mut last = 0;
+        for _ in 0..64 {
+            let space = d.space();
+            let n = space.len().min(READ_CHUNK);
+            space[..n].fill(b'x');
+            d.commit(n);
+            assert_eq!(d.next_frame(), Ok(None));
+            assert!(d.capacity() >= last);
+            last = d.capacity();
+        }
+        assert!(d.buffered() >= 64 * READ_CHUNK - READ_CHUNK);
+    }
+
+    #[test]
+    fn test_read_chunk_is_configurable() {
+        let mut d = Framing::Newline.decoder(&Limits::new()).with_read_chunk(0);
+        assert_eq!(d.read_chunk(), 1);
+        assert_eq!(d.space().len(), 1);
+        let mut d = Framing::ContentLength
+            .decoder(&Limits::new().with_max_message_bytes(10))
+            .with_read_chunk(3);
+        assert_eq!(d.memory_bound(), Limits::new().max_header_bytes + 3);
+        let got = frames_with(&mut d, b"Content-Length: 2\r\n\r\nok", 100);
+        assert_eq!(got, vec![Ok(b"ok".to_vec())]);
+        assert!(d.capacity() <= d.memory_bound());
     }
 
     #[test]

@@ -1,12 +1,17 @@
 //! # rpc-io
 //!
-//! A JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP and
-//! DAP (Content-Length framing), MCP over stdio (newline framing), and service
-//! APIs. Build a [`Router`] of handlers, hand it a byte stream, and the crate
-//! does the rest: framing, the envelope, batches, id correlation, cancellation,
-//! and the error codes the specification prescribes, with bounded buffers and
-//! no panics on any input. JSON is [`jsonx_lib`], the family's own; there are
-//! no third-party runtime dependencies.
+//! A JSON-RPC 2.0 engine for the protocols editors and tools speak: LSP
+//! (Content-Length framing), MCP over stdio (newline framing), and JSON-RPC
+//! service APIs. Build a [`Router`] of handlers, hand it a byte stream, and the
+//! crate does the rest: framing, the envelope, batches, id correlation,
+//! cancellation, deadlines, and the error codes the specification prescribes,
+//! with bounded buffers and no panics on any input. JSON is [`jsonx_lib`], the
+//! family's own; the default build has no third-party runtime dependency.
+//!
+//! The Content-Length framing ([`Framing::ContentLength`], [`Decoder`]) is
+//! also the base protocol of the Debug Adapter Protocol and cuts DAP messages
+//! as well. DAP's messages themselves (`seq`, `type`, `command`) are not
+//! JSON-RPC, so the endpoint does not serve DAP: only the framing applies.
 //!
 //! ## Quick start
 //!
@@ -38,8 +43,9 @@
 //! ## Layers
 //!
 //! - **Framing** ([`Framing`], [`Decoder`]): cuts message bodies out of a
-//!   byte stream and frames them back. The decoder is sans-IO and holds at
-//!   most one message plus a read chunk, whatever the peer sends.
+//!   byte stream and frames them back. The decoder is sans-IO, holds at most
+//!   one message plus a read chunk whatever the peer sends, and gives memory
+//!   back after a large message.
 //! - **Messages** ([`decode`], [`Message`], [`Incoming`], [`Invalid`]):
 //!   one pass of `jsonx_lib`'s pull reader per body; `params` and `result`
 //!   stay borrowed slices ([`Raw`]) until a handler parses them.
@@ -47,13 +53,24 @@
 //!   deadlines and a capacity, every operation `O(log n)`.
 //! - **Endpoint** (`Endpoint`, `Router`, `Peer`, `Call`, `Responder`): the
 //!   dispatcher, both directions, with cancellation (`Cancellation`,
-//!   `CancelToken`) and an opening-request `Gate`. Needs `std`.
+//!   `CancelToken`), an opening-request `Gate`, self-firing deadlines, an
+//!   interceptor, and `Stats`. `run` reads a blocking stream; `next_read`,
+//!   `commit`, and `finish` take it apart for any other kind; `run_async`
+//!   reads an async one (`futures-io`). `Call` is a `Future`. Needs `std`.
+//! - **Output** (`Sink`, `Framed`, `Queued`, `outbox`): where messages go.
+//!   `Queued` writes from its own thread and `outbox` from an async task,
+//!   behind `QueueLimits`, so a peer that stops reading blocks no sender
+//!   while the connection is open; closing waits for the drain outside the
+//!   endpoint's lock, for at most `QueueLimits::close_timeout`.
+//!   Needs `std`.
+//! - **Serving** (`serve`, and `Server` with the `net` feature): one call
+//!   over a byte stream, or an accept loop over TCP and Unix sockets.
 //!
 //! ## Policies
 //!
-//! - **Every request gets exactly one response; no notification gets one.**
-//!   A malformed message is answered under its own id when that id could be
-//!   read, and under `null` otherwise, as JSON-RPC 2.0 requires.
+//! - **Every request gets exactly one response; no valid notification gets
+//!   one.** A malformed message is answered under its own id when that id
+//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires.
 //! - **Handler panics are contained.** A request whose handler panics is
 //!   answered with `INTERNAL_ERROR` (the panic message goes to the event
 //!   hook, never to the peer), and the endpoint keeps serving. This needs
@@ -63,9 +80,21 @@
 //!
 //! ## Features
 //!
-//! - `std` (default): the endpoint, its handles, and the blocking adapter.
-//!   Without it the crate is `no_std` (needs `alloc`): framing, the message
-//!   model, and the correlation map.
+//! - `std` (default): the endpoint, its handles, `serve`, the queued and
+//!   async-drained sinks, and the progress helpers. Without it the crate is
+//!   `no_std` (needs `alloc`): framing, the message model, and the
+//!   correlation map.
+//! - `serde`: typed params and results ([`Router::request_typed`],
+//!   `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed`),
+//!   through `serde` and `serde_json`.
+//! - `futures-io`: the async adapter over `futures-io`'s traits
+//!   (`Endpoint::run_async`, `Outbox::write_to`); runtime-agnostic.
+//! - `tracing`: spans for every call and events for what the endpoint does
+//!   on its own; without it the instrumentation compiles to nothing.
+//! - `net`: `Server`, an accept loop over TCP and Unix domain sockets.
+//!
+//! Every optional feature is off by default, and adds only the crates it
+//! names and their own dependencies.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -90,6 +119,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "futures-io")]
+mod aio;
 mod error_object;
 mod framing;
 mod id;
@@ -110,9 +141,23 @@ mod handles;
 #[cfg(feature = "std")]
 mod link;
 #[cfg(feature = "std")]
+mod progress;
+#[cfg(feature = "std")]
+mod queue;
+#[cfg(feature = "std")]
 mod router;
+#[cfg(feature = "net")]
+mod server;
 #[cfg(feature = "std")]
 mod sink;
+#[cfg(feature = "std")]
+mod slot;
+#[cfg(feature = "std")]
+mod stats;
+#[cfg(feature = "std")]
+mod trace;
+#[cfg(feature = "serde")]
+mod typed;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};
@@ -129,7 +174,7 @@ pub use raw::{Json, Raw};
 pub use config::{Cancellation, Config, Gate};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use endpoint::{End, Endpoint, Flow, serve};
+pub use endpoint::{End, Endpoint, Flow, Next, serve};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use error::{CallError, Error};
@@ -138,10 +183,22 @@ pub use error::{CallError, Error};
 pub use handles::{Call, CancelToken, Canceller, Peer, Responder};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use router::{Context, Event, Params, Router};
+pub use progress::{Progress, WorkDone};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use sink::{Framed, Sink};
+pub use queue::{Outbox, OutboxSink, QueueLimits, Queued, outbox};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use router::{Context, Event, Params, Router};
+#[cfg(feature = "net")]
+#[cfg_attr(docsrs, doc(cfg(feature = "net")))]
+pub use server::{Connection, Server, Stopper};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use sink::{Drain, Framed, Sink};
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+pub use stats::Stats;
 
 /// Compiles and runs the `rust` code blocks in `README.md` and `docs/API.md` as
 /// part of `cargo test`, so the published examples cannot drift from the API.

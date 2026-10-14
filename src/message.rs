@@ -459,9 +459,10 @@ pub type Entry<'a> = Result<Message<'a>, Invalid<'a>>;
 
 /// A decoded message body: one message, or a batch.
 ///
-/// A body that is not valid JSON, an empty batch, and a batch over
-/// [`Limits::max_batch`] are each a single [`Invalid`] (answered with one
-/// error, as JSON-RPC 2.0 prescribes), never a batch.
+/// A body that is not valid JSON, an empty batch, a batch over
+/// [`Limits::max_batch`], and any batch while batches are off are each a
+/// single [`Invalid`] (answered with one error, as JSON-RPC 2.0 prescribes),
+/// never a batch.
 ///
 /// # Examples
 ///
@@ -486,7 +487,12 @@ pub enum Incoming<'a> {
 ///
 /// The body is validated as JSON in full before anything is returned, so a
 /// batch with a syntax error anywhere is a single `PARSE_ERROR`, as JSON-RPC
-/// 2.0 requires. Envelope rules, beyond the specification's:
+/// 2.0 requires; with two exceptions, both refused early so that a batch's
+/// size cannot drive the work done: a batch is refused with one
+/// `INVALID_REQUEST` as soon as it passes [`Limits::max_batch`] (the rest is
+/// not read, so a syntax error after that point is not reported), and at its
+/// `[` when batches are off (`max_batch` 0). Envelope rules, beyond the
+/// specification's:
 ///
 /// - `"jsonrpc"` must be exactly `"2.0"`; unknown members are ignored; a
 ///   repeated envelope member makes the message invalid (two readers could
@@ -550,6 +556,13 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
 
 /// Decodes the elements of a batch, the reader just past its `[`.
 fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Incoming<'a> {
+    if max == 0 {
+        // Batches are off: refused at the `[`, unread.
+        return Incoming::Single(Err(Invalid::request(
+            None,
+            ErrorObject::invalid_request("batches are not accepted"),
+        )));
+    }
     let mut entries = Vec::new();
     loop {
         let event = match reader.next_event() {
@@ -727,7 +740,18 @@ fn read_id(raw: &str) -> IdValue<'_> {
 /// notification); `None` when absent, repeated, or not a valid id.
 #[cfg(feature = "std")]
 pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser) -> Option<Id<'a>> {
-    let mut reader = parser.reader(params);
+    match read_id(read_member(params, member, parser)?) {
+        IdValue::Valid(id) => Some(id),
+        IdValue::Null | IdValue::Invalid => None,
+    }
+}
+
+/// The raw value of member `member` of the object `object`; `None` when
+/// `object` is not an object, or the member is absent or repeated (two
+/// values: acting on either could be wrong).
+#[cfg(feature = "std")]
+pub(crate) fn read_member<'a>(object: &'a str, member: &str, parser: &Parser) -> Option<&'a str> {
+    let mut reader = parser.reader(object);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return None;
     }
@@ -737,18 +761,20 @@ pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser)
             Ok(Some(Event::Key(key))) => {
                 let raw = reader.read_raw().ok()??;
                 if *key == *member && found.replace(raw).is_some() {
-                    // Two targets: cancelling either could be the wrong one.
                     return None;
                 }
             }
-            Ok(Some(Event::EndObject)) => break,
+            Ok(Some(Event::EndObject)) => return found,
             _ => return None,
         }
     }
-    match read_id(found?) {
-        IdValue::Valid(id) => Some(id),
-        IdValue::Null | IdValue::Invalid => None,
-    }
+}
+
+/// Whether `raw` (validated JSON) is a string or an integer within `i64`:
+/// what JSON-RPC ids and progress tokens may be.
+#[cfg(feature = "std")]
+pub(crate) fn is_token(raw: &str) -> bool {
+    matches!(read_id(raw), IdValue::Valid(_))
 }
 
 /// The text of a raw JSON string, borrowed when it has no escapes; `None` if

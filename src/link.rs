@@ -6,15 +6,25 @@
 //! Everything sits behind one mutex. Handles on other threads send through it
 //! directly, so a deferred reply or a notification from a worker goes out at
 //! once, even while the endpoint's own thread is blocked reading. The lock is
-//! held only to encode and hand a message to the sink, never while user code
-//! (a handler or event hook) runs. One connection's traffic is serial on the
-//! wire anyway, so a single lock costs nothing a lock-free design would save.
+//! held to encode a message and hand it to the sink, never while a handler or
+//! event hook runs. One connection's traffic is serial on the wire anyway, so
+//! a single lock costs nothing a lock-free design would save, as long as the
+//! sink does not block: a sink that writes to a slow peer holds the lock for
+//! the write, which is why [`Queued`](crate::Queued) exists.
+//!
+//! Deadlines fire on their own: the first request with one starts a timer
+//! thread that sleeps until the earliest is due, expires it, and sleeps again.
+//! It holds only a weak reference, so it never keeps the connection alive,
+//! and it stops when the connection closes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     io, mem,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
@@ -27,13 +37,16 @@ use crate::{
     id::Id,
     message::{write_call, write_numbered_call, write_response},
     pending::Pending,
-    raw::{Json, Raw},
-    sink::Sink,
+    raw::Json,
+    sink::{Drain, Sink},
+    slot::{self, Outcome, Slot, Waiter},
+    stats::{Stats, Tally, bump},
     text,
+    trace::event,
 };
 
-/// How one of our requests ended.
-pub(crate) type Outcome = Result<Raw<'static>, CallError>;
+/// The encoding buffer is released after a message that grew it past this.
+const SCRATCH_KEEP: usize = 64 * 1024;
 
 /// What the handles need from the shared state, with the sink type erased.
 pub(crate) trait Link: Send + Sync {
@@ -53,30 +66,42 @@ pub(crate) trait Link: Send + Sync {
     ) -> Result<(), Error>;
     fn on_endpoint_thread(&self) -> bool;
     fn is_closed(&self) -> bool;
+    fn stats(&self) -> Stats;
 }
 
 /// A request just sent: its id, where its outcome arrives, its deadline.
 pub(crate) struct Issued {
     pub(crate) id: u64,
-    pub(crate) outcome: mpsc::Receiver<Outcome>,
+    pub(crate) outcome: Arc<Slot>,
     pub(crate) deadline: Option<Instant>,
 }
 
 pub(crate) struct Shared<K> {
     inner: Mutex<Inner<K>>,
+    timer: Arc<Timer>,
+    /// `Inner::closed`, readable without the lock.
+    closed: Arc<AtomicBool>,
 }
 
 impl<K: Sink> Shared<K> {
     pub(crate) fn new(sink: K, config: &Config) -> Arc<Self> {
-        Arc::new(Self {
+        let timer = Arc::new(Timer::default());
+        let closed = Arc::new(AtomicBool::new(false));
+        Arc::new_cyclic(|me| Self {
+            timer: Arc::clone(&timer),
+            closed: Arc::clone(&closed),
             inner: Mutex::new(Inner {
+                me: Weak::clone(me),
+                timer,
+                closed_flag: closed,
                 sink,
+                sink_closed: false,
                 closed: false,
                 broken: None,
                 corked: false,
                 scratch: String::new(),
                 pending: Pending::new(config.max_pending),
-                in_flight: BTreeMap::new(),
+                in_flight: IdMap::default(),
                 batches: BTreeMap::new(),
                 next_batch: 0,
                 gate: if config.gate.is_some() {
@@ -85,7 +110,9 @@ impl<K: Sink> Shared<K> {
                     GateState::Open
                 },
                 held: Vec::new(),
+                held_bytes: 0,
                 held_requests: BTreeSet::new(),
+                stats: Stats::default(),
                 settings: Settings::from(config),
                 epoch: Instant::now(),
                 endpoint_thread: None,
@@ -97,6 +124,18 @@ impl<K: Sink> Shared<K> {
     /// [`Sink`]; the state is still usable, so the poison is ignored.
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner<K>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the connection is closed, without taking the lock: a sender
+    /// stuck in a slow sink does not hold this up.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+impl<K> Drop for Shared<K> {
+    fn drop(&mut self) {
+        self.timer.stop();
     }
 }
 
@@ -135,7 +174,11 @@ impl<K: Sink> Link for Shared<K> {
     }
 
     fn is_closed(&self) -> bool {
-        self.lock().closed
+        Shared::is_closed(self)
+    }
+
+    fn stats(&self) -> Stats {
+        self.lock().stats()
     }
 }
 
@@ -144,6 +187,8 @@ pub(crate) struct Settings {
     pub(crate) cancellation: Option<Cancellation>,
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) max_in_flight: usize,
+    pub(crate) max_held_bytes: usize,
+    pub(crate) timer: bool,
 }
 
 impl From<&Config> for Settings {
@@ -152,8 +197,76 @@ impl From<&Config> for Settings {
             cancellation: config.cancellation.clone(),
             request_timeout: config.request_timeout,
             max_in_flight: config.max_in_flight,
+            max_held_bytes: config.max_held_bytes,
+            timer: config.timer,
         }
     }
+}
+
+/// When the timer thread should next wake, and whether it runs.
+#[derive(Default)]
+struct Timer {
+    state: Mutex<TimerState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct TimerState {
+    /// The earliest deadline it knows of (it may have been settled since;
+    /// waking for nothing is harmless).
+    due: Option<Instant>,
+    running: bool,
+    stopped: bool,
+}
+
+impl Timer {
+    fn lock(&self) -> MutexGuard<'_, TimerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends the timer thread, for good.
+    fn stop(&self) {
+        self.lock().stopped = true;
+        self.wake.notify_all();
+    }
+}
+
+/// The timer thread: sleeps until the earliest deadline, expires what is due,
+/// and asks the state for the next one. Ends when the timer is stopped or the
+/// shared state is gone.
+fn run_timer<K: Sink>(timer: &Timer, shared: &Weak<Shared<K>>) {
+    let mut state = timer.lock();
+    while !state.stopped {
+        let Some(due) = state.due else {
+            state = timer
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            continue;
+        };
+        let now = Instant::now();
+        if due > now {
+            state = timer
+                .wake
+                .wait_timeout(state, due - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            continue;
+        }
+        state.due = None;
+        drop(state);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        {
+            let mut inner = shared.lock();
+            inner.expire();
+            inner.arm();
+        }
+        drop(shared);
+        state = timer.lock();
+    }
+    state.running = false;
 }
 
 /// Where the gate is.
@@ -171,6 +284,54 @@ pub(crate) enum GateState {
 struct InFlight {
     token: CancelToken,
     batch: Option<u64>,
+}
+
+/// Deferred requests by id. Integer and string ids are kept apart, so a
+/// lookup borrows the id it is given (`&str` for a string) instead of copying
+/// it into an owned key.
+struct IdMap<V> {
+    numbers: BTreeMap<i64, V>,
+    strings: BTreeMap<Box<str>, V>,
+}
+
+impl<V> Default for IdMap<V> {
+    fn default() -> Self {
+        Self {
+            numbers: BTreeMap::new(),
+            strings: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> IdMap<V> {
+    fn len(&self) -> usize {
+        self.numbers.len() + self.strings.len()
+    }
+
+    fn contains(&self, id: &Id<'_>) -> bool {
+        match id {
+            Id::Number(n) => self.numbers.contains_key(n),
+            Id::String(s) => self.strings.contains_key(&**s),
+        }
+    }
+
+    fn insert(&mut self, id: Id<'_>, value: V) -> Option<V> {
+        match id {
+            Id::Number(n) => self.numbers.insert(n, value),
+            Id::String(s) => self.strings.insert(s.into_owned().into_boxed_str(), value),
+        }
+    }
+
+    fn remove(&mut self, id: &Id<'_>) -> Option<V> {
+        match id {
+            Id::Number(n) => self.numbers.remove(n),
+            Id::String(s) => self.strings.remove(&**s),
+        }
+    }
+
+    fn into_values(self) -> impl Iterator<Item = V> {
+        self.numbers.into_values().chain(self.strings.into_values())
+    }
 }
 
 /// A batch being answered: responses so far, and how many are still owed.
@@ -194,7 +355,14 @@ enum Sending {
 }
 
 pub(crate) struct Inner<K> {
+    /// The state this sits in, for the timer thread.
+    me: Weak<Shared<K>>,
+    timer: Arc<Timer>,
+    /// Mirrors `closed` for `Shared::is_closed`.
+    closed_flag: Arc<AtomicBool>,
     sink: K,
+    /// Whether `Sink::close` was called.
+    sink_closed: bool,
     closed: bool,
     /// The first failure of the sink, for the endpoint's thread to report.
     broken: Option<io::Error>,
@@ -203,15 +371,19 @@ pub(crate) struct Inner<K> {
     corked: bool,
     /// Reused buffer every message is encoded in.
     scratch: String,
-    pending: Pending<mpsc::Sender<Outcome>>,
-    in_flight: BTreeMap<Id<'static>, InFlight>,
+    pending: Pending<Waiter>,
+    in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
     next_batch: u64,
     pub(crate) gate: GateState,
     held: Vec<Held>,
+    /// The bytes of the bodies in `held`.
+    held_bytes: usize,
     /// Ids of our requests in `held` and not abandoned since: lookups stay
     /// `O(log n)` however much is held.
     held_requests: BTreeSet<u64>,
+    /// The counters; the gauges are filled in by `stats`.
+    stats: Stats,
     pub(crate) settings: Settings,
     epoch: Instant,
     /// The thread inside the endpoint's `handle` or `run`, if any.
@@ -225,6 +397,27 @@ impl<K: Sink> Inner<K> {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// A snapshot of the counters, with the gauges as they are now.
+    pub(crate) fn stats(&self) -> Stats {
+        Stats {
+            pending: self.pending.len(),
+            in_flight: self.in_flight.len(),
+            held: self.held.len(),
+            ..self.stats
+        }
+    }
+
+    /// Counts an incoming body (or, with `tally.body` unset, a message the
+    /// framing skipped).
+    pub(crate) fn take_in(&mut self, tally: &Tally) {
+        self.stats.take_in(tally);
+    }
+
+    /// Counts a contained handler panic.
+    pub(crate) fn count_panic(&mut self) {
+        bump(&mut self.stats.panics);
     }
 
     /// Replaces the settings and the capacity of the pending map (kept if
@@ -252,6 +445,34 @@ impl<K: Sink> Inner<K> {
             .and_then(|at| self.epoch.checked_add(at))
     }
 
+    /// Makes sure the timer thread wakes for the earliest deadline, starting
+    /// it if it is not running. Without a thread (the timer is off, or one
+    /// could not be started) deadlines are enforced lazily, as `expire` says.
+    fn arm(&mut self) {
+        if !self.settings.timer || self.closed {
+            return;
+        }
+        let Some(due) = self.next_deadline() else {
+            return;
+        };
+        let mut timer = self.timer.lock();
+        if timer.stopped {
+            return;
+        }
+        if timer.due.is_none_or(|at| due < at) {
+            timer.due = Some(due);
+            self.timer.wake.notify_all();
+        }
+        if !timer.running {
+            let shared = Weak::clone(&self.me);
+            let thread_timer = Arc::clone(&self.timer);
+            let started = thread::Builder::new()
+                .name("rpc-io-timer".into())
+                .spawn(move || run_timer(&thread_timer, &shared));
+            timer.running = started.is_ok();
+        }
+    }
+
     pub(crate) fn cork(&mut self) {
         self.corked = true;
     }
@@ -276,39 +497,58 @@ impl<K: Sink> Inner<K> {
         self.broken.take()
     }
 
-    /// Closes the connection: flushes, then tells every waiter it is over.
-    pub(crate) fn close(&mut self) {
+    /// Closes the connection: closes the sink (flushing it), tells every
+    /// waiter it is over, and returns what the caller waits for once it has
+    /// released the lock (the sink's [`Drain`]).
+    pub(crate) fn close(&mut self) -> Option<Drain> {
         if self.closed {
-            return;
+            return None;
         }
-        if let Err(error) = guard(|| self.sink.flush()) {
+        if let Err(error) = self.close_sink() {
             let _closed = self.fail(error);
         }
         self.shut();
+        let drain = panic::catch_unwind(AssertUnwindSafe(|| self.sink.drain()));
+        drain.unwrap_or(None)
+    }
+
+    /// Closes the sink, once: at the close, or after a send failed.
+    fn close_sink(&mut self) -> io::Result<()> {
+        if mem::replace(&mut self.sink_closed, true) {
+            return Ok(());
+        }
+        guard(|| self.sink.close())
     }
 
     /// Marks the connection closed and releases everything waiting on it.
     fn shut(&mut self) {
+        event!(debug, "the connection is closed");
         self.closed = true;
+        self.closed_flag.store(true, Ordering::Release);
+        self.timer.stop();
         for (_, waiter) in self.pending.drain() {
-            // A waiter that dropped its `Call` has nothing to be told.
-            let _gone = waiter.send(Err(CallError::Closed));
+            waiter.send(Err(CallError::Closed));
         }
-        for (_, request) in mem::take(&mut self.in_flight) {
+        for request in mem::take(&mut self.in_flight).into_values() {
             // Workers still answering see the cancellation and can stop.
             request.token.cancel();
         }
         self.batches.clear();
         self.held.clear();
         self.held_requests.clear();
+        self.held_bytes = 0;
     }
 
     /// Records a sink failure and closes; returns the error for the sender.
     fn fail(&mut self, error: io::Error) -> Error {
+        event!(warn, error = %error, "the transport failed; closing the connection");
         let copy = io::Error::new(error.kind(), error.to_string());
         if self.broken.is_none() {
             self.broken = Some(error);
         }
+        // Best effort: the sink failed already, but it still gets to release
+        // what it holds.
+        let _released = self.close_sink();
         self.shut();
         Error::Io(copy)
     }
@@ -319,6 +559,16 @@ impl<K: Sink> Inner<K> {
             return Err(Error::Closed);
         }
         if self.gate != GateState::Open && !matches!(sending, Sending::Response) {
+            let bytes = self.held_bytes.saturating_add(self.scratch.len());
+            if bytes > self.settings.max_held_bytes {
+                event!(
+                    warn,
+                    held = self.held.len(),
+                    "too much is held behind the gate; a message was refused"
+                );
+                return Err(Error::Backlog);
+            }
+            self.held_bytes = bytes;
             let request = match sending {
                 Sending::Request(id) => Some(id),
                 _ => None,
@@ -332,12 +582,24 @@ impl<K: Sink> Inner<K> {
             });
             return Ok(());
         }
+        bump(&mut self.stats.bodies_out);
+        self.stats.bytes_out = self.stats.bytes_out.wrapping_add(self.scratch.len() as u64);
+        match sending {
+            Sending::Request(_) => bump(&mut self.stats.requests_out),
+            Sending::Notification => bump(&mut self.stats.notifications_out),
+            // Counted one by one in `respond`, batch elements included.
+            Sending::Response => {}
+        }
         let mut sent = guard(|| self.sink.send(&self.scratch));
         // Inside a turn the endpoint flushes once at its end; a message from
         // any other thread (a worker answering, a progress report) must not
         // wait for a handler that may run for seconds.
         if sent.is_ok() && (!self.corked || !self.on_endpoint_thread()) {
             sent = guard(|| self.sink.flush());
+        }
+        if self.scratch.capacity() > SCRATCH_KEEP {
+            // A large message or batch grew the buffer; keep the usual size.
+            self.scratch = String::new();
         }
         sent.map_err(|error| self.fail(error))
     }
@@ -361,7 +623,7 @@ impl<K: Sink> Inner<K> {
             return Err(Error::Closed);
         }
         self.expire();
-        let (waiter, outcome) = mpsc::channel();
+        let (waiter, outcome) = slot::slot();
         let deadline = timeout
             .or(self.settings.request_timeout)
             .and_then(|t| self.now().checked_add(t));
@@ -374,6 +636,9 @@ impl<K: Sink> Inner<K> {
         if let Err(error) = self.deliver(Sending::Request(id)) {
             let _unsent = self.pending.settle(id);
             return Err(error);
+        }
+        if deadline.is_some() {
+            self.arm();
         }
         Ok(Issued {
             id,
@@ -409,8 +674,7 @@ impl<K: Sink> Inner<K> {
         }
         match self.pending.settle(id) {
             Some(waiter) => {
-                // A waiter that dropped its `Call` did not want the answer.
-                let _gone = waiter.send(outcome);
+                waiter.send(outcome);
                 true
             }
             None => false,
@@ -419,13 +683,28 @@ impl<K: Sink> Inner<K> {
 
     /// Ends a request removed from `pending` without an answer: tells the peer
     /// to stop (unless it was never sent), and tells the waiter why.
-    fn abandon(&mut self, id: u64, waiter: mpsc::Sender<Outcome>, reason: CallError) {
+    fn abandon(&mut self, id: u64, waiter: Waiter, reason: CallError) {
+        match reason {
+            CallError::TimedOut => {
+                bump(&mut self.stats.timed_out);
+                event!(debug, id, "our request timed out");
+            }
+            CallError::Evicted => {
+                bump(&mut self.stats.evicted);
+                event!(
+                    warn,
+                    id,
+                    "our oldest request was evicted: too many are outstanding"
+                );
+            }
+            _ => bump(&mut self.stats.cancelled_out),
+        }
         // Never sent: its held body is skipped when the gate opens, and the
         // peer has nothing to cancel.
         if !self.held_requests.remove(&id) && !self.closed {
             self.send_cancel(id);
         }
-        let _gone = waiter.send(Err(reason));
+        waiter.send(Err(reason));
     }
 
     /// Sends the cancel notification for our request `id`. Best effort: if
@@ -454,6 +733,10 @@ impl<K: Sink> Inner<K> {
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Closed);
+        }
+        bump(&mut self.stats.responses_out);
+        if result.is_err() {
+            bump(&mut self.stats.errors_out);
         }
         self.scratch.clear();
         write_response(&mut self.scratch, id, result);
@@ -504,6 +787,7 @@ impl<K: Sink> Inner<K> {
     fn settle_gate(&mut self, succeeded: bool) {
         let held = mem::take(&mut self.held);
         let live = mem::take(&mut self.held_requests);
+        self.held_bytes = 0;
         if succeeded {
             self.gate = GateState::Open;
             for message in held {
@@ -511,7 +795,10 @@ impl<K: Sink> Inner<K> {
                     continue;
                 }
                 self.scratch = message.body;
-                if self.deliver(Sending::Notification).is_err() {
+                let sending = message
+                    .request
+                    .map_or(Sending::Notification, Sending::Request);
+                if self.deliver(sending).is_err() {
                     break;
                 }
             }
@@ -520,7 +807,7 @@ impl<K: Sink> Inner<K> {
             for message in held {
                 if let Some(id) = message.request.filter(|id| live.contains(id)) {
                     if let Some(waiter) = self.pending.settle(id) {
-                        let _gone = waiter.send(Err(CallError::Cancelled));
+                        waiter.send(Err(CallError::Cancelled));
                     }
                 }
             }
@@ -543,8 +830,7 @@ impl<K: Sink> Inner<K> {
 
     /// Whether a deferred request with this id is being answered.
     pub(crate) fn in_flight(&self, id: &Id<'_>) -> bool {
-        // Most sessions defer nothing: no copy of the id is made then.
-        !self.in_flight.is_empty() && self.in_flight.contains_key(&id.clone().into_owned())
+        self.in_flight.contains(id)
     }
 
     /// Records a deferred request; `None` when too many are in flight.
@@ -583,9 +869,10 @@ impl<K: Sink> Inner<K> {
     /// The peer cancelled its request `id`: sets its token and answers it as
     /// the cancellation settings say. `false` if it is not in flight.
     pub(crate) fn cancel_incoming(&mut self, id: &Id<'_>) -> bool {
-        let Some(request) = self.in_flight.remove(&id.clone().into_owned()) else {
+        let Some(request) = self.in_flight.remove(id) else {
             return false;
         };
+        bump(&mut self.stats.cancelled_in);
         request.token.cancel();
         let reply = self.settings.cancellation.as_ref().and_then(|c| c.reply);
         let _sent = match reply {

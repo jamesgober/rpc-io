@@ -4,11 +4,13 @@
 
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvTimeoutError, TryRecvError},
     },
+    task::{self, Poll},
     thread,
     time::{Duration, Instant},
 };
@@ -19,8 +21,10 @@ use crate::{
     error::{CallError, Error},
     error_object::ErrorObject,
     id::Id,
-    link::{Link, Outcome},
+    link::Link,
     raw::{Json, Raw},
+    slot::{Outcome, Slot},
+    stats::Stats,
 };
 
 /// A flag that says a request was cancelled.
@@ -222,6 +226,7 @@ impl Peer {
             outcome: issued.outcome,
             deadline: issued.deadline,
             link: Arc::clone(&self.link),
+            detached: false,
         })
     }
 
@@ -242,6 +247,27 @@ impl Peer {
     pub fn is_closed(&self) -> bool {
         self.link.is_closed()
     }
+
+    /// The connection's counters and gauges; see [`Stats`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// let peer = endpoint.peer();
+    /// peer.notify("hello", ())?;
+    /// let _call = peer.request("ask", ())?;
+    /// let stats = peer.stats();
+    /// assert_eq!((stats.notifications_out, stats.requests_out, stats.pending), (1, 1, 1));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        self.link.stats()
+    }
 }
 
 impl fmt::Debug for Peer {
@@ -255,8 +281,22 @@ impl fmt::Debug for Peer {
 /// One of our requests, awaiting its answer.
 ///
 /// Ends in exactly one outcome: the peer's result, or a [`CallError`]
-/// (rejected, timed out, cancelled, evicted, connection closed). Dropping a
-/// `Call` does not cancel the request; its answer is then discarded.
+/// (rejected, timed out, cancelled, evicted, connection closed).
+///
+/// Dropping a `Call` before its outcome cancels the request, as
+/// [`cancel`](Call::cancel) does: its pending slot is freed at once and the
+/// peer is sent the cancel notification. That is what a dropped future
+/// means in async code (a `select!` that took another branch), and it keeps
+/// abandoned calls from filling [`Config::max_pending`](crate::Config) and
+/// evicting live ones. To send a request and not wait for its answer, keep
+/// it outstanding with [`detach`](Call::detach), or send a notification.
+///
+/// Wait for it by blocking ([`wait`](Call::wait)), by polling
+/// ([`try_wait`](Call::try_wait)), or by `.await`ing it: `Call` is a
+/// [`Future`] on any executor, woken when the outcome arrives (deadlines
+/// included, which fire on their own; see
+/// [`Config::timer`](crate::Config)). Once the future has returned its
+/// outcome, polling again returns [`CallError::Closed`].
 ///
 /// # Examples
 ///
@@ -271,11 +311,14 @@ impl fmt::Debug for Peer {
 /// assert_eq!(call.wait().map(|raw| raw.as_str().to_owned()), Ok("[42]".to_owned()));
 /// # Ok::<(), rpc_io::Error>(())
 /// ```
+#[must_use = "dropping a Call cancels the request; call .detach() to let it run"]
 pub struct Call {
     id: u64,
-    outcome: mpsc::Receiver<Outcome>,
+    outcome: Arc<Slot>,
     deadline: Option<Instant>,
     link: Arc<dyn Link>,
+    /// Kept outstanding when dropped (see `detach`).
+    detached: bool,
 }
 
 impl Call {
@@ -336,25 +379,23 @@ impl Call {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn wait(self) -> Result<Raw<'static>, CallError> {
-        match self.outcome.try_recv() {
-            Ok(outcome) => return outcome,
-            Err(TryRecvError::Disconnected) => return Err(CallError::Closed),
-            Err(TryRecvError::Empty) => {}
+        if let Some(outcome) = self.outcome.try_take() {
+            return outcome;
         }
         if self.link.on_endpoint_thread() {
             return Err(CallError::WouldDeadlock);
         }
         if let Some(deadline) = self.deadline {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.outcome.recv_timeout(left) {
-                Ok(outcome) => return outcome,
-                Err(RecvTimeoutError::Disconnected) => return Err(CallError::Closed),
-                // Due: expiring delivers `TimedOut` (or the answer, if it won
-                // the race), so the blocking receive below returns at once.
-                Err(RecvTimeoutError::Timeout) => self.link.expire(),
+            if let Some(outcome) = self.outcome.wait_until(Some(deadline)) {
+                return outcome;
             }
+            // Due: expiring delivers `TimedOut` (or the answer, if it won the
+            // race), so the blocking wait below returns at once.
+            self.link.expire();
         }
-        self.outcome.recv().unwrap_or(Err(CallError::Closed))
+        self.outcome
+            .wait_until(None)
+            .unwrap_or(Err(CallError::Closed))
     }
 
     /// The outcome if it has arrived, or the call back to try again later.
@@ -381,11 +422,33 @@ impl Call {
         if self.deadline.is_some_and(|d| d <= Instant::now()) {
             self.link.expire();
         }
-        match self.outcome.try_recv() {
-            Ok(outcome) => Ok(outcome),
-            Err(TryRecvError::Disconnected) => Ok(Err(CallError::Closed)),
-            Err(TryRecvError::Empty) => Err(self),
+        match self.outcome.try_take() {
+            Some(outcome) => Ok(outcome),
+            None => Err(self),
         }
+    }
+
+    /// Lets the request run without a waiter: it stays outstanding until it
+    /// is answered (the answer is then discarded), times out (the peer is
+    /// told to cancel), or is evicted. Dropping the `Call` instead would
+    /// cancel it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    /// endpoint.peer().request("index", ())?.detach();
+    /// assert_eq!(endpoint.stats().pending, 1); // still outstanding
+    /// drop(endpoint.peer().request("cancel me", ())?); // cancelled
+    /// assert_eq!(endpoint.stats().pending, 1);
+    /// assert_eq!(rx.try_iter().count(), 3); // two requests, one cancel
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    pub fn detach(mut self) {
+        self.detached = true;
     }
 
     /// Cancels the request: the peer is sent the cancel notification and the
@@ -436,6 +499,45 @@ impl Call {
     }
 }
 
+impl Drop for Call {
+    /// Cancels the request if it has no outcome yet and was not detached.
+    fn drop(&mut self) {
+        if !self.detached && !self.outcome.is_filled() {
+            // `false` when it ended meanwhile: nothing left to cancel.
+            let _cancelled = self.link.cancel(self.id);
+        }
+    }
+}
+
+impl Future for Call {
+    type Output = Outcome;
+
+    /// The outcome once it has arrived.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{future::Future, pin::pin, task::{Context, Poll, Waker}};
+    /// use rpc_io::{Endpoint, Router};
+    ///
+    /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, Router::new(), ());
+    /// let mut call = pin!(endpoint.peer().request("x", ())?);
+    /// let mut cx = Context::from_waker(Waker::noop());
+    /// assert!(call.as_mut().poll(&mut cx).is_pending());
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":"yes"}"#)?;
+    /// let Poll::Ready(outcome) = call.as_mut().poll(&mut cx) else { panic!() };
+    /// assert_eq!(outcome.map(|raw| raw.as_str().to_owned()), Ok(r#""yes""#.to_owned()));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Outcome> {
+        if self.deadline.is_some_and(|d| d <= Instant::now()) {
+            self.link.expire();
+        }
+        self.outcome.poll(cx)
+    }
+}
+
 impl fmt::Debug for Call {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Call")
@@ -475,8 +577,10 @@ impl Canceller {
     /// let (tx, _rx) = std::sync::mpsc::channel::<String>();
     /// let endpoint = rpc_io::Endpoint::new(tx, rpc_io::Router::new(), ()); // keep it: dropping an endpoint closes it
     /// let peer = endpoint.peer();
-    /// let canceller = peer.request("x", ())?.canceller();
+    /// let call = peer.request("x", ())?;
+    /// let canceller = call.canceller();
     /// assert!(canceller.cancel());
+    /// # drop(call);
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn cancel(&self) -> bool {

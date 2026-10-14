@@ -11,9 +11,11 @@ use crate::{error_object::ErrorCode, limits::Limits};
 /// | `limits` | [`Limits::new`] | budgets on incoming messages |
 /// | `max_pending` | 1024 | our requests awaiting answers; one more evicts the oldest |
 /// | `max_in_flight` | 1024 | deferred requests being answered; more are refused with `SERVER_OVERLOADED` |
+/// | `max_held_bytes` | 4 MiB | messages this side sends while the gate is shut, held until it opens |
 /// | `request_timeout` | none | deadline for our requests that set none themselves |
 /// | `cancellation` | [`Cancellation::lsp`] | the cancel notification, both ways; `None` turns cancellation off |
 /// | `gate` | none | an opening request every other request must wait for |
+/// | `timer` | `true` | deadlines fire on their own, from a helper thread |
 ///
 /// `#[non_exhaustive]`: start from [`Config::new`] and chain `with_*`.
 ///
@@ -39,12 +41,28 @@ pub struct Config {
     pub max_pending: usize,
     /// Most deferred requests being answered at once.
     pub max_in_flight: usize,
+    /// Most bytes of messages held back while the [`Gate`] is shut. A send
+    /// past it fails with [`Error::Backlog`](crate::Error::Backlog) and is
+    /// not held.
+    pub max_held_bytes: usize,
     /// The deadline for our requests that do not set their own.
     pub request_timeout: Option<Duration>,
     /// How cancellation is spelled, or `None` for none.
     pub cancellation: Option<Cancellation>,
     /// The opening request, if the protocol has one.
     pub gate: Option<Gate>,
+    /// Whether our requests' deadlines fire on their own. On (the default),
+    /// the first request with a deadline starts a timer thread for the
+    /// connection, which ends each due request with
+    /// [`CallError::TimedOut`](crate::CallError::TimedOut) and sends the
+    /// peer the cancel notification even while nothing arrives; it sleeps
+    /// between deadlines and stops when the connection closes. Off, a
+    /// deadline is enforced only when it is next looked at: when the endpoint
+    /// handles a message, at the next request, in
+    /// [`Call::wait`](crate::Call::wait) and
+    /// [`try_wait`](crate::Call::try_wait), when an awaited `Call` is polled,
+    /// or by [`Endpoint::expire`](crate::Endpoint::expire).
+    pub timer: bool,
 }
 
 impl Config {
@@ -61,9 +79,11 @@ impl Config {
             limits: Limits::new(),
             max_pending: 1024,
             max_in_flight: 1024,
+            max_held_bytes: 4 * 1024 * 1024,
             request_timeout: None,
             cancellation: Some(Cancellation::lsp()),
             gate: None,
+            timer: true,
         }
     }
 
@@ -106,6 +126,19 @@ impl Config {
     #[must_use]
     pub fn with_max_in_flight(mut self, count: usize) -> Self {
         self.max_in_flight = count;
+        self
+    }
+
+    /// Sets `max_held_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Config::new().with_max_held_bytes(1 << 10).max_held_bytes, 1 << 10);
+    /// ```
+    #[must_use]
+    pub fn with_max_held_bytes(mut self, bytes: usize) -> Self {
+        self.max_held_bytes = bytes;
         self
     }
 
@@ -153,6 +186,58 @@ impl Config {
         self.gate = gate;
         self
     }
+
+    /// Sets `timer`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(!rpc_io::Config::new().with_timer(false).timer);
+    /// ```
+    #[must_use]
+    pub fn with_timer(mut self, timer: bool) -> Self {
+        self.timer = timer;
+        self
+    }
+}
+
+impl Config {
+    /// An LSP server: [`Limits::lsp`], [`Cancellation::lsp`], and
+    /// [`Gate::lsp`]. A client leaves the gate out (`with_gate(None)`): the
+    /// gate belongs on the side that receives `initialize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = rpc_io::Config::lsp();
+    /// assert_eq!(config.gate.map(|g| g.method), Some("initialize".into()));
+    /// assert_eq!(config.cancellation.map(|c| c.method), Some("$/cancelRequest".into()));
+    /// ```
+    #[must_use]
+    pub fn lsp() -> Self {
+        Self::new()
+            .with_limits(Limits::lsp())
+            .with_cancellation(Some(Cancellation::lsp()))
+            .with_gate(Some(Gate::lsp()))
+    }
+
+    /// An MCP server: [`Limits::mcp`] (batches off), [`Cancellation::mcp`],
+    /// and [`Gate::mcp`]. A client leaves the gate out (`with_gate(None)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = rpc_io::Config::mcp();
+    /// assert_eq!(config.limits.max_batch, 0);
+    /// assert_eq!(config.cancellation.map(|c| c.id_member), Some("requestId".into()));
+    /// ```
+    #[must_use]
+    pub fn mcp() -> Self {
+        Self::new()
+            .with_limits(Limits::mcp())
+            .with_cancellation(Some(Cancellation::mcp()))
+            .with_gate(Some(Gate::mcp()))
+    }
 }
 
 impl Default for Config {
@@ -185,9 +270,9 @@ impl Default for Config {
 /// assert_eq!((lsp.method.as_ref(), lsp.id_member.as_ref()), ("$/cancelRequest", "id"));
 /// assert_eq!(lsp.reply, Some(ErrorCode::REQUEST_CANCELLED));
 ///
-/// // LexerSketch's API (specs/STUDIO.md §7.1): `$/cancel {id}`, error 1005.
-/// let studio = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
-/// assert_eq!(studio.reply, Some(ErrorCode(1005)));
+/// // A service API of your own: `$/cancel {id}`, answered with error 1005.
+/// let custom = Cancellation::new("$/cancel", "id", Some(ErrorCode(1005)));
+/// assert_eq!(custom.reply, Some(ErrorCode(1005)));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -251,12 +336,13 @@ impl Cancellation {
 }
 
 /// An opening request that must succeed before anything else is served (LSP's
-/// `initialize`, MCP's `initialize`, LexerSketch's `auth`).
+/// `initialize`, MCP's `initialize`, a service's own `auth`).
 ///
 /// Until the opening request has been answered successfully:
 ///
 /// - other requests are answered with `code` (default
-///   [`SERVER_NOT_INITIALIZED`](ErrorCode::SERVER_NOT_INITIALIZED));
+///   [`SERVER_NOT_INITIALIZED`](ErrorCode::SERVER_NOT_INITIALIZED)), except
+///   the methods in `allow_requests` (MCP's `ping`);
 /// - notifications are dropped (reported as [`Event::Dropped`](crate::Event)),
 ///   except the methods in `allow` (LSP's `exit`);
 /// - everything this side sends other than responses (notifications and
@@ -275,8 +361,10 @@ impl Cancellation {
 /// receives the opening request; on the side that sends it, it would hold that
 /// side's own messages forever.
 ///
-/// Held messages are kept in memory without a limit (only requests are
-/// bounded, by [`Config::max_pending`]): send little before the gate opens.
+/// Held messages are bounded by [`Config::max_held_bytes`]: a send that would
+/// take them past it fails with [`Error::Backlog`](crate::Error::Backlog)
+/// (and a request that fails so is not outstanding). Held requests also count
+/// against [`Config::max_pending`].
 ///
 /// # Examples
 ///
@@ -296,6 +384,8 @@ pub struct Gate {
     pub code: ErrorCode,
     /// Notifications delivered even before the gate opens.
     pub allow: Vec<Cow<'static, str>>,
+    /// Requests served even before the gate opens (MCP's `ping`).
+    pub allow_requests: Vec<Cow<'static, str>>,
 }
 
 impl Gate {
@@ -312,7 +402,53 @@ impl Gate {
             method: method.into(),
             code: ErrorCode::SERVER_NOT_INITIALIZED,
             allow: Vec::new(),
+            allow_requests: Vec::new(),
         }
+    }
+
+    /// LSP's: `initialize`, with `exit` let through (a client may end a
+    /// server it never initialized).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Gate::lsp().allow, ["exit"]);
+    /// ```
+    #[must_use]
+    pub fn lsp() -> Self {
+        Self::new("initialize").allow("exit")
+    }
+
+    /// MCP's: `initialize`, with the `ping` request served before it (MCP
+    /// allows pings at any time).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Gate::mcp().allow_requests, ["ping"]);
+    /// ```
+    #[must_use]
+    pub fn mcp() -> Self {
+        Self::new("initialize").allow_request("ping")
+    }
+
+    /// Serves the request `method` before the gate opens.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let gate = rpc_io::Gate::new("auth").allow_request("version");
+    /// assert_eq!(gate.allow_requests, ["version"]);
+    /// ```
+    #[must_use]
+    pub fn allow_request(mut self, method: impl Into<Cow<'static, str>>) -> Self {
+        self.allow_requests.push(method.into());
+        self
+    }
+
+    /// Whether the request `method` is served before the gate opens.
+    pub(crate) fn allows_request(&self, method: &str) -> bool {
+        self.allow_requests.iter().any(|m| m == method)
     }
 
     /// Lets the notification `method` through before the gate opens.

@@ -1,7 +1,7 @@
 //! [`Sink`]: where an endpoint's outgoing messages go, and [`Framed`], the
 //! sink that frames them onto a byte stream.
 
-use std::{io, io::Write, sync::mpsc};
+use std::{fmt, io, io::Write, sync::mpsc};
 
 use crate::framing::Framing;
 
@@ -11,13 +11,23 @@ use crate::framing::Framing;
 /// or a batch, compact JSON, no framing); the sink frames and transmits it.
 /// [`flush`](Sink::flush) is called after each incoming message has been
 /// handled, and after each message sent from another thread, so a sink may
-/// buffer within a turn and write once.
+/// buffer within a turn and write once. [`close`](Sink::close) is called once:
+/// when the endpoint closes, or after a send or flush failed.
 ///
 /// The endpoint calls the sink with its internal lock held, from whichever
-/// thread sends: a sink must not call back into the endpoint or its handles.
+/// thread sends: a sink must not call back into the endpoint or its handles,
+/// and a sink that blocks (a write to a peer that is not reading) blocks
+/// every sender for as long. [`Queued`](crate::Queued) and
+/// [`outbox`](crate::outbox) do not wait on the peer: they queue, within
+/// limits, and write from elsewhere. A sink with writes still in flight when
+/// it closes returns a [`Drain`] from [`drain`](Sink::drain), which the
+/// closing thread waits on after releasing the lock.
 ///
-/// Implemented for [`Framed`] (a byte stream) and `mpsc::Sender<String>`
-/// (one `String` per message, for message-oriented transports and tests).
+/// Implemented for [`Framed`] (a byte stream, written by the sender),
+/// [`Queued`](crate::Queued) (a byte stream, written by its own thread),
+/// [`OutboxSink`](crate::OutboxSink) (written by an async task), and
+/// `mpsc::Sender<String>` (one `String` per message, for message-oriented
+/// transports and tests).
 ///
 /// # Examples
 ///
@@ -54,6 +64,89 @@ pub trait Sink: Send + 'static {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+
+    /// Ends the output: transmits anything buffered and releases what the
+    /// sink holds. Called once, when the endpoint closes or a send fails;
+    /// nothing is sent after it. Called with the endpoint's lock held, so it
+    /// must not wait on the peer: a sink that needs to wait for its output to
+    /// be written returns that wait from [`drain`](Sink::drain). The default
+    /// flushes.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error. The endpoint is closing either way; the error is
+    /// reported like one from [`send`](Sink::send).
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+
+    /// What closing waits for once the endpoint's lock is released: taken
+    /// right after [`close`](Sink::close) when the endpoint closes, and run
+    /// with no lock held, so handles on other threads are not held up by it.
+    /// `None` (the default) waits for nothing. [`Queued`](crate::Queued)
+    /// waits here for its queue to drain, within its `close_timeout`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io;
+    /// use rpc_io::{Drain, Sink};
+    ///
+    /// /// Hands messages to a worker; closing waits for it, outside the lock.
+    /// struct Worker(Option<std::thread::JoinHandle<()>>, std::sync::mpsc::Sender<String>);
+    ///
+    /// impl Sink for Worker {
+    ///     fn send(&mut self, message: &str) -> io::Result<()> {
+    ///         self.1.send(message.to_owned()).map_err(|_| io::ErrorKind::BrokenPipe.into())
+    ///     }
+    ///     fn drain(&mut self) -> Option<Drain> {
+    ///         let worker = self.0.take()?;
+    ///         Some(Drain::new(move || { let _joined = worker.join(); }))
+    ///     }
+    /// }
+    /// ```
+    fn drain(&mut self) -> Option<Drain> {
+        None
+    }
+}
+
+/// A wait the endpoint runs after it closed its sink and released its lock:
+/// see [`Sink::drain`].
+///
+/// # Examples
+///
+/// ```
+/// let mut done = false;
+/// let drain = rpc_io::Drain::new(move || done = true);
+/// drain.wait();
+/// ```
+pub struct Drain(Box<dyn FnOnce() + Send>);
+
+impl Drain {
+    /// A wait that runs `wait`.
+    ///
+    /// # Examples
+    ///
+    /// See [`Drain`].
+    #[must_use]
+    pub fn new(wait: impl FnOnce() + Send + 'static) -> Self {
+        Self(Box::new(wait))
+    }
+
+    /// Runs the wait.
+    ///
+    /// # Examples
+    ///
+    /// See [`Drain`].
+    pub fn wait(self) {
+        (self.0)();
+    }
+}
+
+impl fmt::Debug for Drain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Drain").finish_non_exhaustive()
+    }
 }
 
 impl Sink for mpsc::Sender<String> {
@@ -68,15 +161,18 @@ impl Sink for mpsc::Sender<String> {
 }
 
 /// Above this many buffered bytes a turn's output is written before the turn
-/// ends, so a handler that sends a great deal holds a bounded buffer.
+/// ends, so a handler that sends a great deal holds a bounded buffer: the
+/// default of [`Framed::with_flush_threshold`].
 const WRITE_AT: usize = 64 * 1024;
 
 /// A [`Sink`] that frames messages onto a byte stream: stdout, a socket, a
 /// pipe.
 ///
 /// Messages are framed into a reused buffer and written with one `write_all`
-/// and one `flush` per turn (and whenever more than 64 KiB is waiting), so a
-/// handler that sends ten notifications costs one system call, not ten.
+/// and one `flush` per turn (and whenever more than the flush threshold, 64
+/// KiB by default, is waiting), so a handler that sends ten notifications
+/// costs one system call, not ten. A buffer grown past twice the threshold
+/// by one large message is released once that message is written.
 ///
 /// # Examples
 ///
@@ -95,6 +191,7 @@ pub struct Framed<W> {
     writer: W,
     framing: Framing,
     out: Vec<u8>,
+    write_at: usize,
 }
 
 impl<W: Write> Framed<W> {
@@ -112,7 +209,44 @@ impl<W: Write> Framed<W> {
             writer,
             framing,
             out: Vec::new(),
+            write_at: WRITE_AT,
         }
+    }
+
+    /// Sets how many framed bytes may wait in the buffer before they are
+    /// written, even mid-turn (64 KiB by default; at least 1). Lower it to
+    /// bound memory per connection, raise it to batch more writes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Framed, Framing, Sink};
+    ///
+    /// let mut framed = Framed::new(Vec::new(), Framing::Newline).with_flush_threshold(4);
+    /// assert_eq!(framed.flush_threshold(), 4);
+    /// framed.send("[1,2]")?; // 6 framed bytes: written at once
+    /// assert_eq!(framed.get_ref().as_slice(), b"[1,2]\n");
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_flush_threshold(mut self, bytes: usize) -> Self {
+        self.write_at = bytes.max(1);
+        self
+    }
+
+    /// The flush threshold: buffered bytes that are written before a turn
+    /// ends.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let framed = rpc_io::Framed::new(Vec::<u8>::new(), rpc_io::Framing::Newline);
+    /// assert_eq!(framed.flush_threshold(), 64 * 1024);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn flush_threshold(&self) -> usize {
+        self.write_at
     }
 
     /// The framing.
@@ -176,6 +310,10 @@ impl<W: Write> Framed<W> {
         }
         let result = self.writer.write_all(&self.out);
         self.out.clear();
+        if self.out.capacity() > self.write_at.saturating_mul(2) {
+            // One large message grew the buffer; keep only the usual size.
+            self.out.shrink_to(self.write_at);
+        }
         result
     }
 }
@@ -183,7 +321,7 @@ impl<W: Write> Framed<W> {
 impl<W: Write + Send + 'static> Sink for Framed<W> {
     fn send(&mut self, message: &str) -> io::Result<()> {
         self.framing.encode(message.as_bytes(), &mut self.out);
-        if self.out.len() >= WRITE_AT {
+        if self.out.len() >= self.write_at {
             self.write_out()?;
         }
         Ok(())
@@ -207,6 +345,16 @@ mod tests {
         assert!(framed.send(&big).is_ok());
         assert_eq!(framed.get_ref().len(), WRITE_AT + 1);
         assert!(framed.out.is_empty());
+    }
+
+    #[test]
+    fn test_framed_releases_a_buffer_grown_by_one_large_message() {
+        let mut framed = Framed::new(io::sink(), Framing::ContentLength);
+        let big = "x".repeat(10 * WRITE_AT);
+        assert!(framed.send(&big).is_ok());
+        assert!(framed.out.capacity() <= 2 * WRITE_AT);
+        assert!(framed.send("{}").is_ok() && framed.flush().is_ok());
+        assert!(framed.out.capacity() <= 2 * WRITE_AT);
     }
 
     #[test]

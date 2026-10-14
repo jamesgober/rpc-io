@@ -1,0 +1,446 @@
+//! The outgoing path: a peer that stops reading must not stall the endpoint
+//! or its handles, and must cost bounded memory and time.
+#![cfg(feature = "std")]
+
+mod common;
+
+use std::{
+    io::{self, Write},
+    sync::{Arc, mpsc},
+    task::{Context, Poll, Wake, Waker},
+    thread,
+    time::{Duration, Instant},
+};
+
+use common::{Shared, pipe};
+use rpc_io::{
+    CallError, End, Endpoint, Error, Framed, Framing, QueueLimits, Queued, Router, outbox,
+};
+
+/// A writer that blocks every write until released, like a peer that has
+/// stopped reading from a full pipe.
+struct Stalled {
+    release: mpsc::Receiver<()>,
+    written: Shared,
+    /// Told each time a write begins, when set.
+    entered: Option<mpsc::Sender<()>>,
+}
+
+impl Write for Stalled {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(entered) = &self.entered {
+            let _told = entered.send(());
+        }
+        if self.release.recv().is_err() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "released"));
+        }
+        self.written.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn stalled(limits: QueueLimits) -> (Queued, mpsc::Sender<()>, Shared) {
+    let (sink, release, written, _entered) = stalled_watched(limits, false);
+    (sink, release, written)
+}
+
+/// As `stalled`, and with `watch`, a receiver told when each write begins.
+fn stalled_watched(
+    limits: QueueLimits,
+    watch: bool,
+) -> (Queued, mpsc::Sender<()>, Shared, mpsc::Receiver<()>) {
+    let (release, wait) = mpsc::channel();
+    let (entered, writes) = mpsc::channel();
+    let written = Shared::default();
+    let writer = Stalled {
+        release: wait,
+        written: written.clone(),
+        entered: watch.then_some(entered),
+    };
+    match Queued::with_limits(writer, Framing::Newline, limits) {
+        Ok(sink) => (sink, release, written, writes),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// Runs `f` on another thread; `None` if it does not return within `limit`.
+fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (done, result) = mpsc::channel();
+    let _worker = thread::spawn(move || done.send(f()));
+    result.recv_timeout(limit).ok()
+}
+
+#[test]
+fn test_stalled_peer_does_not_stall_the_handles() {
+    // Found by the audit (RPC-SEC-01, probe P4): with the write under the
+    // endpoint's lock, a peer that stopped reading froze every handle.
+    let (sink, release, written) = stalled(QueueLimits::new());
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    let peer = endpoint.peer();
+    assert!(peer.notify("first", ()).is_ok()); // the writer is now stuck on it
+    let worker = peer.clone();
+    let sent = within(Duration::from_secs(30), move || {
+        (0..100).all(|_| worker.notify("more", ()).is_ok()) && !worker.is_closed()
+    });
+    assert_eq!(
+        sent,
+        Some(true),
+        "a handle blocked behind the stalled write"
+    );
+    for _ in 0..200 {
+        let _go = release.send(());
+    }
+    drop(endpoint);
+    drop(peer);
+    let text = written.text();
+    assert_eq!(text.lines().count(), 101, "{text}");
+    assert!(text.starts_with("{\"jsonrpc\":\"2.0\",\"method\":\"first\"}\n"));
+}
+
+#[test]
+fn test_is_closed_does_not_wait_for_a_blocked_sink() {
+    // Even with a sink that writes under the lock, `is_closed` reads a flag.
+    struct Blocking(mpsc::Receiver<()>);
+    impl Write for Blocking {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _woken = self.0.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (release, wait) = mpsc::channel();
+    let endpoint = Endpoint::new(
+        Framed::new(Blocking(wait), Framing::Newline),
+        Router::<()>::new(),
+        (),
+    );
+    let peer = endpoint.peer();
+    let sender = peer.clone();
+    let _blocked = thread::spawn(move || sender.notify("stuck", ()));
+    thread::sleep(Duration::from_millis(50));
+    let watcher = peer.clone();
+    assert_eq!(
+        within(Duration::from_secs(30), move || watcher.is_closed()),
+        Some(false)
+    );
+    drop(release);
+}
+
+#[test]
+fn test_overflowing_queue_closes_the_connection() {
+    let limits = QueueLimits::new().with_max_messages(4);
+    let (sink, release, _written) = stalled(limits);
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    let peer = endpoint.peer();
+    let call = peer.request("pending", ());
+    let Ok(call) = call else {
+        panic!("request failed")
+    };
+    let mut results = Vec::new();
+    for _ in 0..10 {
+        results.push(peer.notify("n", ()).map_err(|e| e.to_string()));
+    }
+    assert!(results[..3].iter().all(Result::is_ok), "{results:?}");
+    assert!(
+        results[3]
+            .as_ref()
+            .is_err_and(|e| e.contains("the output queue is full")),
+        "{results:?}"
+    );
+    assert!(peer.is_closed());
+    assert!(matches!(peer.notify("late", ()), Err(Error::Closed)));
+    assert_eq!(call.wait(), Err(CallError::Closed));
+    drop(release);
+}
+
+#[test]
+fn test_stalled_write_times_out_and_closes() {
+    let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(30)));
+    let (sink, release, _written, writes) = stalled_watched(limits, true);
+    let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(endpoint.peer().notify("stuck", ()).is_ok());
+    // The write timeout runs from when the writer took the batch, which is
+    // before it entered the write: once it has, a sleep past the timeout is
+    // enough, however loaded the machine.
+    assert!(writes.recv_timeout(Duration::from_secs(30)).is_ok());
+    thread::sleep(Duration::from_millis(80));
+    let result = endpoint.peer().notify("next", ());
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+        "{result:?}"
+    );
+    assert!(endpoint.is_closed());
+    // Closing again does not wait on the stuck writer.
+    let started = Instant::now();
+    endpoint.close();
+    drop(endpoint);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(release);
+}
+
+#[test]
+fn test_serve_writes_everything_before_returning() {
+    let (to_server, server_in) = pipe();
+    let (to_client, mut client_in) = pipe();
+    let server = thread::spawn(move || {
+        let router = Router::new()
+            .request("echo", |_: &mut (), params, _| {
+                Ok(params
+                    .into_raw()
+                    .map_or(rpc_io::Raw::NULL, rpc_io::Raw::into_owned))
+            })
+            .notification("exit", |_, _, cx| cx.stop());
+        rpc_io::serve(server_in, to_client, Framing::Newline, router)
+    });
+    let mut to_server = to_server;
+    let mut wire = String::new();
+    for i in 0..500 {
+        wire.push_str(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{i},\"method\":\"echo\",\"params\":[{i}]}}\n"
+        ));
+    }
+    wire.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}\n");
+    assert!(to_server.write_all(wire.as_bytes()).is_ok());
+    assert!(matches!(server.join().ok(), Some(Ok(End::Stopped))));
+    // `serve` has returned: its output is complete and the stream has ended.
+    let mut answers = String::new();
+    assert!(io::Read::read_to_string(&mut client_in, &mut answers).is_ok());
+    assert_eq!(answers.lines().count(), 500);
+    assert!(answers.ends_with("{\"jsonrpc\":\"2.0\",\"id\":499,\"result\":[499]}\n"));
+}
+
+#[test]
+fn test_outbox_carries_an_endpoint_and_ends_when_it_closes() {
+    let mut cx = Context::from_waker(Waker::noop());
+    let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    let (sink, mut outbox) = outbox(Framing::ContentLength, QueueLimits::new());
+    let mut endpoint = Endpoint::new(sink, router, ());
+    assert!(
+        endpoint
+            .handle(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .is_ok()
+    );
+    let mut wire = Vec::new();
+    let mut take = |outbox: &mut rpc_io::Outbox, wire: &mut Vec<u8>| loop {
+        match outbox.poll_chunk(&mut cx) {
+            Poll::Ready([]) => return true,
+            Poll::Ready(chunk) => {
+                let n = chunk.len().min(7); // a writer that takes 7 bytes at a time
+                wire.extend_from_slice(&chunk[..n]);
+                outbox.consume(n);
+            }
+            Poll::Pending => return false,
+        }
+    };
+    assert!(!take(&mut outbox, &mut wire));
+    assert_eq!(
+        wire,
+        b"Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}"
+    );
+    endpoint.close();
+    assert!(take(&mut outbox, &mut wire), "the outbox did not end");
+}
+
+#[test]
+fn test_dropped_outbox_closes_the_endpoint() {
+    let (sink, outbox) = outbox(Framing::Newline, QueueLimits::new());
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    drop(outbox);
+    assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Io(_))));
+    assert!(endpoint.is_closed());
+}
+
+#[test]
+fn test_outbox_task_is_woken_by_a_message_and_by_the_close() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            let _previous = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let (sink, mut outbox) = outbox(Framing::Newline, QueueLimits::new());
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(outbox.poll_chunk(&mut cx).is_pending());
+    assert!(endpoint.peer().notify("x", ()).is_ok());
+    assert_eq!(count.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(outbox.poll_chunk(&mut cx), Poll::Ready(chunk) if !chunk.is_empty()));
+    outbox.consume(usize::MAX);
+    assert!(outbox.poll_chunk(&mut cx).is_pending());
+    drop(endpoint);
+    assert_eq!(count.0.load(Ordering::SeqCst), 2);
+    assert!(matches!(outbox.poll_chunk(&mut cx), Poll::Ready([])));
+}
+
+#[test]
+fn test_an_unbounded_close_timeout_drains_everything() {
+    // Found by the verifier (RPC3-003): `Duration::MAX` overflowed the
+    // deadline, which was then read as already passed, and closing waited
+    // for nothing.
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::MAX);
+    let (sink, release, written) = stalled(limits);
+    let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    for _ in 0..3 {
+        assert!(endpoint.peer().notify("queued", ()).is_ok());
+    }
+    let (closing, closed) = mpsc::channel();
+    let closer = thread::spawn(move || {
+        endpoint.close();
+        let _sent = closing.send(());
+    });
+    // Still waiting while the writer is stuck.
+    assert!(closed.recv_timeout(Duration::from_millis(300)).is_err());
+    for _ in 0..10 {
+        let _go = release.send(());
+    }
+    assert!(closed.recv_timeout(Duration::from_secs(30)).is_ok());
+    assert!(closer.join().is_ok());
+    assert_eq!(written.text().lines().count(), 3, "{}", written.text());
+}
+
+#[test]
+fn test_close_with_a_stalled_writer_holds_up_no_other_thread() {
+    // Found by the verifier (RPC2-001): closing drained the queue under the
+    // endpoint's lock, so a worker answering during the close waited for the
+    // whole drain, and forever with no write timeout.
+    // No close timeout at all: the close cannot end before the writer is
+    // released, so the worker is seen answering while it is in progress,
+    // whatever the scheduling.
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::MAX);
+    let (sink, release, _written) = stalled(limits);
+    let router =
+        Router::<Vec<rpc_io::Responder>>::new().deferred("later", |held, _, _, r| held.push(r));
+    let mut endpoint = Endpoint::new(sink, router, Vec::new());
+    assert!(
+        endpoint
+            .handle(br#"{"jsonrpc":"2.0","id":1,"method":"later"}"#)
+            .is_ok()
+    );
+    assert!(endpoint.peer().notify("stuck", ()).is_ok()); // the writer blocks on it
+    let Some(responder) = endpoint.state_mut().pop() else {
+        panic!("no responder")
+    };
+    let peer = endpoint.peer();
+    let (closing, closed) = mpsc::channel();
+    let closer = thread::spawn(move || {
+        endpoint.close();
+        let _sent = closing.send(());
+        endpoint
+    });
+    // The close has begun once the connection reads as closed.
+    let begun = Instant::now();
+    while !peer.is_closed() {
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "the close never began"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    // While the close waits for the stuck writer, the worker's answer is
+    // refused instead of waiting for the lock.
+    let answered = within(Duration::from_secs(30), move || responder.ok(1));
+    assert!(matches!(answered, Some(Err(Error::Closed))), "{answered:?}");
+    assert!(
+        closed.try_recv().is_err(),
+        "the answer waited for the close"
+    );
+    drop(release);
+    assert!(closed.recv_timeout(Duration::from_secs(30)).is_ok());
+    assert!(closer.join().is_ok());
+}
+
+#[test]
+fn test_close_with_a_stalled_writer_is_bounded_by_the_close_timeout() {
+    let limits = QueueLimits::new()
+        .with_write_timeout(None)
+        .with_close_timeout(Duration::from_millis(300));
+    let (sink, release, _written) = stalled(limits);
+    let mut endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    assert!(endpoint.peer().notify("stuck", ()).is_ok());
+    let started = Instant::now();
+    endpoint.close();
+    let took = started.elapsed();
+    // Never before the timeout; the upper bound only rules out "forever".
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(30),
+        "{took:?}"
+    );
+    drop(release);
+}
+
+/// A writer that takes a few bytes per write, slowly but steadily.
+struct Trickle(Shared);
+
+impl Write for Trickle {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        thread::sleep(Duration::from_millis(5));
+        self.0.write(&buf[..buf.len().min(64)])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_a_slow_steady_reader_is_not_timed_out() {
+    // Found by the verifier (RPC2-004): the write timeout counted from the
+    // start of a batch, so a peer that kept reading, slowly, was cut off.
+    let written = Shared::default();
+    // Writes 5 ms apart against a 500 ms timeout: a wide margin for a
+    // loaded machine's scheduling.
+    let limits = QueueLimits::new().with_write_timeout(Some(Duration::from_millis(500)));
+    let sink = Queued::with_limits(Trickle(written.clone()), Framing::Newline, limits);
+    let Ok(sink) = sink else {
+        panic!("no writer thread")
+    };
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    let peer = endpoint.peer();
+    let big = "x".repeat(16 * 1024); // ~256 writes of 64 bytes: over 1.2 s, past the timeout
+    assert!(peer.notify("big", jsonx_lib::json!([big])).is_ok());
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1500) {
+        assert!(
+            peer.notify("small", ()).is_ok(),
+            "a steady reader was cut off"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(peer);
+    drop(endpoint);
+    assert!(written.text().contains("small"));
+}
+
+#[test]
+fn test_a_failed_send_still_closes_the_sink() {
+    // Found by the verifier (RPC2-011): after a send failed, `Sink::close`
+    // was never called.
+    struct Closes(mpsc::Sender<&'static str>);
+    impl rpc_io::Sink for Closes {
+        fn send(&mut self, _: &str) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"))
+        }
+        fn close(&mut self) -> io::Result<()> {
+            let _sent = self.0.send("closed");
+            Ok(())
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut endpoint = Endpoint::new(Closes(tx), Router::<()>::new(), ());
+    assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Io(_))));
+    assert_eq!(rx.try_recv().ok(), Some("closed"));
+    endpoint.close();
+    assert!(rx.try_recv().is_err(), "closed twice");
+}
