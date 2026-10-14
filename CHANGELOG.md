@@ -13,7 +13,11 @@
 
 ### Added
 
+- `Request::new`, `Notification::new`, `Response::new`, `Response::ok`, and `Response::err`.
+
 ### Changed
+
+- **Breaking:** `Request`, `Notification`, and `Response` are `#[non_exhaustive]`, decided for the 1.0 surface (audit RPC-CQ-05), so a later version can keep more of the envelope without a break. Their fields stay public to read and to change. Migration: build them with the new constructors instead of struct literals, and add `..` to struct patterns.
 
 ### Fixed
 

@@ -1017,14 +1017,14 @@ assert_eq!(owned.to_string(), r#"{"jsonrpc":"2.0","id":7,"method":"hover"}"#);
 
 ## `Request`, `Notification`, `Response`
 
-Plain structs with public fields: `Request { id: Id, method: Cow<str>, params: Option<Raw> }`, `Notification { method, params }`, `Response { id: Option<Id>, result: Result<Raw, ErrorObject> }` (`id: None` is `null`, only for errors).
+Structs with public fields: `Request { id: Id, method: Cow<str>, params: Option<Raw> }`, `Notification { method, params }`, `Response { id: Option<Id>, result: Result<Raw, ErrorObject> }` (`id: None` is `null`, only for errors). All three are `#[non_exhaustive]` (since 0.4.0), so a later version can keep more of the envelope without a break: read and change the fields freely, build with the constructors, and add `..` to struct patterns. Constructors: `Request::new(id, method, params)`, `Notification::new(method, params)`, `Response::new(id, result)`, `Response::ok(id, raw)`, `Response::err(id, error)`.
 
 ```rust
 use rpc_io::{ErrorObject, Message, Raw, Response};
 
-let ok = Response { id: Some(4.into()), result: Ok(Raw::new("true")?) };
+let ok = Response::ok(4, Raw::new("true")?);
 assert_eq!(Message::Response(ok).to_string(), r#"{"jsonrpc":"2.0","id":4,"result":true}"#);
-let failed = Response { id: None, result: Err(ErrorObject::parse_error("bad JSON")) };
+let failed = Response::err(None, ErrorObject::parse_error("bad JSON"));
 assert_eq!(
     Message::Response(failed).to_string(),
     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
@@ -1050,7 +1050,7 @@ assert_eq!((invalid.id().and_then(|i| i.as_i64()), invalid.error().code()), (Som
 ```rust
 use rpc_io::{write_batch, Message, Notification};
 
-let ping = Message::Notification(Notification { method: "ping".into(), params: None });
+let ping = Message::Notification(Notification::new("ping", None));
 let mut out = String::new();
 write_batch(&mut out, &[ping.clone(), ping]);
 assert_eq!(out, r#"[{"jsonrpc":"2.0","method":"ping"},{"jsonrpc":"2.0","method":"ping"}]"#);

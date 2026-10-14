@@ -76,28 +76,14 @@ fn error_object() -> impl Strategy<Value = ErrorObject> {
 fn message() -> impl Strategy<Value = Message<'static>> {
     prop_oneof![
         (id(), text(), proptest::option::of(structured())).prop_map(|(id, method, params)| {
-            Message::Request(Request {
-                id,
-                method: method.into(),
-                params,
-            })
+            Message::Request(Request::new(id, method, params))
         }),
         (text(), proptest::option::of(structured())).prop_map(|(method, params)| {
-            Message::Notification(Notification {
-                method: method.into(),
-                params,
-            })
+            Message::Notification(Notification::new(method, params))
         }),
-        (id(), raw()).prop_map(|(id, result)| Message::Response(Response {
-            id: Some(id),
-            result: Ok(result)
-        })),
-        (proptest::option::of(id()), error_object()).prop_map(|(id, error)| Message::Response(
-            Response {
-                id,
-                result: Err(error)
-            }
-        )),
+        (id(), raw()).prop_map(|(id, result)| Message::Response(Response::ok(id, result))),
+        (proptest::option::of(id()), error_object())
+            .prop_map(|(id, error)| Message::Response(Response::err(id, error))),
     ]
 }
 

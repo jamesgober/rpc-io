@@ -20,12 +20,16 @@ use crate::{
 
 /// A request: a call that expects exactly one response.
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Request::new`] (a later version
+/// may keep more of the envelope).
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{Message, Raw, Request};
 ///
-/// let request = Request { id: 1.into(), method: "sum".into(), params: Some(Raw::new("[1, 2]")?) };
+/// let request = Request::new(1, "sum", Some(Raw::new("[1, 2]")?));
 /// assert_eq!(
 ///     Message::Request(request).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":1,"method":"sum","params":[1, 2]}"#,
@@ -33,6 +37,7 @@ use crate::{
 /// # Ok::<(), jsonx_lib::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Request<'a> {
     /// The id the response must carry.
     pub id: Id<'a>,
@@ -44,15 +49,19 @@ pub struct Request<'a> {
 
 /// A notification: a call that gets no response.
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Notification::new`].
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{Message, Notification};
 ///
-/// let n = Notification { method: "exit".into(), params: None };
+/// let n = Notification::new("exit", None);
 /// assert_eq!(Message::Notification(n).to_string(), r#"{"jsonrpc":"2.0","method":"exit"}"#);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Notification<'a> {
     /// The method to call.
     pub method: Cow<'a, str>,
@@ -65,15 +74,19 @@ pub struct Notification<'a> {
 /// `id` is `None` only for an error answering a message whose id could not be
 /// read (it is written as `"id": null`).
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Response::ok`],
+/// [`Response::err`], or [`Response::new`].
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{ErrorObject, Message, Raw, Response};
 ///
-/// let ok = Response { id: Some(4.into()), result: Ok(Raw::new("true")?) };
+/// let ok = Response::ok(4, Raw::new("true")?);
 /// assert_eq!(Message::Response(ok).to_string(), r#"{"jsonrpc":"2.0","id":4,"result":true}"#);
 ///
-/// let failed = Response { id: None, result: Err(ErrorObject::parse_error("bad JSON")) };
+/// let failed = Response::err(None, ErrorObject::parse_error("bad JSON"));
 /// assert_eq!(
 ///     Message::Response(failed).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
@@ -81,11 +94,110 @@ pub struct Notification<'a> {
 /// # Ok::<(), jsonx_lib::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Response<'a> {
     /// The id of the request answered, `None` for `null`.
     pub id: Option<Id<'a>>,
     /// The `result` member, or the `error` member.
     pub result: Result<Raw<'a>, ErrorObject>,
+}
+
+impl<'a> Request<'a> {
+    /// A request for `method` under `id`, with `params` (an array or an
+    /// object; `None` for absent).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let request = rpc_io::Request::new("req-1", "shutdown", None);
+    /// assert_eq!(request.id.as_str(), Some("req-1"));
+    /// assert_eq!(request.method, "shutdown");
+    /// ```
+    #[must_use]
+    pub fn new(
+        id: impl Into<Id<'a>>,
+        method: impl Into<Cow<'a, str>>,
+        params: Option<Raw<'a>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl<'a> Notification<'a> {
+    /// A notification for `method`, with `params` (an array or an object;
+    /// `None` for absent).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let n = rpc_io::Notification::new("initialized", Some(rpc_io::Raw::new("{}")?));
+    /// assert_eq!(n.params.map(|p| p.as_str().to_owned()).as_deref(), Some("{}"));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn new(method: impl Into<Cow<'a, str>>, params: Option<Raw<'a>>) -> Self {
+        Self {
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl<'a> Response<'a> {
+    /// A response under `id` (`None` for `null`) with `result`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Raw, Response};
+    ///
+    /// let response = Response::new(Some(7.into()), Ok(Raw::NULL));
+    /// assert!(response.result.is_ok());
+    /// ```
+    #[must_use]
+    pub const fn new(id: Option<Id<'a>>, result: Result<Raw<'a>, ErrorObject>) -> Self {
+        Self { id, result }
+    }
+
+    /// A successful response under `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ok = rpc_io::Response::ok("a", rpc_io::Raw::new("[1]")?);
+    /// assert_eq!(ok.id.and_then(|id| id.as_str().map(str::to_owned)).as_deref(), Some("a"));
+    /// # Ok::<(), jsonx_lib::Error>(())
+    /// ```
+    #[must_use]
+    pub fn ok(id: impl Into<Id<'a>>, result: Raw<'a>) -> Self {
+        Self {
+            id: Some(id.into()),
+            result: Ok(result),
+        }
+    }
+
+    /// An error response under `id` (`None` for `null`, for a message whose
+    /// id could not be read).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{ErrorObject, Id, Response};
+    ///
+    /// let failed = Response::err(Some(Id::from(3)), ErrorObject::method_not_found("x"));
+    /// assert!(failed.result.is_err());
+    /// ```
+    #[must_use]
+    pub const fn err(id: Option<Id<'a>>, error: ErrorObject) -> Self {
+        Self {
+            id,
+            result: Err(error),
+        }
+    }
 }
 
 /// One JSON-RPC 2.0 message.
@@ -122,7 +234,7 @@ impl<'a> Message<'a> {
     /// ```
     /// use rpc_io::{Message, Notification};
     ///
-    /// let n = Message::Notification(Notification { method: "x".into(), params: None });
+    /// let n = Message::Notification(Notification::new("x", None));
     /// assert!(n.id().is_none());
     /// ```
     #[must_use]
@@ -141,7 +253,7 @@ impl<'a> Message<'a> {
     /// ```
     /// use rpc_io::{Message, Notification};
     ///
-    /// let n = Message::Notification(Notification { method: "x".into(), params: None });
+    /// let n = Message::Notification(Notification::new("x", None));
     /// assert_eq!(n.method(), Some("x"));
     /// ```
     #[must_use]
@@ -161,7 +273,7 @@ impl<'a> Message<'a> {
     /// use rpc_io::{Message, Notification};
     ///
     /// let mut out = String::new();
-    /// Message::Notification(Notification { method: "x".into(), params: None }).write(&mut out);
+    /// Message::Notification(Notification::new("x", None)).write(&mut out);
     /// assert_eq!(out, r#"{"jsonrpc":"2.0","method":"x"}"#);
     /// ```
     pub fn write(&self, out: &mut String) {
@@ -193,7 +305,7 @@ impl<'a> Message<'a> {
     ///
     /// let text = String::from("x");
     /// let owned: Message<'static> =
-    ///     Message::Notification(Notification { method: text.as_str().into(), params: None }).into_owned();
+    ///     Message::Notification(Notification::new(text.as_str(), None)).into_owned();
     /// drop(text);
     /// assert_eq!(owned.method(), Some("x"));
     /// ```
@@ -236,7 +348,7 @@ impl fmt::Display for Message<'_> {
 /// ```
 /// use rpc_io::{write_batch, Message, Notification};
 ///
-/// let ping = Message::Notification(Notification { method: "ping".into(), params: None });
+/// let ping = Message::Notification(Notification::new("ping", None));
 /// let mut out = String::new();
 /// write_batch(&mut out, &[ping.clone(), ping]);
 /// assert_eq!(out, r#"[{"jsonrpc":"2.0","method":"ping"},{"jsonrpc":"2.0","method":"ping"}]"#);
