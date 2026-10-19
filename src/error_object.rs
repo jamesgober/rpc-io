@@ -121,7 +121,7 @@ impl fmt::Display for ErrorCode {
 /// # Examples
 ///
 /// ```
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{ErrorCode, ErrorObject};
 ///
 /// let error = ErrorObject::new(ErrorCode(1001), "stale version")

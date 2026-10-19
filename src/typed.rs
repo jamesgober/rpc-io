@@ -50,7 +50,7 @@ impl Params<'_> {
     ///
     /// let router = Router::new().request("next", |_: &mut (), params, _| {
     ///     let p: Position = params.deserialize()?;
-    ///     Ok(jsonx_lib::json!([p.line + 1, p.character]))
+    ///     Ok(rpc_io::jsonx::json!([p.line + 1, p.character]))
     /// });
     /// let (tx, rx) = std::sync::mpsc::channel::<String>();
     /// let mut endpoint = Endpoint::new(tx, router, ());

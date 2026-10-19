@@ -28,7 +28,7 @@ use jsonx_lib::{DuplicateKeys, Kind, Parser, Value};
 /// assert_eq!(raw.as_str(), r#"{"line": 3}"#);
 /// assert_eq!(raw.parse()?["line"], 3);
 /// assert!(Raw::new("{").is_err());
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Raw<'a>(Cow<'a, str>);
@@ -49,7 +49,7 @@ impl<'a> Raw<'a> {
     /// ```
     /// let raw = rpc_io::Raw::new("[1, 2]")?;
     /// assert_eq!(raw.as_str(), "[1, 2]");
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     pub fn new(text: &'a str) -> Result<Self, jsonx_lib::Error> {
         Self::new_with(text, &Parser::new())
@@ -65,7 +65,7 @@ impl<'a> Raw<'a> {
     /// # Examples
     ///
     /// ```
-    /// use jsonx_lib::{Limits, Parser};
+    /// use rpc_io::jsonx::{Limits, Parser};
     ///
     /// let shallow = Parser::new().limits(Limits::new().with_max_depth(1));
     /// assert!(rpc_io::Raw::new_with("[1]", &shallow).is_ok());
@@ -97,7 +97,7 @@ impl<'a> Raw<'a> {
     /// ```
     /// let raw = rpc_io::Raw::from_string(String::from("true"))?;
     /// assert_eq!(raw.as_str(), "true");
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     pub fn from_string(text: String) -> Result<Raw<'static>, jsonx_lib::Error> {
         let value = Raw::new(&text)?;
@@ -113,7 +113,7 @@ impl<'a> Raw<'a> {
     /// # Examples
     ///
     /// ```
-    /// use jsonx_lib::json;
+    /// use rpc_io::jsonx::json;
     ///
     /// let raw = rpc_io::Raw::from_value(&json!({ "ok": true }));
     /// assert_eq!(raw.as_str(), r#"{"ok":true}"#);
@@ -153,11 +153,11 @@ impl<'a> Raw<'a> {
     /// # Examples
     ///
     /// ```
-    /// use jsonx_lib::Kind;
+    /// use rpc_io::jsonx::Kind;
     ///
     /// assert_eq!(rpc_io::Raw::new("[]")?.kind(), Kind::Array);
     /// assert_eq!(rpc_io::Raw::new("-1.5")?.kind(), Kind::Number);
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     #[must_use]
     pub fn kind(&self) -> Kind {
@@ -177,7 +177,7 @@ impl<'a> Raw<'a> {
     /// ```
     /// let raw = rpc_io::Raw::new(r#"{"a": [1, "two"]}"#)?;
     /// assert_eq!(raw.parse()?["a"][1], "two");
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     pub fn parse(&self) -> Result<Value<'_>, jsonx_lib::Error> {
         self.parse_with(&Parser::new())
@@ -193,13 +193,13 @@ impl<'a> Raw<'a> {
     /// # Examples
     ///
     /// ```
-    /// use jsonx_lib::{DuplicateKeys, Parser};
+    /// use rpc_io::jsonx::{DuplicateKeys, Parser};
     ///
     /// let raw = rpc_io::Raw::new(r#"{"a": 1, "a": 2}"#)?;
     /// assert!(raw.parse().is_err());
     /// let last = Parser::new().duplicate_keys(DuplicateKeys::Last);
     /// assert_eq!(raw.parse_with(&last)?["a"], 2);
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     pub fn parse_with(&self, parser: &Parser) -> Result<Value<'_>, jsonx_lib::Error> {
         parser.parse(self.as_str())
@@ -214,7 +214,7 @@ impl<'a> Raw<'a> {
     /// let raw: rpc_io::Raw<'static> = rpc_io::Raw::new(&text)?.into_owned();
     /// drop(text);
     /// assert_eq!(raw.as_str(), "[1]");
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     #[must_use]
     pub fn into_owned(self) -> Raw<'static> {
@@ -264,14 +264,14 @@ impl fmt::Debug for Raw<'_> {
 /// # Examples
 ///
 /// ```
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{Json, Raw};
 ///
 /// assert_eq!(Json::from(json!([1, 2])).to_string(), "[1,2]");
 /// assert_eq!(Json::from(42).to_string(), "42");
 /// assert_eq!(Json::from(()).to_string(), "null");
 /// assert_eq!(Json::from(Raw::new(r#"{"a": 1}"#)?).to_string(), r#"{"a": 1}"#);
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, PartialEq)]
 pub enum Json<'a> {
@@ -287,7 +287,7 @@ impl Json<'_> {
     /// # Examples
     ///
     /// ```
-    /// use jsonx_lib::Kind;
+    /// use rpc_io::jsonx::Kind;
     ///
     /// assert_eq!(rpc_io::Json::from(true).kind(), Kind::Bool);
     /// ```

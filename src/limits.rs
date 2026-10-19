@@ -309,7 +309,7 @@ impl Limits {
     /// # Examples
     ///
     /// ```
-    /// let limits = rpc_io::Limits::new().with_json(jsonx_lib::Limits::new().with_max_depth(16));
+    /// let limits = rpc_io::Limits::new().with_json(rpc_io::jsonx::Limits::new().with_max_depth(16));
     /// assert_eq!(limits.json.max_depth, 16);
     /// ```
     #[must_use]

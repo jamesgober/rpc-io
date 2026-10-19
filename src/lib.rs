@@ -5,8 +5,9 @@
 //! service APIs. Build a [`Router`] of handlers, hand it a byte stream, and the
 //! crate does the rest: framing, the envelope, batches, id correlation,
 //! cancellation, deadlines, and the error codes the specification prescribes,
-//! with bounded buffers and no panics on any input. JSON is [`jsonx_lib`], the
-//! family's own; the default build has no third-party runtime dependency.
+//! with bounded buffers and no panics on any input. JSON is jsonx-lib, the
+//! family's own, re-exported as [`jsonx`]; the default build has no
+//! third-party runtime dependency.
 //!
 //! The Content-Length framing ([`Framing::ContentLength`], [`Decoder`]) is
 //! also the base protocol of the Debug Adapter Protocol and cuts DAP messages
@@ -18,7 +19,7 @@
 //! ```
 //! # #[cfg(not(feature = "std"))] fn main() {}
 //! # #[cfg(feature = "std")] fn main() -> Result<(), rpc_io::Error> {
-//! use jsonx_lib::json;
+//! use rpc_io::jsonx::json;
 //! use rpc_io::{End, Framing, Router};
 //!
 //! let router = Router::new()
@@ -159,6 +160,24 @@ mod stats;
 mod trace;
 #[cfg(feature = "serde")]
 mod typed;
+
+/// jsonx-lib, the JSON this crate is built on, re-exported: its types are
+/// part of this crate's API ([`Raw::parse`] returns a [`jsonx::Value`],
+/// [`Json`] converts from one, typed handlers take [`jsonx::ToJson`]), so a
+/// crate on top (an LSP or MCP server) uses them through `rpc_io::jsonx` and
+/// always gets the same jsonx-lib version as this crate, with no dependency
+/// of its own to keep in step. `rpc_io::jsonx::json!` builds values.
+///
+/// # Examples
+///
+/// ```
+/// use rpc_io::jsonx::{self, json};
+///
+/// let value = json!({ "line": 3 });
+/// assert_eq!(jsonx::to_string(&value), r#"{"line":3}"#);
+/// assert_eq!(rpc_io::Raw::from_value(&value).as_str(), r#"{"line":3}"#);
+/// ```
+pub use jsonx_lib as jsonx;
 
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};

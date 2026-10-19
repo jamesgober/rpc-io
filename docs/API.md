@@ -94,8 +94,7 @@
 
 ```toml
 [dependencies]
-rpc-io = "0.3"
-jsonx-lib = "0.5"
+rpc-io = "0.3"   # JSON values through `rpc_io::jsonx` (jsonx-lib, re-exported)
 
 # Framing, messages, and correlation only, without std (alloc only):
 # rpc-io = { version = "0.3", default-features = false }
@@ -476,7 +475,7 @@ fn main() -> Result<(), rpc_io::Error> {
     use rpc_io::{Endpoint, Router};
 
     let router = Router::new().request("work", |_: &mut (), _, cx| {
-        cx.notify("$/progress", jsonx_lib::json!({ "token": cx.method() }))?;
+        cx.notify("$/progress", rpc_io::jsonx::json!({ "token": cx.method() }))?;
         Ok("done")
     });
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -777,7 +776,7 @@ fn main() -> Result<(), rpc_io::Error> {
     use rpc_io::{Config, Endpoint, Gate, Router};
 
     let router = Router::new()
-        .request("initialize", |_: &mut (), _, _| Ok(jsonx_lib::json!({ "capabilities": {} })))
+        .request("initialize", |_: &mut (), _, _| Ok(rpc_io::jsonx::json!({ "capabilities": {} })))
         .request("hover", |_, _, _| Ok("text"));
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut endpoint = Endpoint::new(tx, router, ())
@@ -891,7 +890,7 @@ The primary typed API: jsonx-lib's own traits, hand-implemented (no derive, no r
 Encoding runs outside the endpoint's lock: a `ToJson` impl may itself send through a `Peer` (it gets a fresh buffer), and a panic in one is contained like a handler's (a request is answered with `INTERNAL_ERROR`; a panic while encoding params unwinds to the caller, and the buffer stays usable).
 
 ```rust
-use jsonx_lib::{ToJson, ValueWriter, Written};
+use rpc_io::jsonx::{ToJson, ValueWriter, Written};
 use rpc_io::{Endpoint, Router};
 
 struct Hover { line: u64 }
@@ -1134,7 +1133,7 @@ assert_eq!(owned.to_string(), r#"{"jsonrpc":"2.0","id":7,"method":"hover"}"#);
 Structs with public fields: `Request { id: Id, method: Cow<str>, params: Option<Raw> }`, `Notification { method, params }`, `Response { id: Option<Id>, result: Result<Raw, ErrorObject> }` (`id: None` is `null`, only for errors). All three are `#[non_exhaustive]` (since 0.4.0), so a later version can keep more of the envelope without a break: read and change the fields freely, build with the constructors, and add `..` to struct patterns. Constructors: `Request::new(id, method, params)`, `Notification::new(method, params)`, `Response::new(id, result)`, `Response::ok(id, raw)`, `Response::err(id, error)`.
 
 ```rust
-fn main() -> Result<(), jsonx_lib::Error> {
+fn main() -> Result<(), rpc_io::jsonx::Error> {
     use rpc_io::{ErrorObject, Message, Raw, Response};
 
     let ok = Response::ok(4, Raw::new("true")?);
@@ -1189,7 +1188,7 @@ assert_eq!(Id::raw_number("1e3").map(|id| id.to_string()).as_deref(), Some("1e3"
 One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `deserialize::<T>()` (`serde`); `into_owned()`.
 
 ```rust
-fn main() -> Result<(), jsonx_lib::Error> {
+fn main() -> Result<(), rpc_io::jsonx::Error> {
     let raw = rpc_io::Raw::new(r#" {"line": 3} "#)?;
     assert_eq!(raw.as_str(), r#"{"line": 3}"#);
     assert_eq!(raw.parse()?["line"], 3);
@@ -1204,7 +1203,7 @@ A value to send: `Value(jsonx_lib::Value)` or `Raw(Raw)`. Everything that sends 
 ```rust
 use rpc_io::Json;
 
-assert_eq!(Json::from(jsonx_lib::json!([1, 2])).to_string(), "[1,2]");
+assert_eq!(Json::from(rpc_io::jsonx::json!([1, 2])).to_string(), "[1,2]");
 assert_eq!(Json::from(()).to_string(), "null");
 ```
 
@@ -1228,7 +1227,7 @@ The `error` member: `new(code, message)`, `with_data(impl Into<Json>)`, `parse_e
 ```rust
 use rpc_io::{ErrorCode, ErrorObject};
 
-let e = ErrorObject::new(ErrorCode(1001), "stale version").with_data(jsonx_lib::json!({ "expected": 4 }));
+let e = ErrorObject::new(ErrorCode(1001), "stale version").with_data(rpc_io::jsonx::json!({ "expected": 4 }));
 assert_eq!(e.data().map(|d| d.as_str()), Some(r#"{"expected":4}"#));
 assert_eq!(e.to_string(), "stale version (code 1001)");
 ```

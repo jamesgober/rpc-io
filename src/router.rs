@@ -75,7 +75,7 @@ pub(crate) enum RequestHandler<S> {
 /// # Examples
 ///
 /// ```
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{ErrorObject, Router};
 ///
 /// #[derive(Default)]
@@ -518,7 +518,7 @@ impl<'a> Params<'a> {
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let router = Router::new().request("work", |_, _, cx| {
-///     cx.notify("progress", jsonx_lib::json!({ "method": cx.method() }))?;
+///     cx.notify("progress", rpc_io::jsonx::json!({ "method": cx.method() }))?;
 ///     Ok(())
 /// });
 /// let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -635,7 +635,7 @@ impl<'a> Context<'a> {
     /// use rpc_io::{Call, Router};
     ///
     /// let router = Router::<Vec<Call>>::new().notification("initialized", |calls, _, cx| {
-    ///     if let Ok(call) = cx.request("workspace/configuration", jsonx_lib::json!({ "items": [] })) {
+    ///     if let Ok(call) = cx.request("workspace/configuration", rpc_io::jsonx::json!({ "items": [] })) {
     ///         calls.push(call);
     ///     }
     /// });

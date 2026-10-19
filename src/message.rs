@@ -34,7 +34,7 @@ use crate::{
 ///     Message::Request(request).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":1,"method":"sum","params":[1, 2]}"#,
 /// );
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -91,7 +91,7 @@ pub struct Notification<'a> {
 ///     Message::Response(failed).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
 /// );
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -136,7 +136,7 @@ impl<'a> Notification<'a> {
     /// ```
     /// let n = rpc_io::Notification::new("initialized", Some(rpc_io::Raw::new("{}")?));
     /// assert_eq!(n.params.map(|p| p.as_str().to_owned()).as_deref(), Some("{}"));
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     #[must_use]
     pub fn new(method: impl Into<Cow<'a, str>>, params: Option<Raw<'a>>) -> Self {
@@ -170,7 +170,7 @@ impl<'a> Response<'a> {
     /// ```
     /// let ok = rpc_io::Response::ok("a", rpc_io::Raw::new("[1]")?);
     /// assert_eq!(ok.id.and_then(|id| id.as_str().map(str::to_owned)).as_deref(), Some("a"));
-    /// # Ok::<(), jsonx_lib::Error>(())
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
     /// ```
     #[must_use]
     pub fn ok(id: impl Into<Id<'a>>, result: Raw<'a>) -> Self {

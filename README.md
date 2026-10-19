@@ -70,8 +70,9 @@ What it guarantees, and how each guarantee is checked:
 ```toml
 [dependencies]
 rpc-io = "0.3"
-jsonx-lib = "0.5"   # to build and read JSON values
 ```
+
+JSON values are built and read with jsonx-lib, re-exported as `rpc_io::jsonx` (`rpc_io::jsonx::json!`, `rpc_io::jsonx::Value`, the `ToJson`/`FromJson` traits), so no separate dependency is needed and a crate on top always gets the same jsonx-lib version as rpc-io.
 
 The framing, message, and correlation layers without the standard library:
 
@@ -96,7 +97,7 @@ rpc-io = { version = "0.3", default-features = false }
 A server on stdin and stdout is one call. This one takes newline-delimited messages, as MCP's stdio transport does; LSP uses `Framing::ContentLength`:
 
 ```rust
-use jsonx_lib::json;
+use rpc_io::jsonx::json;
 use rpc_io::{End, ErrorObject, Framing, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
@@ -127,7 +128,7 @@ An [`Endpoint`](./docs/API.md#endpoint) carries state for its handlers and sends
 
 ```rust
 use std::sync::mpsc;
-use jsonx_lib::json;
+use rpc_io::jsonx::json;
 use rpc_io::{Endpoint, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
@@ -189,7 +190,7 @@ fn main() -> Result<(), rpc_io::Error> {
             if let Some(progress) = cx.progress(&params) {
                 progress.report(1.0, Some(1.0), Some("done"))?;
             }
-            Ok(jsonx_lib::json!({ "content": [] }))
+            Ok(rpc_io::jsonx::json!({ "content": [] }))
         });
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut endpoint = Endpoint::new(tx, router, ()).with_config(Config::mcp());

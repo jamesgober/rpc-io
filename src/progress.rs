@@ -406,7 +406,7 @@ impl WorkDone {
     ///         work.begin("Searching", false, None, None)?;
     ///         work.end(None)?;
     ///     }
-    ///     Ok(jsonx_lib::json!([]))
+    ///     Ok(rpc_io::jsonx::json!([]))
     /// });
     /// let (tx, rx) = std::sync::mpsc::channel::<String>();
     /// Endpoint::new(tx, router, ()).handle(

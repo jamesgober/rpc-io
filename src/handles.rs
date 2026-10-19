@@ -109,7 +109,7 @@ fn outgoing_params<'a>(params: impl Into<Json<'a>>) -> Result<Option<Json<'a>>, 
 ///
 /// ```
 /// use std::sync::mpsc;
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let (tx, rx) = mpsc::channel::<String>();
@@ -179,7 +179,7 @@ impl Peer {
     /// let (tx, rx) = std::sync::mpsc::channel::<String>();
     /// let endpoint = Endpoint::new(tx, Router::new(), ()); // keep it: dropping an endpoint closes it
     /// let peer = endpoint.peer();
-    /// let call = peer.request("workspace/configuration", jsonx_lib::json!({ "items": [] }))?;
+    /// let call = peer.request("workspace/configuration", rpc_io::jsonx::json!({ "items": [] }))?;
     /// assert_eq!(call.id(), 1);
     /// assert!(rx.try_recv().is_ok_and(|m| m.starts_with(r#"{"jsonrpc":"2.0","id":1,"#)));
     /// # Ok::<(), rpc_io::Error>(())
@@ -634,7 +634,7 @@ impl fmt::Debug for Canceller {
 ///
 /// ```
 /// use std::sync::mpsc;
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let router = Router::new().deferred("slow", |_, _params, _cx, responder| {
