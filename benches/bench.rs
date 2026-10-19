@@ -140,6 +140,30 @@ fn bench_endpoint(c: &mut Criterion) {
             BatchSize::PerIteration,
         );
     });
+    // The endpoint's own cost: a handler that reads nothing and answers
+    // `null`, so neither params parsing nor result building is measured.
+    group.bench_function("handle_100k_unparsed", |b| {
+        b.iter_batched(
+            || {
+                let router = Router::new().request("textDocument/hover", |hits: &mut u64, _, _| {
+                    *hits += 1;
+                    Ok(Raw::NULL)
+                });
+                Endpoint::new(
+                    Framed::new(std::io::sink(), Framing::ContentLength),
+                    router,
+                    0,
+                )
+            },
+            |mut endpoint| {
+                for body in &bodies {
+                    let _flow = endpoint.handle(body.as_bytes());
+                }
+                black_box(*endpoint.state())
+            },
+            BatchSize::PerIteration,
+        );
+    });
     group.bench_function("run_100k_framed_requests", |b| {
         b.iter_batched(
             || {
