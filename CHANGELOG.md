@@ -36,6 +36,8 @@
 
 ### Security
 
+- Repeated envelope members (the jsonx-lib baseline audit, JX-SEC-02: a pull-reader loop that keeps the last key lets `{"method":"initialize","method":"shutdown"}` be read as one method and run as another): rpc-io was **not affected, in 0.3.0 or before**. Its envelope reader records every repeated `jsonrpc`, `id`, `method`, `params`, `result`, or `error` and refuses the message with `-32600` (under no id when `id` is the repeated member); a repeated `code`, `message`, or `data` in an `error` makes the response invalid; a cancel target or progress token whose member repeats names nothing. New regression tests (`tests/duplicates.rs`) pin each case, through the gate and in batches, and pass unchanged on 0.3.0.
+
 ---
 
 ## [0.3.0] — 2026-10-13
