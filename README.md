@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>. One required dependency, from the family: <a href="https://crates.io/crates/jsonx-lib"><code>jsonx-lib</code></a>. The integrations (<code>serde</code>, <code>futures-io</code>, <code>tracing</code>) are optional features, off by default. Without the default <code>std</code> feature the framing, message, and correlation layers are <code>no_std</code> (they need only <code>alloc</code>).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0.</strong> 0.3.0 hardens the foundation and adds the async adapter, typed params, and serving helpers; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0.</strong> 0.4.0 moves onto jsonx-lib 0.5 with typed params and results through its <code>ToJson</code>/<code>FromJson</code>, follows MCP's stateless 2026-07-28 revision, and makes the 1.0 decisions; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -69,7 +69,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-rpc-io = "0.3"
+rpc-io = "0.4"
 ```
 
 JSON values are built and read with jsonx-lib, re-exported as `rpc_io::jsonx` (`rpc_io::jsonx::json!`, `rpc_io::jsonx::Value`, the `ToJson`/`FromJson` traits), so no separate dependency is needed and a crate on top always gets the same jsonx-lib version as rpc-io.
@@ -78,7 +78,7 @@ The framing, message, and correlation layers without the standard library:
 
 ```toml
 [dependencies]
-rpc-io = { version = "0.3", default-features = false }
+rpc-io = { version = "0.4", default-features = false }
 ```
 
 | Feature | Default | Adds |

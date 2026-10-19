@@ -1,7 +1,7 @@
 # rpc-io &mdash; API Reference
 
 > Complete reference for every public item in `rpc-io`; each section has an example.
-> **Status: pre-1.0 (0.3.0).** The surface is refined across the 0.x series and
+> **Status: pre-1.0 (0.4.0).** The surface is refined across the 0.x series and
 > frozen at `1.0.0`, after lsp-lang and mcp-io have run on it (LexerSketch
 > decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -96,13 +96,13 @@
 
 ```toml
 [dependencies]
-rpc-io = "0.3"   # JSON values through `rpc_io::jsonx` (jsonx-lib, re-exported)
+rpc-io = "0.4"   # JSON values through `rpc_io::jsonx` (jsonx-lib, re-exported)
 
 # Framing, messages, and correlation only, without std (alloc only):
-# rpc-io = { version = "0.3", default-features = false }
+# rpc-io = { version = "0.4", default-features = false }
 
 # Integrations, each off by default:
-# rpc-io = { version = "0.3", features = ["serde", "futures-io", "tracing", "net"] }
+# rpc-io = { version = "0.4", features = ["serde", "futures-io", "tracing", "net"] }
 ```
 
 ## Quick start
