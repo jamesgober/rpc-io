@@ -538,8 +538,14 @@ impl Server {
     /// cannot hold the connection open by never answering it. A deferred
     /// request of the peer's being answered keeps it busy too, except while a
     /// request of ours without a timeout is outstanding: its handler may be
-    /// waiting on that answer, which the peer could withhold forever. A
-    /// connection
+    /// waiting on that answer, which the peer could withhold forever. So a
+    /// client that takes longer than this to answer a request of ours with no
+    /// timeout (a slow MCP `sampling/createMessage`, for example) is
+    /// disconnected: give such a request a timeout of its own
+    /// ([`Peer::request_with_timeout`](crate::Peer::request_with_timeout) or
+    /// [`Config::with_request_timeout`](crate::Config::with_request_timeout)),
+    /// which keeps the connection busy until it passes, or raise this
+    /// limit. A connection
     /// idle past it is closed. Long-lived sessions whose peer may be quiet
     /// for a long time (an editor's LSP client, an MCP host between tool
     /// calls) may want `None`.
