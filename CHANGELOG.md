@@ -20,6 +20,7 @@
 - **Lenient ids** (audit RPC-COR-06, decided for the 1.0 surface): `Limits::lenient_ids` / `with_lenient_ids(true)` accepts the request ids JSON-RPC 2.0 allows and discourages, `null` and numbers that are not integers within `i64`, and echoes them back exactly as sent, for generic JSON-RPC services. Off by default and in every preset (LSP and MCP forbid them). `Id::RawNumber`, `Id::Null`, `Id::raw_number`, `Id::is_null`.
 - `Context::progress` and `Responder::progress`: a `Progress` bound to its request.
 - `Error::ProgressNotIncreasing { last, next }`.
+- **Typed results and params through jsonx-lib's `ToJson`**, the primary typed API (moved from the v0.2.0 roadmap; the `serde` feature stays as the alternative): `Router::request_encoded` writes a handler's `ToJson` result straight into a buffer the endpoint reuses, so no `Value` is built and, once the buffer has grown, nothing is allocated for the result; `Peer::notify_json`, `Peer::request_json`, `Context::notify_json`, `Context::request_json`, and `Responder::ok_json` encode in a per-thread reused buffer, outside the endpoint's lock; `Json::encode`; `ToJson` for `Id` and `ErrorCode`.
 
 ### Changed
 

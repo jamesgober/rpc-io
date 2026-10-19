@@ -42,6 +42,7 @@
 - [`Limits`](#limits)
 - [`Sink` and `Framed`](#sink-and-framed)
 - [`Queued` and `Outbox`](#queued-and-outbox)
+- [Typed params and results (`ToJson` / `FromJson`)](#typed-params-and-results-tojson--fromjson)
 - [Typed params and results (`serde`)](#typed-params-and-results-serde)
 - [The async adapter (`futures-io`)](#the-async-adapter-futures-io)
 - [`Framing`](#framing)
@@ -875,9 +876,53 @@ fn main() -> Result<(), std::io::Error> {
 }
 ```
 
+## Typed params and results (`ToJson` / `FromJson`)
+
+The primary typed API: jsonx-lib's own traits, hand-implemented (no derive, no reflection, no third-party dependency), in every build.
+
+| Item | Description |
+|---|---|
+| `Router::request_encoded(method, FnMut(&mut S, Params, &mut Context) -> Result<R, ErrorObject>)` | `R: ToJson`, written straight into a buffer the endpoint reuses (released after a result over 64 KiB): no `Value` is built, and once the buffer has grown nothing is allocated for the result. |
+| `Peer::notify_json(method, &T)`, `Peer::request_json(method, &T)`, and the same on `Context` | `T: ToJson`, encoded in a per-thread reused buffer (also released after 64 KiB); params must encode to an array, an object, or `null` (`Error::InvalidParams` otherwise). |
+| `Responder::ok_json(&T)` | The same, for a deferred answer from any thread. |
+| `Json::encode(&T) -> Json<'static>` | Compact JSON, allocated; for error `data` and the like. Infallible. |
+| `ToJson` for `Id` and `ErrorCode` | An integer, a string, a raw number's text, or `null`; an integer. |
+
+Encoding runs outside the endpoint's lock: a `ToJson` impl may itself send through a `Peer` (it gets a fresh buffer), and a panic in one is contained like a handler's (a request is answered with `INTERNAL_ERROR`; a panic while encoding params unwinds to the caller, and the buffer stays usable).
+
+```rust
+use jsonx_lib::{ToJson, ValueWriter, Written};
+use rpc_io::{Endpoint, Router};
+
+struct Hover { line: u64 }
+
+impl ToJson for Hover {
+    fn to_json(&self, out: ValueWriter<'_>) -> Written {
+        out.object(|o| {
+            o.member("contents", "markdown");
+            o.member("line", &self.line);
+        })
+    }
+}
+
+fn main() -> Result<(), rpc_io::Error> {
+    let router = Router::new().request_encoded("hover", |_: &mut (), params, _| {
+        let p = params.parse()?;
+        Ok(Hover { line: p["line"].as_u64().unwrap_or(0) })
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"hover","params":{"line":3}}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"contents":"markdown","line":3}}"#));
+    endpoint.peer().notify_json("log", &["indexed", "a.rs"])?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","method":"log","params":["indexed","a.rs"]}"#));
+    Ok(())
+}
+```
+
 ## Typed params and results (`serde`)
 
-With the `serde` feature, protocol types written against `serde` (`lsp-types`, MCP schema crates, your own `#[derive(Deserialize)]`) go in and out of handlers and calls. Values are read from the text the endpoint has already validated within its JSON budgets, with `serde_json`.
+The alternative to the traits above. With the `serde` feature, protocol types written against `serde` (`lsp-types`, MCP schema crates, your own `#[derive(Deserialize)]`) go in and out of handlers and calls. Values are read from the text the endpoint has already validated within its JSON budgets, with `serde_json`.
 
 | Item | Description |
 |---|---|

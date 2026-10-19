@@ -22,8 +22,16 @@ use crate::{
     raw::{Json, Raw},
 };
 
+/// A request handler. The `String` is a buffer the endpoint keeps for it to
+/// encode a result into (and borrow it from) instead of allocating one.
 pub(crate) type RequestFn<S> = Box<
-    dyn FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<Json<'static>, ErrorObject> + Send,
+    dyn for<'b> FnMut(
+            &mut S,
+            Params<'_>,
+            &mut Context<'_>,
+            &'b mut String,
+        ) -> Result<Json<'b>, ErrorObject>
+        + Send,
 >;
 pub(crate) type DeferredFn<S> =
     Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>, Responder) + Send>;
@@ -126,19 +134,32 @@ impl<S> Router<S> {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     #[must_use]
-    pub fn request<F, J>(mut self, method: &str, mut handler: F) -> Self
+    pub fn request<F, J>(self, method: &str, mut handler: F) -> Self
     where
         F: FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<J, ErrorObject> + Send + 'static,
         J: Into<Json<'static>>,
     {
-        let boxed: RequestFn<S> = Box::new(
-            move |state: &mut S, params: Params<'_>, cx: &mut Context<'_>| {
-                handler(state, params, cx).map(Into::into)
-            },
-        );
+        self.request_into(method, move |state, params, cx, _out| {
+            handler(state, params, cx).map(Into::into)
+        })
+    }
+
+    /// Registers a request handler that may encode its result into the
+    /// endpoint's result buffer.
+    pub(crate) fn request_into<F>(mut self, method: &str, handler: F) -> Self
+    where
+        F: for<'b> FnMut(
+                &mut S,
+                Params<'_>,
+                &mut Context<'_>,
+                &'b mut String,
+            ) -> Result<Json<'b>, ErrorObject>
+            + Send
+            + 'static,
+    {
         let _replaced = self
             .requests
-            .insert(method.into(), RequestHandler::Now(boxed));
+            .insert(method.into(), RequestHandler::Now(Box::new(handler)));
         self
     }
 

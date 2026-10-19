@@ -170,7 +170,12 @@ pub struct Endpoint<S, K: Sink> {
     cancellation: Option<Cancellation>,
     /// The stream decoder, kept between reads so read-ahead is never lost.
     input: Option<Decoder>,
+    /// Reused buffer typed request handlers encode their results into.
+    result: String,
 }
+
+/// The result buffer is released after a result that grew it past this.
+const RESULT_KEEP: usize = 64 * 1024;
 
 impl<S, K: Sink> Endpoint<S, K> {
     /// An endpoint that sends through `sink`, answers calls with `router`,
@@ -199,6 +204,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             gate: config.gate,
             cancellation: config.cancellation,
             input: None,
+            result: String::new(),
         }
     }
 
@@ -841,8 +847,9 @@ impl<S, K: Sink> Endpoint<S, K> {
         match handler {
             RequestHandler::Now(handler) => {
                 let state = &mut self.state;
+                let out = &mut self.result;
                 let mut cx = Context::new(&self.link, stop, Some(&id), &method, false);
-                let outcome = contain(|| handler(state, params, &mut cx));
+                let outcome = contain(|| handler(state, params, &mut cx, out));
                 let turn = cx.take_turn();
                 let error;
                 let result = match &outcome {
@@ -869,6 +876,11 @@ impl<S, K: Sink> Endpoint<S, K> {
                     turn.store(true, Ordering::Release);
                 }
                 let _reported = inner.respond(Some(&id), batch, result);
+                drop(inner);
+                drop(outcome);
+                if self.result.capacity() > RESULT_KEEP {
+                    self.result = String::new();
+                }
             }
             RequestHandler::Deferred(handler) => {
                 let owned = id.clone().into_owned();
