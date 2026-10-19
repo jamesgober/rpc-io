@@ -29,6 +29,7 @@
 - **Breaking:** `Id` has two more variants, `RawNumber(Cow<str>)` and `Null`, produced only with lenient ids. `Id` stays exhaustive, since these are every id JSON-RPC 2.0 allows. Migration: add arms (or `_`) to exhaustive `match`es on `Id`.
 - `docs/API.md`'s examples have no rustdoc-hidden (`# `) lines, which GitHub shows verbatim: each is a whole program, still compiled and run by `cargo test` (0.3.0 release verification, Info).
 - **Breaking:** built on jsonx-lib 0.5 (from 0.2). jsonx-lib's types are part of this crate's API (`Raw::parse` returns a `jsonx_lib::Value`, `Json` converts from one, `Raw::new_with` takes a `jsonx_lib::Parser`), so a crate that names them needs the same jsonx-lib. jsonx-lib 0.5 keeps the 0.2 surface these use. Migration: depend on `jsonx-lib = "0.5"`.
+- `Progress::report` and the `WorkDone` reports encode their params in a per-thread reused buffer instead of allocating them per report (one string per MCP report, two per LSP report in 0.3).
 
 ### Fixed
 

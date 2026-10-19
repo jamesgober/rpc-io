@@ -7,9 +7,8 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use jsonx_lib::Number;
-
 use crate::{
+    convert::with_buffer,
     error::Error,
     handles::{Peer, Responder},
     link::Scope,
@@ -73,13 +72,23 @@ fn token(raw: &str) -> Option<Raw<'_>> {
     is_token(raw).then(|| Raw::trusted(raw))
 }
 
+/// `Ok` for a finite `n`: JSON has no NaN or infinity.
+fn finite(name: &str, n: f64) -> Result<(), Error> {
+    if n.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::Serialize(format!(
+            "`{name}` must be a finite number, not {n}"
+        )))
+    }
+}
+
 /// Appends `"name":<n>` for a finite `n`: whole numbers without a fraction
-/// (`3`, not `3.0`), as peers written in JavaScript send them.
-fn push_number(out: &mut String, name: &str, n: f64) -> Result<(), Error> {
+/// (`3`, not `3.0`), as peers written in JavaScript send them, and any other
+/// as its shortest round-trip text.
+fn push_number(out: &mut String, name: &str, n: f64) {
     /// 2^53: every whole `f64` below it is exactly an `i64`.
     const EXACT: f64 = 9_007_199_254_740_992.0;
-    let number = Number::from_f64(n)
-        .ok_or_else(|| Error::Serialize(format!("`{name}` must be a finite number, not {n}")))?;
     out.push(',');
     jsonx_lib::write_string(out, name);
     out.push(':');
@@ -87,9 +96,8 @@ fn push_number(out: &mut String, name: &str, n: f64) -> Result<(), Error> {
         // Whole and below 2^53 in size: the cast is exact.
         crate::text::push_i64(out, n as i64);
     } else {
-        out.push_str(number.as_str());
+        jsonx_lib::write_value(out, &n);
     }
-    Ok(())
 }
 
 /// Appends `"name":"<text>"` when there is a text.
@@ -257,14 +265,10 @@ impl Progress {
         total: Option<f64>,
         message: Option<&str>,
     ) -> Result<(), Error> {
-        let mut params = String::from("{\"progressToken\":");
-        params.push_str(self.token.as_str());
-        push_number(&mut params, "progress", progress)?;
+        finite("progress", progress)?;
         if let Some(total) = total {
-            push_number(&mut params, "total", total)?;
+            finite("total", total)?;
         }
-        push_text(&mut params, "message", message);
-        params.push('}');
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(last) = *last {
             if progress <= last {
@@ -274,10 +278,24 @@ impl Progress {
                 });
             }
         }
-        let params = Json::Raw(Raw::trusted_owned(params));
-        self.peer
-            .link()
-            .notify_in(&self.scope, "notifications/progress", Some(&params))?;
+        // Encoded in this thread's reused buffer: no allocation per report.
+        let fill = |out: &mut String| {
+            out.push_str("{\"progressToken\":");
+            out.push_str(self.token.as_str());
+            push_number(out, "progress", progress);
+            if let Some(total) = total {
+                push_number(out, "total", total);
+            }
+            push_text(out, "message", message);
+            out.push('}');
+        };
+        with_buffer(fill, |params| {
+            self.peer.link().notify_in(
+                &self.scope,
+                "notifications/progress",
+                Some(&Json::Raw(params)),
+            )
+        })?;
         *last = Some(progress);
         Ok(())
     }
@@ -456,16 +474,17 @@ impl WorkDone {
         message: Option<&str>,
         percentage: Option<u32>,
     ) -> Result<(), Error> {
-        let mut value = String::from("{\"kind\":\"begin\"");
-        push_text(&mut value, "title", Some(title));
-        value.push_str(if cancellable {
-            ",\"cancellable\":true"
-        } else {
-            ",\"cancellable\":false"
-        });
-        push_text(&mut value, "message", message);
-        push_percentage(&mut value, percentage);
-        self.send(value)
+        self.send(|value| {
+            value.push_str("{\"kind\":\"begin\"");
+            push_text(value, "title", Some(title));
+            value.push_str(if cancellable {
+                ",\"cancellable\":true"
+            } else {
+                ",\"cancellable\":false"
+            });
+            push_text(value, "message", message);
+            push_percentage(value, percentage);
+        })
     }
 
     /// Reports progress: an optional message and percentage (0 to 100; LSP
@@ -479,10 +498,11 @@ impl WorkDone {
     ///
     /// See [`WorkDone`].
     pub fn report(&self, message: Option<&str>, percentage: Option<u32>) -> Result<(), Error> {
-        let mut value = String::from("{\"kind\":\"report\"");
-        push_text(&mut value, "message", message);
-        push_percentage(&mut value, percentage);
-        self.send(value)
+        self.send(|value| {
+            value.push_str("{\"kind\":\"report\"");
+            push_text(value, "message", message);
+            push_percentage(value, percentage);
+        })
     }
 
     /// Ends the work, with an optional final message.
@@ -495,21 +515,25 @@ impl WorkDone {
     ///
     /// See [`WorkDone`].
     pub fn end(&self, message: Option<&str>) -> Result<(), Error> {
-        let mut value = String::from("{\"kind\":\"end\"");
-        push_text(&mut value, "message", message);
-        self.send(value)
+        self.send(|value| {
+            value.push_str("{\"kind\":\"end\"");
+            push_text(value, "message", message);
+        })
     }
 
     /// Sends `$/progress` with `value` (an object missing its `}`).
-    fn send(&self, mut value: String) -> Result<(), Error> {
-        value.push('}');
-        let mut params = String::from("{\"token\":");
-        params.push_str(self.token.as_str());
-        params.push_str(",\"value\":");
-        params.push_str(&value);
-        params.push('}');
-        self.peer
-            .notify("$/progress", Json::Raw(Raw::trusted_owned(params)))
+    /// Sends `$/progress` for the token, with the `value` object `members`
+    /// opens and fills (its closing brace is added here), encoded in this
+    /// thread's reused buffer.
+    fn send(&self, members: impl FnOnce(&mut String)) -> Result<(), Error> {
+        let fill = |out: &mut String| {
+            out.push_str("{\"token\":");
+            out.push_str(self.token.as_str());
+            out.push_str(",\"value\":");
+            members(out);
+            out.push_str("}}");
+        };
+        with_buffer(fill, |params| self.peer.notify("$/progress", params))
     }
 }
 

@@ -62,6 +62,9 @@ impl ToJson for ErrorCode {
 }
 
 #[cfg(feature = "std")]
+pub(crate) use handlers::with_buffer;
+
+#[cfg(feature = "std")]
 mod handlers {
     use std::cell::RefCell;
 
@@ -88,7 +91,10 @@ mod handlers {
     /// Runs `send` with the JSON `fill` writes, in this thread's reused
     /// buffer (or a fresh one, if `fill` or `send` encodes another value on
     /// this thread meanwhile). `fill` must write exactly one JSON value.
-    fn with_buffer<R>(fill: impl FnOnce(&mut String), send: impl FnOnce(Raw<'_>) -> R) -> R {
+    pub(crate) fn with_buffer<R>(
+        fill: impl FnOnce(&mut String),
+        send: impl FnOnce(Raw<'_>) -> R,
+    ) -> R {
         BUFFER.with(|cell| match cell.try_borrow_mut() {
             Ok(mut buffer) => {
                 buffer.clear();
