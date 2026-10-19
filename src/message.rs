@@ -291,7 +291,7 @@ impl<'a> Message<'a> {
                     Ok(raw) => Ok(Json::Raw(raw.reborrow())),
                     Err(error) => Err(error),
                 };
-                write_response(out, r.id.as_ref(), result.as_ref().map_err(|e| *e));
+                write_response(out, r.id.as_ref(), result.as_ref().map_err(|e| *e), false);
             }
         }
     }
@@ -404,16 +404,22 @@ fn write_method_params(out: &mut String, method: &str, params: Option<&Json<'_>>
     out.push('}');
 }
 
-/// Writes a response.
+/// Writes a response. A `None` id is written as `"id":null`, or left out
+/// when `omit_null_id` (MCP's form).
 pub(crate) fn write_response(
     out: &mut String,
     id: Option<&Id<'_>>,
     result: Result<&Json<'_>, &ErrorObject>,
+    omit_null_id: bool,
 ) {
-    out.push_str("{\"jsonrpc\":\"2.0\",\"id\":");
+    out.push_str("{\"jsonrpc\":\"2.0\"");
     match id {
-        Some(id) => id.write(out),
-        None => out.push_str("null"),
+        Some(id) => {
+            out.push_str(",\"id\":");
+            id.write(out);
+        }
+        None if omit_null_id => {}
+        None => out.push_str(",\"id\":null"),
     }
     match result {
         Ok(value) => {
@@ -984,7 +990,10 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
         (None, None) => return fail("a response needs a `result` or an `error`".into()),
     };
     match id {
-        None => fail("a response needs an `id`".into()),
+        // MCP writes an error for a message whose id it could not read with
+        // no `id` at all (JSON-RPC 2.0 says `null`): the same answer.
+        None if result.is_err() => Ok(Message::Response(Response { id: None, result })),
+        None => fail("a successful response needs an `id`".into()),
         Some(IdValue::Invalid) => {
             fail("a response id must be a string, an integer, or null".into())
         }

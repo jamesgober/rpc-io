@@ -178,15 +178,14 @@ fn main() -> Result<(), rpc_io::Error> {
 
 ### Protocol presets
 
-`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the `initialize` gate, and the limits each protocol wants (MCP turns batches off, as its 2025-06-18 revision removed them, and serves `ping` before `initialize`). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
+`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the opening gate, and the limits each protocol wants. LSP waits for `initialize`. MCP's current revision (2026-07-28) is stateless, so `Config::mcp()` has no gate, keeps batches off (MCP removed them in 2025-06-18), and writes errors for unreadable messages without an `id`, as MCP's schema has it; `Config::mcp_legacy()` adds the `initialize` gate for servers whose clients all speak a legacy revision (2025-11-25 and earlier). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
 
 ```rust
 use rpc_io::{Config, Endpoint, Progress, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
     let router = Router::new()
-        .request("initialize", |_: &mut (), _, _| Ok(jsonx_lib::json!({ "protocolVersion": "2025-06-18" })))
-        .request("tools/call", |_, params, cx| {
+        .request("tools/call", |_: &mut (), params, cx| {
             if let Some(progress) = Progress::from_params(&params, cx.peer()) {
                 progress.report(1.0, Some(1.0), Some("done"))?;
             }
@@ -194,10 +193,9 @@ fn main() -> Result<(), rpc_io::Error> {
         });
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut endpoint = Endpoint::new(tx, router, ()).with_config(Config::mcp());
-    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)?;
     endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"progressToken":"p"}}}"#)?;
     let sent: Vec<String> = rx.try_iter().collect();
-    assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1,"total":1,"message":"done"}}"#);
+    assert_eq!(sent[0], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1,"total":1,"message":"done"}}"#);
     Ok(())
 }
 ```

@@ -22,13 +22,10 @@ fn mcp_server() -> Router<()> {
 }
 
 #[test]
-fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
+fn test_mcp_config_is_stateless_with_batches_off() {
+    // MCP 2026-07-28: no `initialize`, every request served at once.
     let (e, rx) = endpoint(mcp_server(), ());
     let mut e = e.with_config(Config::mcp());
-    assert!(
-        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
-            .is_ok()
-    );
     assert!(
         e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .is_ok()
@@ -37,13 +34,38 @@ fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
         e.handle(br#"[{"jsonrpc":"2.0","id":3,"method":"ping"}]"#)
             .is_ok()
     );
+    assert!(e.handle(b"{").is_ok());
+    let replies = sent(&rx);
+    assert_eq!(
+        replies[0],
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#
+    );
+    // Unreadable or refused before an id was read: no `id` at all, as
+    // MCP's schema has it.
+    assert_eq!(
+        replies[1],
+        r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"batches are not accepted"}}"#
+    );
+    assert!(replies[2].starts_with(r#"{"jsonrpc":"2.0","error":{"code":-32700"#));
+    assert!(replies.iter().all(|r| !r.contains("-32002")));
+}
+
+#[test]
+fn test_mcp_legacy_config_serves_ping_before_initialize() {
+    let (e, rx) = endpoint(mcp_server(), ());
+    let mut e = e.with_config(Config::mcp_legacy());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .is_ok()
+    );
     let replies = sent(&rx);
     assert_eq!(replies[0], r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
-    assert!(replies[1].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32002"#));
-    assert_eq!(
-        replies[2],
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batches are not accepted"}}"#
-    );
+    // `-32600`, never `-32002` (MCP's "resource not found").
+    assert!(replies[1].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600"#));
     assert!(
         e.handle(br#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{}}"#)
             .is_ok()
@@ -57,6 +79,62 @@ fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
         replies[1],
         r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[]}}"#
     );
+}
+
+#[test]
+fn test_mcp_overload_refusal_avoids_the_legacy_code_range() {
+    let router = Router::new().deferred("work", |kept: &mut Vec<rpc_io::Responder>, _, _, r| {
+        kept.push(r);
+    });
+    let (e, rx) = endpoint(router, Vec::new());
+    let mut e = e.with_config(Config::mcp().with_max_in_flight(1));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"work"}"#)
+            .is_ok()
+    );
+    let replies = sent(&rx);
+    assert!(
+        replies[0].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603"#),
+        "{}",
+        replies[0]
+    );
+    // The default stays JSON-RPC's server-error code.
+    let (e, rx) = endpoint(
+        Router::new().deferred("work", |kept: &mut Vec<rpc_io::Responder>, _, _, r| {
+            kept.push(r)
+        }),
+        Vec::new(),
+    );
+    let mut e = e.with_config(Config::new().with_max_in_flight(0));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)
+            .is_ok()
+    );
+    assert!(sent(&rx)[0].contains("-32000"));
+}
+
+#[test]
+fn test_error_response_without_id_is_one_under_null() {
+    let body = br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"bad"}}"#;
+    let Incoming::Single(Ok(rpc_io::Message::Response(response))) = decode(body, &Limits::new())
+    else {
+        panic!("refused");
+    };
+    assert!(response.id.is_none());
+    assert_eq!(
+        response.result.err().map(|e| e.code()),
+        Some(ErrorCode::PARSE_ERROR)
+    );
+    // A result needs an id, still.
+    let body = br#"{"jsonrpc":"2.0","result":1}"#;
+    let Incoming::Single(Err(invalid)) = decode(body, &Limits::new()) else {
+        panic!("accepted");
+    };
+    assert!(invalid.is_response());
 }
 
 #[test]

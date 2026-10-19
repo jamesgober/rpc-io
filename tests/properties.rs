@@ -434,9 +434,10 @@ fn reference(body: &str) -> Class {
         }
     }
     match id {
-        None | Some(RefId::Invalid) => Class::Dropped,
-        Some(RefId::Null) if result.is_some() => Class::Dropped,
-        Some(RefId::Null) => Class::Response {
+        Some(RefId::Invalid) => Class::Dropped,
+        None | Some(RefId::Null) if result.is_some() => Class::Dropped,
+        // An error with no `id` (MCP's form) is one under `null`.
+        None | Some(RefId::Null) => Class::Response {
             id: None,
             ok: false,
         },

@@ -32,7 +32,7 @@ use std::{
 use crate::{
     config::{Cancellation, Config},
     error::{CallError, Error},
-    error_object::ErrorObject,
+    error_object::{ErrorCode, ErrorObject},
     handles::CancelToken,
     id::Id,
     message::{write_call, write_numbered_call, write_response},
@@ -189,6 +189,8 @@ pub(crate) struct Settings {
     pub(crate) max_in_flight: usize,
     pub(crate) max_held_bytes: usize,
     pub(crate) timer: bool,
+    pub(crate) omit_null_id: bool,
+    pub(crate) overloaded_code: ErrorCode,
 }
 
 impl From<&Config> for Settings {
@@ -199,6 +201,8 @@ impl From<&Config> for Settings {
             max_in_flight: config.max_in_flight,
             max_held_bytes: config.max_held_bytes,
             timer: config.timer,
+            omit_null_id: config.omit_null_id,
+            overloaded_code: config.overloaded_code,
         }
     }
 }
@@ -739,7 +743,7 @@ impl<K: Sink> Inner<K> {
             bump(&mut self.stats.errors_out);
         }
         self.scratch.clear();
-        write_response(&mut self.scratch, id, result);
+        write_response(&mut self.scratch, id, result, self.settings.omit_null_id);
         let opening = match (&self.gate, id) {
             (GateState::Opening(opening), Some(id)) => opening == id,
             _ => false,

@@ -134,7 +134,7 @@ assert_eq!(end, End::Stopped);
 For any input, an [`Endpoint`](#endpoint):
 
 - answers every request exactly once, and never answers a valid notification;
-- answers a malformed message under its own id when the message has a `method` and a valid, unrepeated id, and under `null` otherwise; never answers a malformed *response* (it ends the call it names with `CallError::InvalidResponse` instead);
+- answers a malformed message under its own id when the message has a `method` and a valid, unrepeated id, and under `null` otherwise (with no `id` member at all under `Config::omit_null_id`, as MCP's schema has it); never answers a malformed *response* (it ends the call it names with `CallError::InvalidResponse` instead);
 - matches answers to our requests by id, and reports answers to ids it is not waiting on as [`Event::Unmatched`](#event);
 - contains handler and interceptor panics: the request is answered with `INTERNAL_ERROR`, the session goes on;
 - never panics, and holds memory within [`Limits`](#limits), [`QueueLimits`](#queued-and-outbox), and `Config::max_held_bytes`.
@@ -148,8 +148,8 @@ For any input, an [`Endpoint`](#endpoint):
 | `-32601` | `ErrorCode::METHOD_NOT_FOUND` | No request handler for the method. |
 | `-32602` | `ErrorCode::INVALID_PARAMS` | Returned by handlers; `Params::parse` and `Params::deserialize` produce it for params that do not parse or fit. |
 | `-32603` | `ErrorCode::INTERNAL_ERROR` | A handler or the interceptor panicked, a `Responder` was dropped without answering, or a typed result could not be serialized. |
-| `-32000` | `ErrorCode::SERVER_OVERLOADED` | More deferred requests than `Config::max_in_flight`. |
-| `-32002` | `ErrorCode::SERVER_NOT_INITIALIZED` | A request before the [`Gate`](#gate) opened (the gate's code; this is the default). |
+| `-32000` | `ErrorCode::SERVER_OVERLOADED` | More deferred requests than `Config::max_in_flight` (`Config::overloaded_code`; this is the default, and `Config::mcp()` uses `-32603`, since MCP asks new implementations not to use `-32000..=-32019`). |
+| `-32002` | `ErrorCode::SERVER_NOT_INITIALIZED` | A request before the [`Gate`](#gate) opened (the gate's code; this is the default of `Gate::new`, and `Gate::lsp()`'s; `Gate::mcp()` uses `-32600`). |
 | `-32800` | `ErrorCode::REQUEST_CANCELLED` | The peer cancelled the request (LSP; the cancellation's code). |
 | `-32801`, `-32802`, `-32803` | `CONTENT_MODIFIED`, `SERVER_CANCELLED`, `REQUEST_FAILED` | LSP's codes, for handlers to answer with. |
 
@@ -678,8 +678,16 @@ assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":
 | `cancellation` | `Some(Cancellation::lsp())` | How cancellation is spelled; `None` turns it off (the notification then reaches handlers). |
 | `gate` | none | An opening request every other request waits for. |
 | `timer` | `true` | Deadlines fire on their own, from a timer thread (see [Deadlines](#deadlines)). |
+| `omit_null_id` | `false` | An error for a message whose id could not be read carries `"id": null` (JSON-RPC 2.0); `true` leaves `id` out (MCP). An error response from the peer with either form is read as one under `null`. |
+| `overloaded_code` | `-32000` | The code of the refusal past `max_in_flight`. |
 
-Presets: `Config::lsp()` (LSP server: `Limits::lsp()`, `Cancellation::lsp()`, `Gate::lsp()`) and `Config::mcp()` (MCP server: `Limits::mcp()` with batches off, `Cancellation::mcp()`, `Gate::mcp()`). A client leaves the gate out (`with_gate(None)`).
+Presets:
+
+- `Config::lsp()`: an LSP server. `Limits::lsp()`, `Cancellation::lsp()`, `Gate::lsp()`. A client leaves the gate out (`with_gate(None)`).
+- `Config::mcp()`: MCP as of its current revision, 2026-07-28, for a server or a client. `Limits::mcp()` (batches off), `Cancellation::mcp()`, **no gate** (the protocol is stateless: every request carries its protocol version in `_meta`, and there is no `initialize`), `omit_null_id`, and `overloaded_code` `-32603`. This is also the preset of a dual-era server: the specification has such a server pick each request's semantics from the request itself (an `initialize` selects the legacy ones), which belongs to the protocol layer above.
+- `Config::mcp_legacy()`: a server for MCP's legacy revisions only (2025-11-25 and earlier): `Config::mcp()` plus `Gate::mcp()`. Modern clients never send `initialize`, so it refuses all their requests.
+
+Before 0.4.0, `Config::mcp()` was the legacy preset, with the `initialize` gate and its `-32002` refusals.
 
 ```rust
 use std::time::Duration;
@@ -691,6 +699,8 @@ let mcp = Config::new()
     .with_request_timeout(Some(Duration::from_secs(30)));
 assert_eq!(mcp.max_pending, 1024);
 assert_eq!(Config::mcp().limits.max_batch, 0);
+assert!(Config::mcp().gate.is_none());
+assert!(Config::mcp_legacy().gate.is_some());
 ```
 
 ## `Cancellation`
@@ -707,7 +717,7 @@ assert_eq!(custom.method, "$/cancel");
 
 ## `Gate`
 
-`#[non_exhaustive]` with public fields `method`, `code` (default `-32002`), `allow` (notifications), `allow_requests`. Constructors: `new(method)`, `lsp()` (`initialize`, `exit` allowed), `mcp()` (`initialize`, the `ping` request allowed), `allow(self, notification)`, `allow_request(self, request)`, `with_code(self, code)`.
+`#[non_exhaustive]` with public fields `method`, `code` (default `-32002`), `allow` (notifications), `allow_requests`. Constructors: `new(method)`, `lsp()` (`initialize`, `exit` allowed), `mcp()` (MCP's legacy handshake, revisions 2025-11-25 and earlier: `initialize`, the `ping` request allowed, refusals with `-32600`, since MCP used `-32002` for "resource not found" and forbids emitting it since), `allow(self, notification)`, `allow_request(self, request)`, `with_code(self, code)`.
 
 Until the opening request succeeds: other requests are refused with `code`, except those in `allow_requests`; notifications are dropped except those in `allow`; everything this side sends but responses is held, within `Config::max_held_bytes`, and sent in order right after the opening response. If the opening request fails (an error answer, or cancelled under a cancellation with no reply), held traffic is discarded, held requests end `Cancelled`, and the gate shuts again. A held request that times out or is cancelled is never sent; an answer to one is unmatched. A repeated opening request after success, and one in a batch, are refused with `-32600`.
 

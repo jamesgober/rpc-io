@@ -14,12 +14,19 @@
 ### Added
 
 - `Request::new`, `Notification::new`, `Response::new`, `Response::ok`, and `Response::err`.
+- `Config::mcp_legacy()`: the `initialize`-gated preset, for servers whose MCP clients all speak a legacy revision (2025-11-25 and earlier).
+- `Config::omit_null_id` / `with_omit_null_id`: an error for a message whose id could not be read leaves `id` out instead of writing `"id": null` (MCP's schema has `id?: RequestId`, never `null`).
+- `Config::overloaded_code` / `with_overloaded_code`: the code of the refusal past `max_in_flight` (default `-32000`, as before).
 
 ### Changed
 
 - **Breaking:** `Request`, `Notification`, and `Response` are `#[non_exhaustive]`, decided for the 1.0 surface (audit RPC-CQ-05), so a later version can keep more of the envelope without a break. Their fields stay public to read and to change. Migration: build them with the new constructors instead of struct literals, and add `..` to struct patterns.
 
 ### Fixed
+
+- **Behaviour fix, MCP:** `Config::mcp()` now follows MCP's current revision, 2026-07-28, which is stateless. In 0.3 it gated every request on `initialize`, so a modern client (which never sends one) had every request refused, with `-32002`, a code the revision forbids. It now has no gate, writes errors for unreadable messages without `id`, and refuses requests past `max_in_flight` with `-32603` instead of `-32000` (MCP asks new implementations not to use `-32000..=-32019`). Batches stay off and the cancellation spelling is unchanged. Migration: a server for legacy clients only uses `Config::mcp_legacy()`; a dual-era server keeps `Config::mcp()` and picks each request's semantics in the protocol layer, as the specification describes.
+- `Gate::mcp()` refuses early requests with `-32600` instead of `-32002`, which legacy MCP used for "resource not found".
+- An error response from the peer with no `id` member (MCP's form) is read as an error under `null` (reported as `Event::PeerError`) instead of being dropped as invalid.
 
 ### Security
 

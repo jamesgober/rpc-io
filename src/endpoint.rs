@@ -21,7 +21,7 @@ use crate::trace::event;
 use crate::{
     config::{Cancellation, Config, Gate},
     error::{CallError, Error},
-    error_object::{ErrorCode, ErrorObject, clip},
+    error_object::{ErrorObject, clip},
     framing::{Decoder, FrameError, Framing},
     handles::{Peer, Responder},
     id::Id,
@@ -865,15 +865,17 @@ impl<S, K: Sink> Endpoint<S, K> {
             }
             RequestHandler::Deferred(handler) => {
                 let owned = id.clone().into_owned();
-                let token = self.shared.lock().begin_deferred(owned.clone(), batch);
-                let Some(token) = token else {
+                let mut inner = self.shared.lock();
+                let Some(token) = inner.begin_deferred(owned.clone(), batch) else {
                     let error = ErrorObject::new(
-                        ErrorCode::SERVER_OVERLOADED,
+                        inner.settings.overloaded_code,
                         "too many requests are already being answered",
                     );
-                    let _reported = self.shared.lock().respond(Some(&id), batch, Err(&error));
+                    let _reported = inner.respond(Some(&id), batch, Err(&error));
                     return;
                 };
+                // The handler sends through the same lock.
+                drop(inner);
                 let responder = Responder::new(owned, token, Arc::clone(&self.link));
                 let state = &mut self.state;
                 let mut cx = Context::new(&self.link, stop, Some(&id), &method);
