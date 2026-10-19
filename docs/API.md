@@ -434,6 +434,7 @@ A call's `params`: validated, a slice of the message, parsed only when asked.
 | Method | Description |
 |---|---|
 | `parse(&self) -> Result<Value<'_>, ErrorObject>` | Parses with the endpoint's JSON budgets, duplicate keys refused; `Value::Null` when absent. The error is `INVALID_PARAMS`, ready for `?`. |
+| `decode<T: FromJson>(&self) -> Result<T, ErrorObject>` | Into a jsonx-lib `FromJson` type, with the endpoint's budgets and duplicate keys refused; `T` may borrow from the message. Absent params read as `null`. The error is `INVALID_PARAMS` naming the path and offset. |
 | `deserialize<T>(&self) -> Result<T, ErrorObject>` | Into a `serde` type (`serde`); absent params read as `null`. |
 | `raw(&self) -> Option<&Raw>` | The JSON text. |
 | `is_present(&self) -> bool` | Whether params were sent (`"params": null` reads as absent). |
@@ -505,7 +506,7 @@ fn main() -> Result<(), rpc_io::Error> {
 | `UnknownNotification { method }` | A notification with no handler. |
 | `Dropped { method }` | A notification dropped before the gate opened. |
 | `Refused { method, error }` | A notification the interceptor refused. |
-| `InvalidParams { method, error }` | A notification whose params did not fit its typed handler (`serde`). |
+| `InvalidParams { method, error }` | A notification whose params did not fit its typed handler (`notification_json`, or `notification_typed` with `serde`). |
 | `Unmatched { id }` | A response to an id we are not waiting on. |
 | `PeerError { error }` | An error response under `null`: the peer could not read something we sent. |
 | `Oversized { error }` | A message over `max_message_bytes`, skipped and answered under `null`. |
@@ -598,6 +599,7 @@ One of our requests. Ends in exactly one outcome. Dropping it before its outcome
 | `id(&self) -> u64` | The id on the wire. |
 | `deadline(&self) -> Option<Instant>` | The deadline, if any. |
 | `wait(self) -> Result<Raw<'static>, CallError>` | Blocks for the outcome, enforcing the deadline. On the endpoint's own thread returns `WouldDeadlock` unless the outcome is already there. |
+| `wait_json<T: FromJson>(self) -> Result<T, CallError>` | `wait`, then decodes the result (owned `T`); one that does not fit is `CallError::InvalidResponse`. |
 | `wait_typed<T>(self) -> Result<T, CallError>` | `wait`, then deserializes the result (`serde`). |
 | `try_wait(self) -> Result<Result<Raw<'static>, CallError>, Call>` | Never blocks; `Err(self)` while outstanding. |
 | `cancel(self) -> bool` | Cancels (sends the cancel notification); `false` if already ended. |
@@ -913,19 +915,36 @@ The primary typed API: jsonx-lib's own traits, hand-implemented (no derive, no r
 
 | Item | Description |
 |---|---|
-| `Router::request_encoded(method, FnMut(&mut S, Params, &mut Context) -> Result<R, ErrorObject>)` | `R: ToJson`, written straight into a buffer the endpoint reuses (released after a result over 64 KiB): no `Value` is built, and once the buffer has grown nothing is allocated for the result. |
+| `Router::request_json(method, FnMut(&mut S, P, &mut Context) -> Result<R, ErrorObject>)` | `P: for<'de> FromJson<'de>` (owned), `R: ToJson`. Params that do not decode are `INVALID_PARAMS` without calling the handler. The result is written as for `request_encoded`. |
+| `Router::request_encoded(method, FnMut(&mut S, Params, &mut Context) -> Result<R, ErrorObject>)` | `R: ToJson`, written straight into a buffer the endpoint reuses (released after a result over 64 KiB): no `Value` is built, and once the buffer has grown nothing is allocated for the result. With `Params::decode` inside, the way to take params that borrow from the message. |
+| `Router::notification_json(method, FnMut(&mut S, P, &mut Context))` | Params that do not decode are reported as `Event::InvalidParams`. |
+| `Params::decode::<T>()`, `Raw::decode::<T>()`, `Call::wait_json::<T>()` | Decoding; see [`Params`](#params), [`Raw`](#raw), [`Call`](#call). Errors name what did not fit, the byte offset, and the JSON Pointer path, clipped to 256 bytes (they may quote keys the peer chose). |
 | `Peer::notify_json(method, &T)`, `Peer::request_json(method, &T)`, and the same on `Context` | `T: ToJson`, encoded in a per-thread reused buffer (also released after 64 KiB); params must encode to an array, an object, or `null` (`Error::InvalidParams` otherwise). |
 | `Responder::ok_json(&T)` | The same, for a deferred answer from any thread. |
 | `Json::encode(&T) -> Json<'static>` | Compact JSON, allocated; for error `data` and the like. Infallible. |
-| `ToJson` for `Id` and `ErrorCode` | An integer, a string, a raw number's text, or `null`; an integer. |
+| `ToJson` for `Id`, `ErrorCode`, `ErrorObject`, `Raw`, `Json`; `FromJson` for `Id<'de>`, `ErrorCode`, `Raw<'de>` | An id writes as it is sent and decodes strictly (a string, borrowed when it has no escapes, or an `i64` integer); a code is an integer; an error object writes as a response carries it; a `Raw` writes its text and decodes as a value's source text, unparsed. |
 
 Encoding runs outside the endpoint's lock: a `ToJson` impl may itself send through a `Peer` (it gets a fresh buffer), and a panic in one is contained like a handler's (a request is answered with `INTERNAL_ERROR`; a panic while encoding params unwinds to the caller, and the buffer stays usable).
 
 ```rust
-use rpc_io::jsonx::{ToJson, ValueWriter, Written};
+use rpc_io::jsonx::{DecodeError, FromJson, Reader, ToJson, ValueWriter, Written};
 use rpc_io::{Endpoint, Router};
 
+struct Position { line: u64 }
 struct Hover { line: u64 }
+
+impl<'de> FromJson<'de> for Position {
+    fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
+        let mut line = None;
+        let mut object = reader.read_object()?;
+        while let Some(key) = object.next_key()? {
+            if key == "line" {
+                object.field(&mut line)?;
+            }
+        }
+        Ok(Position { line: object.required(line, "line")? })
+    }
+}
 
 impl ToJson for Hover {
     fn to_json(&self, out: ValueWriter<'_>) -> Written {
@@ -937,10 +956,7 @@ impl ToJson for Hover {
 }
 
 fn main() -> Result<(), rpc_io::Error> {
-    let router = Router::new().request_encoded("hover", |_: &mut (), params, _| {
-        let p = params.parse()?;
-        Ok(Hover { line: p["line"].as_u64().unwrap_or(0) })
-    });
+    let router = Router::new().request_json("hover", |_: &mut (), p: Position, _| Ok(Hover { line: p.line }));
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut endpoint = Endpoint::new(tx, router, ());
     endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"hover","params":{"line":3}}"#)?;
@@ -1217,7 +1233,7 @@ assert_eq!(Id::raw_number("1e3").map(|id| id.to_string()).as_deref(), Some("1e3"
 
 ## `Raw`
 
-One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `deserialize::<T>()` (`serde`); `into_owned()`.
+One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `decode::<T>()` (a jsonx-lib `FromJson`, borrowing from the text; `jsonx::DecodeError`); `deserialize::<T>()` (`serde`); `into_owned()`. `ToJson` (the text, validated again on the way out) and `FromJson` (a value's source text, borrowed, unparsed).
 
 ```rust
 fn main() -> Result<(), rpc_io::jsonx::Error> {

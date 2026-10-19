@@ -224,3 +224,134 @@ fn test_typed_answers_from_other_threads() {
         Some(r#"{"jsonrpc":"2.0","id":1,"result":[1,1,1]}"#)
     );
 }
+
+#[test]
+fn test_params_decode_borrows_from_the_message() {
+    let router = Router::new().request("first", |_: &mut (), params, _| {
+        let words: Vec<&str> = params.decode()?;
+        // Borrowed: the slice lies inside the params' own text.
+        let text = params.raw().map(|r| r.as_str()).unwrap_or_default();
+        let inside = words.first().is_some_and(|w| {
+            let (start, end) = (text.as_ptr() as usize, text.as_ptr() as usize + text.len());
+            (start..end).contains(&(w.as_ptr() as usize))
+        });
+        Ok(inside)
+    });
+    let (mut e, rx) = endpoint(router, ());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"first","params":["a","b"]}"#)
+            .is_ok()
+    );
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":1,"result":true}"#]);
+}
+
+#[test]
+fn test_request_json_refuses_params_that_do_not_fit() {
+    let router = Router::new().request_json("pair", |_: &mut (), p: (u8, String), _| {
+        Ok(p.1.len() + usize::from(p.0))
+    });
+    let (e, rx) = endpoint(router, ());
+    let config = rpc_io::Config::new()
+        .with_limits(rpc_io::Limits::new().with_json(jsonx_lib::Limits::new().with_max_depth(3)));
+    let mut e = e.with_config(config);
+    let long_key = "k".repeat(10_000);
+    for (params, ok) in [
+        (r#"[2,"abc"]"#.to_owned(), true),
+        (r#"[300,"abc"]"#.to_owned(), false),   // out of range
+        (r#"[1]"#.to_owned(), false),           // too short
+        (r#"{"a":1,"a":2}"#.to_owned(), false), // repeated key
+        (format!(r#"{{"{long_key}":1}}"#), false), // the error quotes a key: clipped
+    ] {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"pair","params":{params}}}"#);
+        assert!(e.handle(body.as_bytes()).is_ok());
+        let reply = sent(&rx).concat();
+        if ok {
+            assert_eq!(reply, r#"{"jsonrpc":"2.0","id":1,"result":5}"#);
+        } else {
+            assert!(reply.contains("-32602"), "{params}: {reply}");
+            assert!(reply.len() < 1024, "{} bytes", reply.len());
+        }
+    }
+    // Over the endpoint's depth budget: the whole message is refused when it
+    // is decoded, before any handler.
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"pair","params":[1,[[["deep"]]]]}"#)
+            .is_ok()
+    );
+    assert!(sent(&rx).concat().contains("-32600"));
+    // Absent params read as `null`.
+    let router =
+        Router::new().request_json("opt", |_: &mut (), p: Option<Vec<u8>>, _| Ok(p.is_none()));
+    let (mut e, rx) = endpoint(router, ());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"opt"}"#)
+            .is_ok()
+    );
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":1,"result":true}"#]);
+}
+
+#[test]
+fn test_decode_errors_say_where() {
+    let router = Router::new().request("m", |_: &mut (), params, _| {
+        params.decode::<Vec<Vec<u8>>>().map(|_| ())
+    });
+    let (mut e, rx) = endpoint(router, ());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":[[1],[2,"x"]]}"#)
+            .is_ok()
+    );
+    let reply = sent(&rx).concat();
+    assert!(reply.contains("/1/1"), "{reply}");
+}
+
+#[test]
+fn test_notification_json_reports_params_that_do_not_fit() {
+    use rpc_io::Event;
+
+    let router = Router::new()
+        .notification_json("n", |seen: &mut Vec<String>, p: Vec<u8>, _| {
+            seen.push(format!("{p:?}"))
+        })
+        .on_event(|seen: &mut Vec<String>, event| {
+            if let Event::InvalidParams { method, error } = event {
+                seen.push(format!("{method}: {}", error.code()));
+            }
+        });
+    let (mut e, rx) = endpoint(router, Vec::new());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","method":"n","params":[1,2]}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","method":"n","params":["x"]}"#)
+            .is_ok()
+    );
+    assert_eq!(e.state()[0], "[1, 2]");
+    assert!(e.state()[1].starts_with("n: -32602"));
+    assert!(sent(&rx).is_empty());
+}
+
+#[test]
+fn test_wait_json_decodes_or_refuses_the_result() {
+    use rpc_io::CallError;
+
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, Router::<()>::new(), ());
+    let good = e.peer().request("a", ());
+    let bad = e.peer().request("b", ());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"result":{"k":[1,2]}}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"result":"nope"}"#)
+            .is_ok()
+    );
+    let good = good.map(|c| c.wait_json::<std::collections::BTreeMap<String, Vec<u8>>>());
+    assert_eq!(
+        good.ok().and_then(Result::ok).map(|m| m["k"].clone()),
+        Some(vec![1, 2])
+    );
+    let bad = bad.map(|c| c.wait_json::<u8>());
+    assert!(matches!(bad, Ok(Err(CallError::InvalidResponse(_)))));
+}

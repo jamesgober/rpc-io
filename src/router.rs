@@ -829,9 +829,9 @@ pub enum Event<'a> {
         /// The interceptor's error.
         error: &'a ErrorObject,
     },
-    /// A notification's params did not fit what its handler takes (a
-    /// [typed](Router::notification_typed) handler, with the `serde`
-    /// feature); the handler was not called.
+    /// A notification's params did not fit what its handler takes (a typed
+    /// handler: [`Router::notification_json`], or `notification_typed` with
+    /// the `serde` feature); the handler was not called.
     InvalidParams {
         /// The method.
         method: &'a str,

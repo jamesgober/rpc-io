@@ -84,7 +84,7 @@ rpc-io = { version = "0.3", default-features = false }
 | Feature | Default | Adds |
 |---|---|---|
 | `std` | yes | The endpoint, its handles, `serve`, `Queued`, `outbox`, progress helpers. |
-| `serde` | no | Typed params and results: `Router::request_typed`, `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed` (with `serde` and `serde_json`). |
+| `serde` | no | Typed params and results through `serde`, as an alternative to the built-in `ToJson`/`FromJson` API: `Router::request_typed`, `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed` (with `serde` and `serde_json`). |
 | `futures-io` | no | The async adapter: `Endpoint::run_async`, and `Outbox` as `AsyncRead`/`AsyncBufRead` with `write_to`. Runtime-agnostic. |
 | `tracing` | no | Spans for every call and events for what the endpoint does on its own. Off, the instrumentation compiles to nothing. |
 | `net` | no | `Server`: an accept loop over TCP and, on Unix, Unix domain sockets. |
@@ -220,7 +220,51 @@ fn main() -> Result<(), rpc_io::FrameError> {
 }
 ```
 
-Typed params through `serde`, the async adapter, the TCP server, and the interceptor have examples in [`docs/API.md`](./docs/API.md).
+### Typed params and results
+
+jsonx-lib's `FromJson` and `ToJson` (hand-written, no derive) are the typed API, in every build: `Router::request_json` decodes a handler's params and encodes its result, `Params::decode` decodes params that borrow from the message, and `Peer::notify_json`, `request_json`, `Responder::ok_json`, and `Call::wait_json` do the same for the other directions. Results are written straight into a buffer the endpoint reuses, so a typed handler builds no `Value` and, once the buffer has grown, allocates nothing for its result.
+
+```rust
+use rpc_io::jsonx::{DecodeError, FromJson, Reader, ToJson, ValueWriter, Written};
+use rpc_io::{Endpoint, Router};
+
+struct Add { a: i64, b: i64 }
+struct Sum(i64);
+
+impl<'de> FromJson<'de> for Add {
+    fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
+        let (mut a, mut b) = (None, None);
+        let mut object = reader.read_object()?;
+        while let Some(key) = object.next_key()? {
+            match &*key {
+                "a" => object.field(&mut a)?,
+                "b" => object.field(&mut b)?,
+                _ => {}
+            }
+        }
+        Ok(Add { a: object.required(a, "a")?, b: object.required(b, "b")? })
+    }
+}
+
+impl ToJson for Sum {
+    fn to_json(&self, out: ValueWriter<'_>) -> Written {
+        out.object(|o| o.member("sum", &self.0))
+    }
+}
+
+fn main() -> Result<(), rpc_io::Error> {
+    let router = Router::new().request_json("add", |_: &mut (), p: Add, _| Ok(Sum(p.a + p.b)));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"add","params":{"a":2,"b":3}}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"sum":5}}"#));
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"add","params":{"a":2}}"#)?;
+    assert!(rx.try_recv().is_ok_and(|m| m.contains("-32602"))); // `b` is missing
+    Ok(())
+}
+```
+
+Typed params through `serde` (the `serde` feature), the async adapter, the TCP server, and the interceptor have examples in [`docs/API.md`](./docs/API.md).
 
 <hr>
 <br>
