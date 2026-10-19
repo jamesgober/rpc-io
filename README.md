@@ -288,42 +288,45 @@ Runnable programs in [`examples/`](./examples):
 
 Decoding is one pass of `jsonx-lib`'s pull reader over each body: the envelope members are read as raw slices, so `params` and `result` are validated once and never copied or decoded unless a handler asks. Method names and string ids borrow from the body when they have no escapes, and deferred requests are looked up without copying their ids. `Framed` frames messages into a reused buffer and writes once per turn, however many messages a handler sends; `Queued` writes each batch of queued messages with one `write_all` and one `flush`. The decoder reads straight into its own buffer, searches for line ends eight bytes at a time, resumes each search where the last one stopped, and grows geometrically while a large message arrives.
 
-Measured with the benchmarks in [`benches/`](./benches), x86_64 Windows, Rust 1.99, release profile, on LSP-shaped `textDocument/hover` requests (about 160 bytes each), against jsonx-lib 0.5's tip. The machine was loaded by other work, so 0.3.0 and 0.4.0 ran alternately in the same session (four rounds for the `endpoint` and `typed` rows, two for the rest), and each figure is the range of medians over those rounds: compare columns, not absolutes on another machine.
+Throughput, measured with the benchmarks in [`benches/`](./benches): x86_64 Windows, Rust 1.99, release profile, LSP-shaped `textDocument/hover` requests (about 160 bytes each), jsonx-lib 0.5 at `2161d2c`. The machine was loaded by other work, so each figure is the range of medians over two rounds: a guide to scale, not a speed to quote.
 
-| Benchmark | What it measures | 0.3.0 | 0.4.0 |
-|---|---|---:|---:|
-| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | 4.0-4.1 GiB/s | 3.9-4.1 GiB/s |
-| `framing/decode_100k_Newline` | The same with newline framing. | 6.6-6.9 GiB/s | 7.2-7.3 GiB/s |
-| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | 1.7 / 1.9-2.0 GiB/s | 1.9-2.2 / 1.9 GiB/s |
-| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | 2.1-2.8 M/s | 2.2-2.4 M/s |
-| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | 350-380 µs | 360-390 µs |
-| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | 2.6-2.7 M/s | 2.6-2.9 M/s |
-| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params` into a `Value`, build a result, encode, frame, write. | 575-750 K/s | 575-590 K/s |
-| `endpoint/handle_100k_unparsed` | The endpoint's own cost: the same 100,000 requests to a handler that reads nothing and answers `null`. | 1.69-2.11 M/s | 1.63-1.65 M/s |
-| `endpoint/run_100k_framed_requests` | The same as `handle_100k_requests`, read from one Content-Length stream by `run`, written by `Framed`. | 565-730 K/s | 555-585 K/s |
-| `endpoint/run_100k_queued` | The same through a `Queued` sink: a writer thread does the writes, and the time includes waiting for it to finish. | 525-615 K/s | 510-540 K/s |
-| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | 1.8-1.9 M pairs/s | 1.7-1.8 M pairs/s |
-| `typed/handle_100k_json_borrowed` | The hover path through a `FromJson` struct borrowed from the message and a `ToJson` result (`request_encoded` + `Params::decode`). | | 990-1,025 K/s |
-| `typed/handle_100k_request_json` | The same through `request_json`, owned params. | | 1,000-1,030 K/s |
-| `typed/handle_100k_serde` | The same through `serde` (the `serde` feature). | 1.25-1.64 M/s | 1.19-1.24 M/s |
-| `typed/progress_100k_reports` | 100,000 MCP progress reports. | 2.0-2.4 M/s | 8.3-9.0 M/s |
+| Benchmark | What it measures | 0.4.0 |
+|---|---|---:|
+| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | 3.6-4.8 GiB/s |
+| `framing/decode_100k_Newline` | The same with newline framing. | 7.3-8.0 GiB/s |
+| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | 2.1-2.7 / 1.5-2.0 GiB/s |
+| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | 2.5-2.7 M/s |
+| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | 300-380 µs |
+| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | 2.5-2.8 M/s |
+| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params` into a `Value`, build a result, encode, frame, write. | 540-640 K/s |
+| `endpoint/handle_100k_unparsed` | The endpoint's own cost: the same 100,000 requests to a handler that reads nothing and answers `null`. | 1.70-1.95 M/s |
+| `endpoint/run_100k_framed_requests` | The same as `handle_100k_requests`, read from one Content-Length stream by `run`, written by `Framed`. | 560-610 K/s |
+| `endpoint/run_100k_queued` | The same through a `Queued` sink: a writer thread does the writes, and the time includes waiting for it to finish. | 505-540 K/s |
+| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | 2.2-2.4 M pairs/s |
+| `typed/handle_100k_json_borrowed` | The hover path through a `FromJson` struct borrowed from the message and a `ToJson` result (`request_encoded` + `Params::decode`). | 1.13-1.14 M/s |
+| `typed/handle_100k_request_json` | The same through `request_json`, owned params. | 1.08-1.15 M/s |
+| `typed/handle_100k_serde` | The same through `serde` (the `serde` feature). | 1.39-1.47 M/s |
+| `typed/progress_100k_reports` | 100,000 MCP progress reports. | 10.4-11.0 M/s |
 
-Wall-clock time on this machine drifted between rounds by more than the versions differ: 0.3.0's figures span up to 25%, and in a bisect over four commits the same build measured up to 30% apart from one round to the next, faster or slower than 0.3.0 depending on the round. To compare the work itself, a separate harness counted CPU cycles per request on the endpoint's thread (`QueryThreadCycleTime`, which leaves out time the thread is not running) over the same workload, a fresh endpoint and 100,000 distinct hover requests, five runs of each version interleaved:
+Against 0.3.0, wall-clock time on this machine drifted between rounds by more than the versions differ, so the comparison counts CPU cycles per request on the endpoint's thread instead (`QueryThreadCycleTime`, which leaves out time the thread is not running), with [`dev/ab`](./dev/ab): rpc-io 0.3.0 from crates.io and this tree in one binary, 100,000 distinct hover requests on a fresh endpoint per run, the two versions alternating within each round. Two independent sets of runs: the 0.4.0 release verification's (jsonx-lib `51205c2`, before the serde change below) and a later one (jsonx-lib `2161d2c`, 2 x 11 rounds). Each figure is the change in minimum cycles, as the range over both sets.
 
-| Per request | 0.3.0 | 0.4.0 |
-|---|---:|---:|
-| Endpoint path, handler reads nothing (min cycles) | 1,935-1,971 | 1,729-1,896 |
-| Handler parses `params` into a `Value` and builds a result (min cycles) | 5,892-6,040 | 5,243-5,307 |
-| `decode` alone (min cycles) | 1,473-1,536 | 1,290-1,435 |
-| Allocations: endpoint path / `decode` / a handler that parses `params` | 1 / 1 / 9 | 0 / 0 / 6 |
+| Per request, 0.4.0 against 0.3.0 | Change in CPU cycles |
+|---|---:|
+| Endpoint path, handler reads nothing | -8.0% to +1.3% |
+| `decode` alone | -11.8% to +1.2% |
+| `run` over one Content-Length stream | -9.3% to +4.4% |
+| Handler parses `params` into a `Value` and builds a result | -7.7% to -4.1% |
+| `serde` typed handler (the later set only: the verification's runs predate writing serde results into the endpoint's buffer, and measured +3.5% by median before it) | -0.4% to +1.3% |
+| Progress report | -75.4% to -76% |
 
-0.4.0 does less work per request: envelopes are read with jsonx-lib 0.5's duplicate-key tracking off (rpc-io checks repeated envelope members itself), and jsonx-lib 0.5 reads and parses with fewer allocations. Progress reports are about four times faster (3.4-4.5 times): they are encoded into a reused per-thread buffer instead of allocating their text and numbers. The `FromJson` path is 15-20% behind `serde_json`'s in these rounds; it refuses repeated keys anywhere in the params (the endpoint's policy), where serde's derive ignores repeats of members it does not know.
+The endpoint path and `decode` cost about what they did in 0.3.0: within a few percent either way, depending on the jsonx-lib commit and the machine. Handlers that parse params are 4-8% cheaper, and progress reports cost about a quarter of what they did (they are encoded into a reused per-thread buffer instead of allocating their text and numbers). The `FromJson` path is 17-27% behind `serde_json`'s in throughput; it refuses repeated keys anywhere in the params (the endpoint's policy), where serde's derive ignores repeats of members it does not know.
 
 The queued path costs a hand-off to the writer thread per batch; it buys senders that do not wait on the peer while the connection is open. Use `Framed` for a peer that always reads (a local pipe), `Queued` for anything that might stall.
 
 ```bash
 cargo bench --bench bench
 cargo bench --features serde --bench typed
+cd dev/ab && cargo run --release -- 11   # the cycle A/B against 0.3.0 (Windows)
 ```
 
 Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by CPU and load; use the trend across runs, not a single absolute.
