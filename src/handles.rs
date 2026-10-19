@@ -942,7 +942,7 @@ impl Notifier {
         let params = outgoing_params(params)?;
         self.peer
             .link()
-            .notify_in(&self.scope, method, params.as_ref())
+            .notify_in(&self.scope, None, method, params.as_ref())
     }
 }
 

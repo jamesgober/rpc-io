@@ -23,7 +23,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, ThreadId},
     time::{Duration, Instant},
@@ -63,16 +63,27 @@ pub(crate) enum Scope {
 }
 
 /// The state of a request answered by its handler's return value, shared by
-/// its bound handles.
+/// its bound handles. Read and written only under the shared lock (atomics
+/// so it can be shared between threads at all).
 #[derive(Debug, Default)]
 pub(crate) struct Turn {
-    /// Set (under the shared lock) when the response is written.
+    /// Set when the response is written.
     done: AtomicBool,
+    /// The last progress value sent for the request, as `f64` bits; `NO_PROGRESS`
+    /// before the first.
+    progress: AtomicU64,
 }
+
+/// `Turn::progress` before any report: the bits of a NaN, which no report
+/// can carry (reports are finite).
+const NO_PROGRESS: u64 = u64::MAX;
 
 impl Turn {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            done: AtomicBool::new(false),
+            progress: AtomicU64::new(NO_PROGRESS),
+        }
     }
 
     /// Marks the request answered; called under the lock the response is
@@ -86,10 +97,13 @@ impl Turn {
 pub(crate) trait Link: Send + Sync {
     fn notify(&self, method: &str, params: Option<&Json<'_>>) -> Result<(), Error>;
     /// As `notify`, refused with `Error::AlreadyAnswered` once `scope`'s
-    /// request is answered or cancelled.
+    /// request is answered or cancelled. With `progress`, refused with
+    /// `Error::ProgressNotIncreasing` unless it exceeds the last progress
+    /// value sent for that request (bound scopes only).
     fn notify_in(
         &self,
         scope: &Scope,
+        progress: Option<f64>,
         method: &str,
         params: Option<&Json<'_>>,
     ) -> Result<(), Error>;
@@ -193,6 +207,7 @@ impl<K: Sink> Link for Shared<K> {
     fn notify_in(
         &self,
         scope: &Scope,
+        progress: Option<f64>,
         method: &str,
         params: Option<&Json<'_>>,
     ) -> Result<(), Error> {
@@ -200,18 +215,38 @@ impl<K: Sink> Link for Shared<K> {
         if inner.closed {
             return Err(Error::Closed);
         }
-        let live = match scope {
-            Scope::Free => true,
-            Scope::Turn(turn) => !turn.done.load(Ordering::Acquire),
-            Scope::Deferred { id, serial } => inner
-                .in_flight
-                .get(id)
-                .is_some_and(|request| request.serial == *serial),
+        let last = match scope {
+            Scope::Free => None,
+            Scope::Turn(turn) => {
+                if turn.done.load(Ordering::Acquire) {
+                    return Err(Error::AlreadyAnswered);
+                }
+                let bits = turn.progress.load(Ordering::Acquire);
+                (bits != NO_PROGRESS).then(|| f64::from_bits(bits))
+            }
+            Scope::Deferred { id, serial } => match inner.in_flight.get(id) {
+                Some(request) if request.serial == *serial => request.progress,
+                _ => return Err(Error::AlreadyAnswered),
+            },
         };
-        if !live {
-            return Err(Error::AlreadyAnswered);
+        if let (Some(next), Some(last)) = (progress, last) {
+            if next <= last {
+                return Err(Error::ProgressNotIncreasing { last, next });
+            }
         }
-        inner.notify(method, params)
+        inner.notify(method, params)?;
+        if let Some(next) = progress {
+            match scope {
+                Scope::Free => {}
+                Scope::Turn(turn) => turn.progress.store(next.to_bits(), Ordering::Release),
+                Scope::Deferred { id, .. } => {
+                    if let Some(request) = inner.in_flight.get_mut(id) {
+                        request.progress = Some(next);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn request(
@@ -363,6 +398,8 @@ struct InFlight {
     /// its handles carry it, so they never act on a later request that
     /// reuses the id.
     serial: u64,
+    /// The last progress value sent for it, shared by all its handles.
+    progress: Option<f64>,
 }
 
 /// Deferred requests by id. Integer, string, and other (lenient) ids are
@@ -422,6 +459,15 @@ impl<V> IdMap<V> {
             Id::String(s) => self.strings.get(&**s),
             Id::RawNumber(s) => self.raw_numbers.get(&**s),
             Id::Null => self.null.as_ref(),
+        }
+    }
+
+    fn get_mut(&mut self, id: &Id<'_>) -> Option<&mut V> {
+        match id {
+            Id::Number(n) => self.numbers.get_mut(n),
+            Id::String(s) => self.strings.get_mut(&**s),
+            Id::RawNumber(s) => self.raw_numbers.get_mut(&**s),
+            Id::Null => self.null.as_mut(),
         }
     }
 
@@ -963,6 +1009,7 @@ impl<K: Sink> Inner<K> {
                 token: token.clone(),
                 batch,
                 serial,
+                progress: None,
             },
         );
         Some((token, serial))

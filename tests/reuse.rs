@@ -22,6 +22,7 @@ fn router() -> Router<Kept> {
     Router::new().deferred("work", |kept: &mut Kept, params, cx, responder| {
         kept.notifiers.push(responder.notifier());
         kept.progress.extend(responder.progress(&params));
+        // Created separately: shares the request's history with the other.
         kept.progress.extend(cx.progress(&params));
         kept.responders.push(responder);
     })
@@ -133,6 +134,40 @@ fn test_stale_notifiers_and_progress_stay_quiet_after_the_id_is_reused() {
         assert!(!traffic.contains("t1"), "{traffic}");
         drop(second.responders);
     }
+}
+
+#[test]
+fn test_separately_made_progress_handles_share_their_request_history() {
+    // Deferred: one from the responder, one from the context.
+    let (e, rx) = endpoint(router(), Kept::default());
+    let mut e = e.with_config(Config::mcp());
+    assert!(e.handle(work(1, "p").as_bytes()).is_ok());
+    let kept = std::mem::take(e.state_mut());
+    assert_eq!(kept.progress.len(), 2);
+    assert!(kept.progress[0].report(2.0, None, None).is_ok());
+    assert!(matches!(
+        kept.progress[1].report(1.0, None, None),
+        Err(Error::ProgressNotIncreasing { last, next }) if last == 2.0 && next == 1.0
+    ));
+    assert!(kept.progress[1].report(3.0, None, None).is_ok());
+    assert_eq!(sent(&rx).len(), 2);
+    drop(kept.responders);
+    // Answered by its return value: two `cx.progress` calls in one handler.
+    let router = Router::new().request("now", |_: &mut (), params, cx| {
+        let (a, b) = (cx.progress(&params), cx.progress(&params));
+        let (Some(a), Some(b)) = (a, b) else {
+            return Ok(false);
+        };
+        a.report(5.0, None, None)?;
+        Ok(b.report(4.0, None, None).is_err())
+    });
+    let (mut e, rx) = endpoint(router, ());
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"now","params":{"_meta":{"progressToken":1}}}"#;
+    assert!(e.handle(body).is_ok());
+    assert_eq!(
+        sent(&rx).last().map(String::as_str),
+        Some(r#"{"jsonrpc":"2.0","id":1,"result":true}"#)
+    );
 }
 
 #[test]

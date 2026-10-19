@@ -118,8 +118,11 @@ fn push_text(out: &mut String, name: &str, text: Option<&str>) {
 /// stdio, also once the peer cancelled it). A `Progress` holds both rules:
 ///
 /// - [`report`](Progress::report) refuses a value that does not exceed the
-///   last one sent for this handle and its clones, with
-///   [`Error::ProgressNotIncreasing`], and sends nothing;
+///   last one sent, with [`Error::ProgressNotIncreasing`], and sends
+///   nothing. For a handle bound to a request the history is the request's,
+///   shared by every handle made for it (each call of `Context::progress` or
+///   `Responder::progress`, and their clones); for one bound to nothing it is
+///   the handle's, shared by its clones;
 /// - one made by [`Context::progress`] or [`Responder::progress`] is bound to
 ///   its request: once the request is answered or cancelled (or the
 ///   connection closes), `report` refuses with [`Error::AlreadyAnswered`],
@@ -159,8 +162,10 @@ pub struct Progress {
     peer: Peer,
     token: Raw<'static>,
     scope: Scope,
-    /// The value last sent, shared by the clones: held while a report is
-    /// checked and sent, so concurrent reports reach the wire in order.
+    /// For a handle bound to no request, the value last sent, shared by the
+    /// clones: held while a report is checked and sent, so concurrent reports
+    /// reach the wire in order. A bound handle's history is its request's,
+    /// kept with the request under the shared lock instead.
     last: Arc<Mutex<Option<f64>>>,
 }
 
@@ -269,11 +274,16 @@ impl Progress {
         if let Some(total) = total {
             finite("total", total)?;
         }
-        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(last) = *last {
-            if progress <= last {
+        // A handle bound to a request has its history checked and kept with
+        // the request, under the lock the report is sent under, so every
+        // handle for that request shares it. One bound to nothing keeps its
+        // own, shared by its clones, under this lock.
+        let bound = !matches!(self.scope, Scope::Free);
+        let mut last = (!bound).then(|| self.last.lock().unwrap_or_else(PoisonError::into_inner));
+        if let Some(Some(last)) = last.as_deref() {
+            if progress <= *last {
                 return Err(Error::ProgressNotIncreasing {
-                    last,
+                    last: *last,
                     next: progress,
                 });
             }
@@ -292,11 +302,14 @@ impl Progress {
         with_buffer(fill, |params| {
             self.peer.link().notify_in(
                 &self.scope,
+                bound.then_some(progress),
                 "notifications/progress",
                 Some(&Json::Raw(params)),
             )
         })?;
-        *last = Some(progress);
+        if let Some(last) = last.as_deref_mut() {
+            *last = Some(progress);
+        }
         Ok(())
     }
 }
