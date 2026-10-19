@@ -5,8 +5,9 @@
 //! service APIs. Build a [`Router`] of handlers, hand it a byte stream, and the
 //! crate does the rest: framing, the envelope, batches, id correlation,
 //! cancellation, deadlines, and the error codes the specification prescribes,
-//! with bounded buffers and no panics on any input. JSON is [`jsonx_lib`], the
-//! family's own; the default build has no third-party runtime dependency.
+//! with bounded buffers and no panics on any input. JSON is jsonx-lib, the
+//! family's own, re-exported as [`jsonx`]; the default build has no
+//! third-party runtime dependency.
 //!
 //! The Content-Length framing ([`Framing::ContentLength`], [`Decoder`]) is
 //! also the base protocol of the Debug Adapter Protocol and cuts DAP messages
@@ -18,7 +19,7 @@
 //! ```
 //! # #[cfg(not(feature = "std"))] fn main() {}
 //! # #[cfg(feature = "std")] fn main() -> Result<(), rpc_io::Error> {
-//! use jsonx_lib::json;
+//! use rpc_io::jsonx::json;
 //! use rpc_io::{End, Framing, Router};
 //!
 //! let router = Router::new()
@@ -70,13 +71,19 @@
 //!
 //! - **Every request gets exactly one response; no valid notification gets
 //!   one.** A malformed message is answered under its own id when that id
-//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires.
+//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires
+//!   (with no `id` at all under [`Config::omit_null_id`], as MCP has it).
 //! - **Handler panics are contained.** A request whose handler panics is
 //!   answered with `INTERNAL_ERROR` (the panic message goes to the event
 //!   hook, never to the peer), and the endpoint keeps serving. This needs
 //!   `panic = "unwind"`, Rust's default.
-//! - **Ids are strings or integers.** `null`, fractional, and out-of-range
-//!   request ids are refused as invalid requests (LSP and MCP forbid them).
+//! - **Ids are strings or integers by default.** `null`, fractional, and
+//!   out-of-range request ids are refused as invalid requests (LSP and MCP
+//!   forbid them); [`Limits::with_lenient_ids`] accepts them and echoes them
+//!   back as sent, for generic JSON-RPC services.
+//! - **Repeated envelope members are refused.** A message with two
+//!   `method`s (or `id`s, `params`, ...) is invalid, so no reader can see one
+//!   method and run another.
 //!
 //! ## Features
 //!
@@ -84,9 +91,11 @@
 //!   async-drained sinks, and the progress helpers. Without it the crate is
 //!   `no_std` (needs `alloc`): framing, the message model, and the
 //!   correlation map.
-//! - `serde`: typed params and results ([`Router::request_typed`],
-//!   `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed`),
-//!   through `serde` and `serde_json`.
+//! - `serde`: typed params and results through `serde` and `serde_json`
+//!   (`Router::request_typed`, `Params::deserialize`, `Peer::request_typed`,
+//!   `Call::wait_typed`), an alternative to the typed API every build has:
+//!   jsonx-lib's `FromJson` and `ToJson` ([`Router::request_json`],
+//!   [`Params::decode`], [`Peer::notify_json`], [`Call::wait_json`]).
 //! - `futures-io`: the async adapter over `futures-io`'s traits
 //!   (`Endpoint::run_async`, `Outbox::write_to`); runtime-agnostic.
 //! - `tracing`: spans for every call and events for what the endpoint does
@@ -121,6 +130,7 @@ extern crate alloc;
 
 #[cfg(feature = "futures-io")]
 mod aio;
+mod convert;
 mod error_object;
 mod framing;
 mod id;
@@ -159,6 +169,24 @@ mod trace;
 #[cfg(feature = "serde")]
 mod typed;
 
+/// jsonx-lib, the JSON this crate is built on, re-exported: its types are
+/// part of this crate's API ([`Raw::parse`] returns a [`jsonx::Value`],
+/// [`Json`] converts from one, typed handlers take [`jsonx::ToJson`]), so a
+/// crate on top (an LSP or MCP server) uses them through `rpc_io::jsonx` and
+/// always gets the same jsonx-lib version as this crate, with no dependency
+/// of its own to keep in step. `rpc_io::jsonx::json!` builds values.
+///
+/// # Examples
+///
+/// ```
+/// use rpc_io::jsonx::{self, json};
+///
+/// let value = json!({ "line": 3 });
+/// assert_eq!(jsonx::to_string(&value), r#"{"line":3}"#);
+/// assert_eq!(rpc_io::Raw::from_value(&value).as_str(), r#"{"line":3}"#);
+/// ```
+pub use jsonx_lib as jsonx;
+
 pub use error_object::{ErrorCode, ErrorObject};
 pub use framing::{Decoder, FrameError, Framing, READ_CHUNK};
 pub use id::Id;
@@ -180,7 +208,7 @@ pub use endpoint::{End, Endpoint, Flow, Next, serve};
 pub use error::{CallError, Error};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use handles::{Call, CancelToken, Canceller, Peer, Responder};
+pub use handles::{Call, CancelToken, Canceller, Notifier, Peer, Responder};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use progress::{Progress, WorkDone};

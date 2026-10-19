@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use common::{Faulty, endpoint, quiet_deliberate_panics, sent};
 use jsonx_lib::json;
 use rpc_io::{
-    Config, Endpoint, Error, ErrorCode, ErrorObject, Event, Flow, Limits, Responder, Router,
+    Config, Endpoint, Error, ErrorCode, ErrorObject, Event, Flow, Id, Limits, Responder, Router,
 };
 
 /// The router of JSON-RPC 2.0's own examples (section 7), plus methods that
@@ -750,4 +750,81 @@ fn test_interceptor_panic_is_contained() {
     assert!(replies[0].starts_with(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603"#));
     assert_eq!(*e.state(), 2);
     assert_eq!(e.stats().panics, 2);
+}
+
+#[test]
+fn test_lenient_ids_are_echoed_as_sent() {
+    let router = Router::new().request("m", |_: &mut (), _, cx| {
+        Ok(cx.id().is_some_and(Id::is_null))
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let config = Config::new().with_limits(Limits::new().with_lenient_ids(true));
+    let mut e = Endpoint::new(tx, router, ()).with_config(config);
+    for id in ["1.5", "-2e3", "18446744073709551616", "1.0", "null"] {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"m"}}"#);
+        assert!(e.handle(body.as_bytes()).is_ok());
+        let expected = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{}}}"#, id == "null");
+        assert_eq!(rx.try_recv().ok(), Some(expected));
+    }
+}
+
+#[test]
+fn test_strict_ids_refuse_what_lenient_ids_accept() {
+    let router = Router::new().request("m", |_: &mut (), _, _| Ok(()));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, ());
+    for id in ["1.5", "null"] {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"m"}}"#);
+        assert!(e.handle(body.as_bytes()).is_ok());
+        let reply = rx.try_recv().unwrap_or_default();
+        assert!(
+            reply.starts_with(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600"#),
+            "{reply}"
+        );
+    }
+}
+
+#[test]
+fn test_lenient_ids_track_deferred_requests_and_cancels() {
+    let router = Router::new().deferred("slow", |kept: &mut Vec<Responder>, _, _, r| kept.push(r));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let config = Config::new().with_limits(Limits::new().with_lenient_ids(true));
+    let mut e = Endpoint::new(tx, router, Vec::new()).with_config(config);
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":null,"method":"slow"}"#)
+            .is_ok()
+    );
+    // A second `null` id while the first is in flight is a duplicate.
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":null,"method":"slow"}"#)
+            .is_ok()
+    );
+    assert!(rx.try_recv().is_ok_and(|r| r.contains("already used")));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2.5,"method":"slow"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2.5}}"#)
+            .is_ok()
+    );
+    assert_eq!(
+        rx.try_recv().ok().as_deref(),
+        Some(
+            r#"{"jsonrpc":"2.0","id":2.5,"error":{"code":-32800,"message":"the request was cancelled"}}"#
+        )
+    );
+    // `null` cannot name the request to cancel.
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":null}}"#)
+            .is_ok()
+    );
+    assert!(rx.try_recv().is_err());
+    let kept = std::mem::take(e.state_mut());
+    assert!(kept[0].id().is_null());
+    assert!(kept.into_iter().next().is_some_and(|r| r.ok(1).is_ok()));
+    assert_eq!(
+        rx.try_recv().ok().as_deref(),
+        Some(r#"{"jsonrpc":"2.0","id":null,"result":1}"#)
+    );
 }

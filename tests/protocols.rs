@@ -22,13 +22,10 @@ fn mcp_server() -> Router<()> {
 }
 
 #[test]
-fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
+fn test_mcp_config_is_stateless_with_batches_off() {
+    // MCP 2026-07-28: no `initialize`, every request served at once.
     let (e, rx) = endpoint(mcp_server(), ());
     let mut e = e.with_config(Config::mcp());
-    assert!(
-        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
-            .is_ok()
-    );
     assert!(
         e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .is_ok()
@@ -37,13 +34,38 @@ fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
         e.handle(br#"[{"jsonrpc":"2.0","id":3,"method":"ping"}]"#)
             .is_ok()
     );
+    assert!(e.handle(b"{").is_ok());
+    let replies = sent(&rx);
+    assert_eq!(
+        replies[0],
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#
+    );
+    // Unreadable or refused before an id was read: no `id` at all, as
+    // MCP's schema has it.
+    assert_eq!(
+        replies[1],
+        r#"{"jsonrpc":"2.0","error":{"code":-32600,"message":"batches are not accepted"}}"#
+    );
+    assert!(replies[2].starts_with(r#"{"jsonrpc":"2.0","error":{"code":-32700"#));
+    assert!(replies.iter().all(|r| !r.contains("-32002")));
+}
+
+#[test]
+fn test_mcp_legacy_config_serves_ping_before_initialize() {
+    let (e, rx) = endpoint(mcp_server(), ());
+    let mut e = e.with_config(Config::mcp_legacy());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .is_ok()
+    );
     let replies = sent(&rx);
     assert_eq!(replies[0], r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
-    assert!(replies[1].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32002"#));
-    assert_eq!(
-        replies[2],
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batches are not accepted"}}"#
-    );
+    // `-32600`, never `-32002` (MCP's "resource not found").
+    assert!(replies[1].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600"#));
     assert!(
         e.handle(br#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{}}"#)
             .is_ok()
@@ -57,6 +79,62 @@ fn test_mcp_config_turns_batches_off_and_serves_ping_before_initialize() {
         replies[1],
         r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[]}}"#
     );
+}
+
+#[test]
+fn test_mcp_overload_refusal_avoids_the_legacy_code_range() {
+    let router = Router::new().deferred("work", |kept: &mut Vec<rpc_io::Responder>, _, _, r| {
+        kept.push(r);
+    });
+    let (e, rx) = endpoint(router, Vec::new());
+    let mut e = e.with_config(Config::mcp().with_max_in_flight(1));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"work"}"#)
+            .is_ok()
+    );
+    let replies = sent(&rx);
+    assert!(
+        replies[0].starts_with(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603"#),
+        "{}",
+        replies[0]
+    );
+    // The default stays JSON-RPC's server-error code.
+    let (e, rx) = endpoint(
+        Router::new().deferred("work", |kept: &mut Vec<rpc_io::Responder>, _, _, r| {
+            kept.push(r)
+        }),
+        Vec::new(),
+    );
+    let mut e = e.with_config(Config::new().with_max_in_flight(0));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)
+            .is_ok()
+    );
+    assert!(sent(&rx)[0].contains("-32000"));
+}
+
+#[test]
+fn test_error_response_without_id_is_one_under_null() {
+    let body = br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"bad"}}"#;
+    let Incoming::Single(Ok(rpc_io::Message::Response(response))) = decode(body, &Limits::new())
+    else {
+        panic!("refused");
+    };
+    assert!(response.id.is_none());
+    assert_eq!(
+        response.result.err().map(|e| e.code()),
+        Some(ErrorCode::PARSE_ERROR)
+    );
+    // A result needs an id, still.
+    let body = br#"{"jsonrpc":"2.0","result":1}"#;
+    let Incoming::Single(Err(invalid)) = decode(body, &Limits::new()) else {
+        panic!("accepted");
+    };
+    assert!(invalid.is_response());
 }
 
 #[test]
@@ -306,4 +384,268 @@ fn test_lsp_error_codes_have_names() {
         assert!(!code.is_reserved());
     }
     assert_eq!(ErrorCode::CONTENT_MODIFIED.0, -32801);
+}
+
+/// The `progress` values of the progress notifications in `sent`.
+fn progress_values(sent: &[String]) -> Vec<f64> {
+    sent.iter()
+        .filter(|m| m.contains("notifications/progress"))
+        .filter_map(|m| {
+            let at = m.find(r#""progress":"#)? + 11;
+            let rest = &m[at..];
+            let end = rest.find([',', '}'])?;
+            rest[..end].parse().ok()
+        })
+        .collect()
+}
+
+#[test]
+fn test_progress_must_increase_across_clones() {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let Ok(token) = Raw::new("5") else {
+        panic!("not JSON")
+    };
+    let progress = Progress::new(endpoint.peer(), token);
+    let clone = progress.clone();
+    assert!(progress.report(-1.0, None, None).is_ok());
+    assert!(matches!(
+        progress.report(-1.0, None, None),
+        Err(rpc_io::Error::ProgressNotIncreasing { last, next }) if last == -1.0 && next == -1.0
+    ));
+    assert!(clone.report(0.5, None, None).is_ok());
+    assert!(matches!(
+        progress.report(0.25, None, None),
+        Err(rpc_io::Error::ProgressNotIncreasing { .. })
+    ));
+    // A refused number leaves the last value as it was.
+    assert!(progress.report(f64::NAN, None, None).is_err());
+    assert!(progress.report(0.75, None, None).is_ok());
+    assert_eq!(progress_values(&sent(&rx)), [-1.0, 0.5, 0.75]);
+    let error = progress
+        .report(0.0, None, None)
+        .err()
+        .map(|e| e.to_string());
+    assert!(error.is_some_and(|e| e.contains("must increase")));
+}
+
+#[test]
+fn test_concurrent_progress_reaches_the_wire_in_order() {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let Ok(token) = Raw::new(r#""p""#) else {
+        panic!("not JSON")
+    };
+    let progress = Progress::new(endpoint.peer(), token);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let progress = progress.clone();
+            let counter = std::sync::Arc::clone(&counter);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Values taken out of order are refused, never sent late.
+                    let _sent_or_refused = progress.report(n as f64, None, None);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert!(thread.join().is_ok());
+    }
+    let values = progress_values(&sent(&rx));
+    assert!(!values.is_empty());
+    assert!(values.windows(2).all(|w| w[0] < w[1]), "{values:?}");
+}
+
+#[test]
+fn test_bound_progress_stops_when_its_request_is_answered_or_cancelled() {
+    use rpc_io::{Error, Responder};
+
+    #[derive(Default)]
+    struct Kept {
+        responders: Vec<Responder>,
+        progress: Vec<Progress>,
+    }
+    let router = Router::new()
+        .deferred("slow", |kept: &mut Kept, params, cx, responder| {
+            // Both ways of binding: through the context and the responder.
+            kept.progress.extend(cx.progress(&params));
+            kept.progress.extend(responder.progress(&params));
+            kept.responders.push(responder);
+        })
+        .request("now", |kept: &mut Kept, params, cx| {
+            kept.progress.extend(cx.progress(&params));
+            Ok(())
+        })
+        .notification("note", |kept: &mut Kept, params, cx| {
+            kept.progress.extend(cx.progress(&params));
+        });
+    let (e, rx) = endpoint(router, Kept::default());
+    let mut e = e.with_config(Config::mcp());
+    let meta = r#""params":{"_meta":{"progressToken":"t"}}"#;
+    for body in [
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"slow",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":2,"method":"slow",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":3,"method":"now",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","method":"note",{meta}}}"#),
+    ] {
+        assert!(e.handle(body.as_bytes()).is_ok());
+    }
+    // Five handles: two each for requests 1 and 2, and the immediate
+    // request's, already over; a notification gets none.
+    let kept = std::mem::take(e.state_mut());
+    assert_eq!(kept.progress.len(), 5);
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":3,"result":null}"#]);
+    assert!(matches!(
+        kept.progress[4].report(1.0, None, None),
+        Err(Error::AlreadyAnswered)
+    ));
+    // While in flight, reports go out.
+    assert!(kept.progress[0].report(1.0, None, None).is_ok());
+    assert!(kept.progress[3].report(1.0, None, None).is_ok());
+    assert_eq!(progress_values(&sent(&rx)), [1.0, 1.0]);
+    // Request 1 cancelled by the peer (MCP: no response, no more messages).
+    let cancel =
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+    assert!(e.handle(cancel).is_ok());
+    for progress in &kept.progress[..2] {
+        assert!(matches!(
+            progress.report(2.0, None, None),
+            Err(Error::AlreadyAnswered)
+        ));
+    }
+    // Request 2 answered.
+    let mut responders = kept.responders.into_iter();
+    let _first = responders.next();
+    assert!(responders.next().is_some_and(|r| r.ok(()).is_ok()));
+    assert!(matches!(
+        kept.progress[2].report(2.0, None, None),
+        Err(Error::AlreadyAnswered)
+    ));
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":2,"result":null}"#]);
+    // A closed connection refuses too.
+    e.close();
+    assert!(matches!(
+        kept.progress[3].report(9.0, None, None),
+        Err(Error::Closed)
+    ));
+}
+
+#[test]
+fn test_notifier_stops_at_cancel_even_while_a_worker_is_sending() {
+    use rpc_io::{Error, Notifier, Responder};
+
+    let router = Router::new().deferred(
+        "subscriptions/listen",
+        |kept: &mut Vec<(Notifier, Responder)>, _, _, responder| {
+            kept.push((responder.notifier(), responder));
+        },
+    );
+    let (e, rx) = endpoint(router, Vec::new());
+    let mut e = e.with_config(Config::mcp());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen"}"#)
+            .is_ok()
+    );
+    let (notifier, responder) = e.state_mut().remove(0);
+    let worker = std::thread::spawn(move || {
+        loop {
+            match notifier.notify_json("notifications/tools/list_changed", &()) {
+                Ok(()) => {}
+                Err(error) => return error,
+            }
+        }
+    });
+    // Let the worker send at least one.
+    let first = rx.recv_timeout(std::time::Duration::from_secs(10));
+    assert!(first.is_ok_and(|m| m.contains("list_changed")));
+    let cancel =
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#;
+    assert!(e.handle(cancel).is_ok());
+    // Everything sent for it was sent before the cancel was handled.
+    let _before: Vec<String> = rx.try_iter().collect();
+    let ended = worker.join();
+    assert!(matches!(ended, Ok(Error::AlreadyAnswered)), "{ended:?}");
+    assert!(
+        rx.try_recv().is_err(),
+        "a notification followed the cancellation"
+    );
+    // The responder's late answer is dropped too (MCP: nothing after a cancel).
+    assert!(responder.ok(()).is_err());
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn test_notifier_never_follows_the_response() {
+    use rpc_io::{Error, Notifier, Responder};
+
+    for _ in 0..20 {
+        let router = Router::new().deferred(
+            "listen",
+            |kept: &mut Vec<(Notifier, Responder)>, _, _, r| {
+                kept.push((r.notifier(), r));
+            },
+        );
+        let (mut e, rx) = endpoint(router, Vec::new());
+        assert!(
+            e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"listen"}"#)
+                .is_ok()
+        );
+        let (notifier, responder) = e.state_mut().remove(0);
+        let worker = std::thread::spawn(move || {
+            loop {
+                if let Err(error) = notifier.notify("tick", ()) {
+                    return error;
+                }
+            }
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(first.is_ok_and(|m| m.contains("tick")));
+        assert!(responder.ok("closed").is_ok());
+        let ended = worker.join();
+        assert!(matches!(ended, Ok(Error::AlreadyAnswered)), "{ended:?}");
+        let rest: Vec<String> = rx.try_iter().collect();
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":"closed"}"#)
+        );
+    }
+}
+
+#[test]
+fn test_notifier_refuses_after_close_and_for_notifications() {
+    use rpc_io::{Error, Notifier};
+
+    let router = Router::new()
+        .request("m", |kept: &mut Vec<Option<Notifier>>, _, cx| {
+            kept.push(cx.notifier());
+            Ok(())
+        })
+        .notification("n", |kept: &mut Vec<Option<Notifier>>, _, cx| {
+            kept.push(cx.notifier());
+        });
+    let (mut e, _rx) = endpoint(router, Vec::new());
+    assert!(e.handle(br#"{"jsonrpc":"2.0","method":"n"}"#).is_ok());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#)
+            .is_ok()
+    );
+    let kept = std::mem::take(e.state_mut());
+    assert!(kept[0].is_none());
+    let notifier = kept[1].clone();
+    assert!(
+        notifier
+            .as_ref()
+            .is_some_and(|n| matches!(n.notify("x", ()), Err(Error::AlreadyAnswered)))
+    );
+    assert!(
+        notifier
+            .as_ref()
+            .is_some_and(|n| matches!(n.notify("x", 5), Err(Error::InvalidParams(_))))
+    );
+    assert!(format!("{notifier:?}").contains("Notifier"));
+    e.close();
+    assert!(notifier.is_some_and(|n| matches!(n.notify("x", ()), Err(Error::Closed))));
 }

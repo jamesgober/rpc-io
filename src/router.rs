@@ -2,7 +2,12 @@
 //! [`Params`] and a [`Context`]. [`Event`]s report what the endpoint did on
 //! its own.
 
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use jsonx_lib::{Parser, Value};
 
@@ -12,12 +17,20 @@ use crate::{
     framing::FrameError,
     handles::{Call, Peer, Responder},
     id::Id,
-    link::Link,
+    link::{Link, Scope, Turn},
     raw::{Json, Raw},
 };
 
+/// A request handler. The `String` is a buffer the endpoint keeps for it to
+/// encode a result into (and borrow it from) instead of allocating one.
 pub(crate) type RequestFn<S> = Box<
-    dyn FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<Json<'static>, ErrorObject> + Send,
+    dyn for<'b> FnMut(
+            &mut S,
+            Params<'_>,
+            &mut Context<'_>,
+            &'b mut String,
+        ) -> Result<Json<'b>, ErrorObject>
+        + Send,
 >;
 pub(crate) type DeferredFn<S> =
     Box<dyn FnMut(&mut S, Params<'_>, &mut Context<'_>, Responder) + Send>;
@@ -61,7 +74,7 @@ pub(crate) enum RequestHandler<S> {
 /// # Examples
 ///
 /// ```
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{ErrorObject, Router};
 ///
 /// #[derive(Default)]
@@ -120,19 +133,32 @@ impl<S> Router<S> {
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     #[must_use]
-    pub fn request<F, J>(mut self, method: &str, mut handler: F) -> Self
+    pub fn request<F, J>(self, method: &str, mut handler: F) -> Self
     where
         F: FnMut(&mut S, Params<'_>, &mut Context<'_>) -> Result<J, ErrorObject> + Send + 'static,
         J: Into<Json<'static>>,
     {
-        let boxed: RequestFn<S> = Box::new(
-            move |state: &mut S, params: Params<'_>, cx: &mut Context<'_>| {
-                handler(state, params, cx).map(Into::into)
-            },
-        );
+        self.request_into(method, move |state, params, cx, _out| {
+            handler(state, params, cx).map(Into::into)
+        })
+    }
+
+    /// Registers a request handler that may encode its result into the
+    /// endpoint's result buffer.
+    pub(crate) fn request_into<F>(mut self, method: &str, handler: F) -> Self
+    where
+        F: for<'b> FnMut(
+                &mut S,
+                Params<'_>,
+                &mut Context<'_>,
+                &'b mut String,
+            ) -> Result<Json<'b>, ErrorObject>
+            + Send
+            + 'static,
+    {
         let _replaced = self
             .requests
-            .insert(method.into(), RequestHandler::Now(boxed));
+            .insert(method.into(), RequestHandler::Now(Box::new(handler)));
         self
     }
 
@@ -491,7 +517,7 @@ impl<'a> Params<'a> {
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let router = Router::new().request("work", |_, _, cx| {
-///     cx.notify("progress", jsonx_lib::json!({ "method": cx.method() }))?;
+///     cx.notify("progress", rpc_io::jsonx::json!({ "method": cx.method() }))?;
 ///     Ok(())
 /// });
 /// let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -506,6 +532,12 @@ pub struct Context<'a> {
     stop: &'a mut bool,
     id: Option<&'a Id<'a>>,
     method: &'a str,
+    /// For a deferred request (answered through a `Responder`), its serial.
+    deferred: Option<u64>,
+    /// Set when a request answered by the handler's return value has its
+    /// response written; made only if a scoped progress handle asks for it.
+    /// A `OnceLock` rather than a `OnceCell`, so `Context` stays `Sync`.
+    turn: OnceLock<Arc<Turn>>,
 }
 
 impl<'a> Context<'a> {
@@ -514,13 +546,67 @@ impl<'a> Context<'a> {
         stop: &'a mut bool,
         id: Option<&'a Id<'a>>,
         method: &'a str,
+        deferred: Option<u64>,
     ) -> Self {
         Self {
             link,
             stop,
             id,
             method,
+            deferred,
+            turn: OnceLock::new(),
         }
+    }
+
+    /// The request this call is, for a notification that must not outlive
+    /// it; `None` for a notification.
+    pub(crate) fn scope(&self) -> Option<Scope> {
+        let id = self.id?;
+        Some(match self.deferred {
+            Some(serial) => Scope::Deferred {
+                id: id.clone().into_owned(),
+                serial,
+            },
+            None => Scope::Turn(Arc::clone(self.turn.get_or_init(|| Arc::new(Turn::new())))),
+        })
+    }
+
+    /// A [`Notifier`](crate::Notifier) bound to the request being handled:
+    /// it sends while the request is in flight and refuses once it is
+    /// answered (for a request answered by the handler's return value, as
+    /// soon as the handler returns) or cancelled. `None` for a notification.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Error, Notifier, Router};
+    ///
+    /// let router = Router::new().request("work", |kept: &mut Option<Notifier>, _, cx| {
+    ///     let notifier = cx.notifier();
+    ///     if let Some(n) = &notifier {
+    ///         n.notify("working", ())?;
+    ///     }
+    ///     *kept = notifier;
+    ///     Ok("done")
+    /// });
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, None);
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)?;
+    /// assert_eq!(rx.try_iter().count(), 2); // the notification, then the result
+    /// let late = endpoint.state().as_ref().map(|n| n.notify("working", ()));
+    /// assert!(matches!(late, Some(Err(Error::AlreadyAnswered))));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn notifier(&self) -> Option<crate::Notifier> {
+        self.scope()
+            .map(|scope| crate::Notifier::new(self.peer(), scope))
+    }
+
+    /// The flag to set when the response is written, if a scoped handle
+    /// took one.
+    pub(crate) fn take_turn(&mut self) -> Option<Arc<Turn>> {
+        self.turn.take()
     }
 
     /// The method being handled.
@@ -583,7 +669,7 @@ impl<'a> Context<'a> {
     /// use rpc_io::{Call, Router};
     ///
     /// let router = Router::<Vec<Call>>::new().notification("initialized", |calls, _, cx| {
-    ///     if let Ok(call) = cx.request("workspace/configuration", jsonx_lib::json!({ "items": [] })) {
+    ///     if let Ok(call) = cx.request("workspace/configuration", rpc_io::jsonx::json!({ "items": [] })) {
     ///         calls.push(call);
     ///     }
     /// });
@@ -745,9 +831,9 @@ pub enum Event<'a> {
         /// The interceptor's error.
         error: &'a ErrorObject,
     },
-    /// A notification's params did not fit what its handler takes (a
-    /// [typed](Router::notification_typed) handler, with the `serde`
-    /// feature); the handler was not called.
+    /// A notification's params did not fit what its handler takes (a typed
+    /// handler: [`Router::notification_json`], or `notification_typed` with
+    /// the `serde` feature); the handler was not called.
     InvalidParams {
         /// The method.
         method: &'a str,

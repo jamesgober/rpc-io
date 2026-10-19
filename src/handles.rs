@@ -21,7 +21,7 @@ use crate::{
     error::{CallError, Error},
     error_object::ErrorObject,
     id::Id,
-    link::Link,
+    link::{Link, Scope},
     raw::{Json, Raw},
     slot::{Outcome, Slot},
     stats::Stats,
@@ -109,7 +109,7 @@ fn outgoing_params<'a>(params: impl Into<Json<'a>>) -> Result<Option<Json<'a>>, 
 ///
 /// ```
 /// use std::sync::mpsc;
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let (tx, rx) = mpsc::channel::<String>();
@@ -132,6 +132,11 @@ pub struct Peer {
 impl Peer {
     pub(crate) fn new(link: Arc<dyn Link>) -> Self {
         Self { link }
+    }
+
+    /// The shared state this peer sends through.
+    pub(crate) fn link(&self) -> &Arc<dyn Link> {
+        &self.link
     }
 
     /// Sends a notification. `params` may be an array, an object, or `()`
@@ -174,7 +179,7 @@ impl Peer {
     /// let (tx, rx) = std::sync::mpsc::channel::<String>();
     /// let endpoint = Endpoint::new(tx, Router::new(), ()); // keep it: dropping an endpoint closes it
     /// let peer = endpoint.peer();
-    /// let call = peer.request("workspace/configuration", jsonx_lib::json!({ "items": [] }))?;
+    /// let call = peer.request("workspace/configuration", rpc_io::jsonx::json!({ "items": [] }))?;
     /// assert_eq!(call.id(), 1);
     /// assert!(rx.try_recv().is_ok_and(|m| m.starts_with(r#"{"jsonrpc":"2.0","id":1,"#)));
     /// # Ok::<(), rpc_io::Error>(())
@@ -629,7 +634,7 @@ impl fmt::Debug for Canceller {
 ///
 /// ```
 /// use std::sync::mpsc;
-/// use jsonx_lib::json;
+/// use rpc_io::jsonx::json;
 /// use rpc_io::{Endpoint, Router};
 ///
 /// let router = Router::new().deferred("slow", |_, _params, _cx, responder| {
@@ -647,18 +652,34 @@ impl fmt::Debug for Canceller {
 /// ```
 pub struct Responder {
     id: Id<'static>,
+    /// Which request under `id` this answers (see `Inner::respond_deferred`).
+    serial: u64,
     token: CancelToken,
     link: Arc<dyn Link>,
     answered: bool,
 }
 
 impl Responder {
-    pub(crate) fn new(id: Id<'static>, token: CancelToken, link: Arc<dyn Link>) -> Self {
+    pub(crate) fn new(
+        id: Id<'static>,
+        serial: u64,
+        token: CancelToken,
+        link: Arc<dyn Link>,
+    ) -> Self {
         Self {
             id,
+            serial,
             token,
             link,
             answered: false,
+        }
+    }
+
+    /// The scope of the request this answers.
+    pub(crate) fn scope(&self) -> Scope {
+        Scope::Deferred {
+            id: self.id.clone(),
+            serial: self.serial,
         }
     }
 
@@ -772,8 +793,8 @@ impl Responder {
     ) -> Result<(), Error> {
         self.answered = true;
         match result {
-            Ok(value) => self.link.respond(&self.id, Ok(&value.into())),
-            Err(error) => self.link.respond(&self.id, Err(&error)),
+            Ok(value) => self.link.respond(&self.id, self.serial, Ok(&value.into())),
+            Err(error) => self.link.respond(&self.id, self.serial, Err(&error)),
         }
     }
 
@@ -836,9 +857,101 @@ impl Drop for Responder {
         };
         // Already answered (cancelled) or closed: there is no one left to
         // tell, which is the point of answering here.
-        let _settled = self
-            .link
-            .respond(&self.id, Err(&ErrorObject::internal_error(message)));
+        let _settled = self.link.respond(
+            &self.id,
+            self.serial,
+            Err(&ErrorObject::internal_error(message)),
+        );
+    }
+}
+
+impl Responder {
+    /// A [`Notifier`] bound to this request: it sends notifications while
+    /// the request is in flight and refuses once it is answered (through
+    /// this responder, or by the connection) or cancelled by the peer. For a
+    /// stream of notifications that belongs to one request (MCP's
+    /// `subscriptions/listen`).
+    ///
+    /// # Examples
+    ///
+    /// See [`Notifier`].
+    #[must_use]
+    pub fn notifier(&self) -> Notifier {
+        Notifier {
+            peer: self.peer(),
+            scope: self.scope(),
+        }
+    }
+}
+
+/// Notifications that belong to one request: sent only while it is in
+/// flight.
+///
+/// [`notify`](Notifier::notify) refuses with [`Error::AlreadyAnswered`] once
+/// the request is answered or cancelled by the peer, and with
+/// [`Error::Closed`] once the connection closed. The check runs under the
+/// lock the response is written under, so no notification can follow the
+/// response, or a cancellation the endpoint has handled, on the wire. It is
+/// bound to its request, not to the request's id: when the peer reuses the
+/// id for a later request, a notifier of the earlier one still refuses and
+/// never sends for the later one. Made by
+/// [`Responder::notifier`] for a deferred request, or by
+/// [`Context::notifier`](crate::Context::notifier) for the request being
+/// handled. `Clone`, and usable from any thread.
+///
+/// # Examples
+///
+/// ```
+/// use rpc_io::{Config, Endpoint, Error, Notifier, Responder, Router};
+///
+/// let router = Router::new().deferred("subscriptions/listen", |kept: &mut Vec<(Notifier, Responder)>, _, _, responder| {
+///     kept.push((responder.notifier(), responder));
+/// });
+/// let (tx, rx) = std::sync::mpsc::channel::<String>();
+/// let mut endpoint = Endpoint::new(tx, router, Vec::new()).with_config(Config::mcp());
+/// endpoint.handle(br#"{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen"}"#)?;
+/// let (notifier, _responder) = endpoint.state_mut().remove(0);
+/// notifier.notify("notifications/tools/list_changed", ())?;
+/// assert!(rx.try_recv().is_ok_and(|m| m.contains("list_changed")));
+/// // The client cancels the request: the stream is over.
+/// endpoint.handle(br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#)?;
+/// assert!(matches!(notifier.notify("notifications/tools/list_changed", ()), Err(Error::AlreadyAnswered)));
+/// assert!(rx.try_recv().is_err());
+/// # Ok::<(), rpc_io::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct Notifier {
+    peer: Peer,
+    scope: Scope,
+}
+
+impl Notifier {
+    pub(crate) fn new(peer: Peer, scope: Scope) -> Self {
+        Self { peer, scope }
+    }
+
+    /// Sends a notification, as [`Peer::notify`], while the request is in
+    /// flight.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AlreadyAnswered`] once the request is answered or cancelled;
+    /// otherwise as [`Peer::notify`]. Nothing is sent when it fails.
+    ///
+    /// # Examples
+    ///
+    /// See [`Notifier`].
+    pub fn notify<'a>(&self, method: &str, params: impl Into<Json<'a>>) -> Result<(), Error> {
+        let params = outgoing_params(params)?;
+        self.peer
+            .link()
+            .notify_in(&self.scope, None, method, params.as_ref())
+    }
+}
+
+impl fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Notifier").finish_non_exhaustive()
     }
 }
 

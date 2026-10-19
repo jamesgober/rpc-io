@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "rpc-io"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -72,7 +72,7 @@ net = ["std"]
 # #################################
 [dependencies]
 # The owner's JSON: borrowing parser, pull reader with raw slices, writer.
-jsonx-lib = { version = "0.2", default-features = false }
+jsonx-lib = { version = "0.5", default-features = false }
 # Optional, off by default: the `tracing` feature's instrumentation. The
 # ecosystem's standard facade (no runtime of its own); default features off,
 # so no proc-macro crate is pulled in.
@@ -102,6 +102,13 @@ serde     = { version = "1.0.200", features = ["derive"] }
 # #################################
 [[bench]]
 name              = "bench"
+harness           = false
+required-features = ["std"]
+
+# Typed handlers (`FromJson`/`ToJson`, and `serde` when the feature is on)
+# and progress reports.
+[[bench]]
+name              = "typed"
 harness           = false
 required-features = ["std"]
 

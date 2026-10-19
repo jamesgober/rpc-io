@@ -10,12 +10,14 @@ use crate::{error_object::ErrorCode, limits::Limits};
 /// |---|---|---|
 /// | `limits` | [`Limits::new`] | budgets on incoming messages |
 /// | `max_pending` | 1024 | our requests awaiting answers; one more evicts the oldest |
-/// | `max_in_flight` | 1024 | deferred requests being answered; more are refused with `SERVER_OVERLOADED` |
+/// | `max_in_flight` | 1024 | deferred requests being answered; more are refused with `overloaded_code` |
 /// | `max_held_bytes` | 4 MiB | messages this side sends while the gate is shut, held until it opens |
 /// | `request_timeout` | none | deadline for our requests that set none themselves |
 /// | `cancellation` | [`Cancellation::lsp`] | the cancel notification, both ways; `None` turns cancellation off |
 /// | `gate` | none | an opening request every other request must wait for |
 /// | `timer` | `true` | deadlines fire on their own, from a helper thread |
+/// | `omit_null_id` | `false` | an error for a message whose id could not be read carries `"id": null` (JSON-RPC 2.0); `true` leaves `id` out (MCP) |
+/// | `overloaded_code` | `SERVER_OVERLOADED` (`-32000`) | the code of the refusal past `max_in_flight` |
 ///
 /// `#[non_exhaustive]`: start from [`Config::new`] and chain `with_*`.
 ///
@@ -63,6 +65,13 @@ pub struct Config {
     /// [`try_wait`](crate::Call::try_wait), when an awaited `Call` is polled,
     /// or by [`Endpoint::expire`](crate::Endpoint::expire).
     pub timer: bool,
+    /// Whether an error answering a message whose id could not be read
+    /// leaves `id` out (`true`, as MCP's schema has it: `id?: RequestId`,
+    /// never `null`) or writes `"id": null` (`false`, as JSON-RPC 2.0
+    /// requires). Either form from the peer is read as the same answer.
+    pub omit_null_id: bool,
+    /// The error code a request past `max_in_flight` is refused with.
+    pub overloaded_code: ErrorCode,
 }
 
 impl Config {
@@ -84,6 +93,8 @@ impl Config {
             cancellation: Some(Cancellation::lsp()),
             gate: None,
             timer: true,
+            omit_null_id: false,
+            overloaded_code: ErrorCode::SERVER_OVERLOADED,
         }
     }
 
@@ -199,6 +210,44 @@ impl Config {
         self.timer = timer;
         self
     }
+
+    /// Sets `omit_null_id`: whether an error for a message whose id could
+    /// not be read leaves `id` out instead of writing `"id": null`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Config, Endpoint, Router};
+    ///
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let config = Config::new().with_omit_null_id(true);
+    /// Endpoint::new(tx, Router::<()>::new(), ()).with_config(config).handle(b"{")?;
+    /// let reply = rx.try_recv().unwrap_or_default();
+    /// assert!(reply.starts_with(r#"{"jsonrpc":"2.0","error":{"code":-32700"#), "{reply}");
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_omit_null_id(mut self, omit: bool) -> Self {
+        self.omit_null_id = omit;
+        self
+    }
+
+    /// Sets `overloaded_code`, the code of the refusal past
+    /// `max_in_flight`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Config, ErrorCode};
+    ///
+    /// let config = Config::new().with_overloaded_code(ErrorCode::INTERNAL_ERROR);
+    /// assert_eq!(config.overloaded_code, ErrorCode::INTERNAL_ERROR);
+    /// ```
+    #[must_use]
+    pub fn with_overloaded_code(mut self, code: ErrorCode) -> Self {
+        self.overloaded_code = code;
+        self
+    }
 }
 
 impl Config {
@@ -221,14 +270,31 @@ impl Config {
             .with_gate(Some(Gate::lsp()))
     }
 
-    /// An MCP server: [`Limits::mcp`] (batches off), [`Cancellation::mcp`],
-    /// and [`Gate::mcp`]. A client leaves the gate out (`with_gate(None)`).
+    /// MCP as its current revision (2026-07-28) has it, for a server or a
+    /// client: [`Limits::mcp`] (batches off), [`Cancellation::mcp`], and no
+    /// gate. The protocol is stateless: every request carries its protocol
+    /// version in `_meta`, and there is no `initialize` to wait for. Errors
+    /// for unreadable messages are written without `id` (MCP's schema has
+    /// no `null` id), and requests past `max_in_flight` are refused with
+    /// `INTERNAL_ERROR` (`-32603`), since MCP asks new implementations not to
+    /// use `-32000..=-32019`.
+    ///
+    /// This is also the preset of a dual-era server (one that serves legacy
+    /// clients too): the specification has such a server pick each
+    /// request's semantics from the request itself (an `initialize` selects
+    /// the legacy ones), which belongs to the protocol layer above. A server
+    /// for legacy clients only takes [`Config::mcp_legacy`].
     ///
     /// # Examples
     ///
     /// ```
-    /// let config = rpc_io::Config::mcp();
+    /// use rpc_io::{Config, ErrorCode};
+    ///
+    /// let config = Config::mcp();
     /// assert_eq!(config.limits.max_batch, 0);
+    /// assert!(config.gate.is_none());
+    /// assert!(config.omit_null_id);
+    /// assert_eq!(config.overloaded_code, ErrorCode::INTERNAL_ERROR);
     /// assert_eq!(config.cancellation.map(|c| c.id_member), Some("requestId".into()));
     /// ```
     #[must_use]
@@ -236,7 +302,26 @@ impl Config {
         Self::new()
             .with_limits(Limits::mcp())
             .with_cancellation(Some(Cancellation::mcp()))
-            .with_gate(Some(Gate::mcp()))
+            .with_omit_null_id(true)
+            .with_overloaded_code(ErrorCode::INTERNAL_ERROR)
+    }
+
+    /// A server for MCP's legacy revisions only (2025-11-25 and earlier),
+    /// which open with an `initialize` handshake: [`Config::mcp`] plus
+    /// [`Gate::mcp`]. Modern clients never send `initialize`, so this
+    /// preset refuses every request of theirs: use it only where no modern
+    /// client can connect. A client leaves the gate out (`with_gate(None)`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let config = rpc_io::Config::mcp_legacy();
+    /// assert_eq!(config.gate.map(|g| g.method), Some("initialize".into()));
+    /// assert!(config.omit_null_id);
+    /// ```
+    #[must_use]
+    pub fn mcp_legacy() -> Self {
+        Self::mcp().with_gate(Some(Gate::mcp()))
     }
 }
 
@@ -419,17 +504,26 @@ impl Gate {
         Self::new("initialize").allow("exit")
     }
 
-    /// MCP's: `initialize`, with the `ping` request served before it (MCP
-    /// allows pings at any time).
+    /// MCP's legacy handshake (revisions 2025-11-25 and earlier; the
+    /// 2026-07-28 revision has none): `initialize`, with the `ping` request
+    /// served before it (those revisions allow pings at any time), and
+    /// early requests refused with `INVALID_REQUEST` (`-32600`). Not
+    /// `SERVER_NOT_INITIALIZED`: MCP used `-32002` for "resource not found"
+    /// in those revisions and forbids emitting it since.
     ///
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(rpc_io::Gate::mcp().allow_requests, ["ping"]);
+    /// use rpc_io::{ErrorCode, Gate};
+    ///
+    /// assert_eq!(Gate::mcp().allow_requests, ["ping"]);
+    /// assert_eq!(Gate::mcp().code, ErrorCode::INVALID_REQUEST);
     /// ```
     #[must_use]
     pub fn mcp() -> Self {
-        Self::new("initialize").allow_request("ping")
+        Self::new("initialize")
+            .allow_request("ping")
+            .with_code(ErrorCode::INVALID_REQUEST)
     }
 
     /// Serves the request `method` before the gate opens.

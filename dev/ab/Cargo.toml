@@ -1,0 +1,29 @@
+# Interleaved CPU-cycle A/B of rpc-io 0.3.0 (from crates.io) against this
+# tree, on the endpoint's thread (Windows: `QueryThreadCycleTime`, which
+# leaves out time the thread is not running). Not part of the crate or CI.
+#
+#   cd dev/ab && cargo run --release -- 11            # 11 rounds, every workload
+#   cd dev/ab && cargo run --release -- 11 serde      # only the matching ones
+#
+# Each round runs both versions, in an order that alternates; the output is
+# the minimum and median cycles per request of each, and their difference.
+[package]
+name = "ab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rpc03 = { package = "rpc-io", version = "=0.3.0", features = ["serde"] }
+jsonx02 = { package = "jsonx-lib", version = "=0.2.0" }
+rpc04 = { package = "rpc-io", path = "../..", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Its own workspace: not a member of the crate's.
+[workspace]

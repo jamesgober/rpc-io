@@ -37,6 +37,7 @@ fn limits(knob: u8) -> Limits {
         .with_max_batch(usize::from(knob % 7))
         .with_max_skip_bytes(if knob & 0x80 == 0 { u64::MAX } else { 512 })
         .with_json(jsonx_lib::Limits::new().with_max_depth(1 + usize::from(knob % 9)))
+        .with_lenient_ids(knob % 3 == 0)
 }
 
 /// One frame, or the error in its place.
@@ -132,7 +133,8 @@ pub fn message(data: &[u8]) {
     let check = |entry: &rpc_io::Entry<'_>| match entry {
         Ok(message) => {
             let text = message.to_string();
-            match decode(text.as_bytes(), &Limits::new()) {
+            let again = Limits::new().with_lenient_ids(limits.lenient_ids);
+            match decode(text.as_bytes(), &again) {
                 Incoming::Single(Ok(again)) => assert_eq!(&again, message, "{text}"),
                 other => panic!("{text} decoded as {other:?}"),
             }
@@ -245,7 +247,11 @@ impl Asked {
             Ok(Message::Request(request)) => {
                 let id = request.id.to_string();
                 *self.count.entry(id.clone()).or_default() += 1;
-                let _new = self.valid.insert(id);
+                // A `null` id (lenient ids) is answered under `null`, which
+                // names no request: it cannot be counted as answered.
+                if !request.id.is_null() {
+                    let _new = self.valid.insert(id);
+                }
             }
             Ok(_) => {}
             Err(invalid) => {
@@ -337,7 +343,9 @@ pub fn endpoint(data: &[u8], panics: bool) {
     }
     let mcp = knob & 4 != 0;
     if mcp {
-        config = config.with_cancellation(Some(rpc_io::Cancellation::mcp()));
+        config = config
+            .with_cancellation(Some(rpc_io::Cancellation::mcp()))
+            .with_omit_null_id(true);
     }
     let mut asked = Asked::default();
     let whole = mode & 4 != 0;
@@ -377,8 +385,9 @@ pub fn endpoint(data: &[u8], panics: bool) {
             *answered.entry(id.to_string()).or_default() += 1;
         }
     };
+    let read_back = Limits::new().with_lenient_ids(limits.lenient_ids);
     for sent in &sent {
-        match decode(sent.as_bytes(), &Limits::new()) {
+        match decode(sent.as_bytes(), &read_back) {
             Incoming::Single(Ok(Message::Response(r))) => count(r.id.as_ref()),
             Incoming::Single(Ok(Message::Request(r))) => assert_eq!(r.method, "question"),
             Incoming::Single(Ok(Message::Notification(n))) => assert!(

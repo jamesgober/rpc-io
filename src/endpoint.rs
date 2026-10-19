@@ -21,7 +21,7 @@ use crate::trace::event;
 use crate::{
     config::{Cancellation, Config, Gate},
     error::{CallError, Error},
-    error_object::{ErrorCode, ErrorObject, clip},
+    error_object::{ErrorObject, clip},
     framing::{Decoder, FrameError, Framing},
     handles::{Peer, Responder},
     id::Id,
@@ -170,7 +170,12 @@ pub struct Endpoint<S, K: Sink> {
     cancellation: Option<Cancellation>,
     /// The stream decoder, kept between reads so read-ahead is never lost.
     input: Option<Decoder>,
+    /// Reused buffer typed request handlers encode their results into.
+    result: String,
 }
+
+/// The result buffer is released after a result that grew it past this.
+const RESULT_KEEP: usize = 64 * 1024;
 
 impl<S, K: Sink> Endpoint<S, K> {
     /// An endpoint that sends through `sink`, answers calls with `router`,
@@ -199,6 +204,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             gate: config.gate,
             cancellation: config.cancellation,
             input: None,
+            result: String::new(),
         }
     }
 
@@ -361,6 +367,12 @@ impl<S, K: Sink> Endpoint<S, K> {
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         self.shared.lock().next_deadline()
+    }
+
+    /// How many of our requests wait on the peer with no deadline.
+    #[cfg(feature = "net")]
+    pub(crate) fn open_ended(&self) -> usize {
+        self.shared.lock().open_ended()
     }
 
     /// Ends every one of our requests whose deadline has passed with
@@ -841,8 +853,10 @@ impl<S, K: Sink> Endpoint<S, K> {
         match handler {
             RequestHandler::Now(handler) => {
                 let state = &mut self.state;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method);
-                let outcome = contain(|| handler(state, params, &mut cx));
+                let out = &mut self.result;
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, None);
+                let outcome = contain(|| handler(state, params, &mut cx, out));
+                let turn = cx.take_turn();
                 let error;
                 let result = match &outcome {
                     Ok(Ok(value)) => Ok(value),
@@ -861,22 +875,35 @@ impl<S, K: Sink> Endpoint<S, K> {
                         Err(&error)
                     }
                 };
-                let _reported = self.shared.lock().respond(Some(&id), batch, result);
+                let mut inner = self.shared.lock();
+                if let Some(turn) = turn {
+                    // Under the lock the response is written under: no
+                    // progress report can follow it.
+                    turn.finish();
+                }
+                let _reported = inner.respond(Some(&id), batch, result);
+                drop(inner);
+                drop(outcome);
+                if self.result.capacity() > RESULT_KEEP {
+                    self.result = String::new();
+                }
             }
             RequestHandler::Deferred(handler) => {
                 let owned = id.clone().into_owned();
-                let token = self.shared.lock().begin_deferred(owned.clone(), batch);
-                let Some(token) = token else {
+                let mut inner = self.shared.lock();
+                let Some((token, serial)) = inner.begin_deferred(owned.clone(), batch) else {
                     let error = ErrorObject::new(
-                        ErrorCode::SERVER_OVERLOADED,
+                        inner.settings.overloaded_code,
                         "too many requests are already being answered",
                     );
-                    let _reported = self.shared.lock().respond(Some(&id), batch, Err(&error));
+                    let _reported = inner.respond(Some(&id), batch, Err(&error));
                     return;
                 };
-                let responder = Responder::new(owned, token, Arc::clone(&self.link));
+                // The handler sends through the same lock.
+                drop(inner);
+                let responder = Responder::new(owned, serial, token, Arc::clone(&self.link));
                 let state = &mut self.state;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method);
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, Some(serial));
                 // A panic drops the responder while unwinding, which answers
                 // the request with `INTERNAL_ERROR`.
                 if let Err(payload) = contain(|| handler(state, params, &mut cx, responder)) {
@@ -939,7 +966,12 @@ impl<S, K: Sink> Endpoint<S, K> {
         if let Some(cancellation) = &self.cancellation {
             if *method == *cancellation.method {
                 let target = params.as_ref().and_then(|p| {
-                    read_member_id(p.as_str(), &cancellation.id_member, &self.parser)
+                    read_member_id(
+                        p.as_str(),
+                        &cancellation.id_member,
+                        &self.parser,
+                        self.limits.lenient_ids,
+                    )
                 });
                 if let Some(target) = target {
                     if self.shared.lock().cancel_incoming(&target) {
@@ -984,7 +1016,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             return;
         };
         let state = &mut self.state;
-        let mut cx = Context::new(&self.link, stop, None, &method);
+        let mut cx = Context::new(&self.link, stop, None, &method, None);
         match contain(|| handler(state, params, &mut cx)) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => report(

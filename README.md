@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>. One required dependency, from the family: <a href="https://crates.io/crates/jsonx-lib"><code>jsonx-lib</code></a>. The integrations (<code>serde</code>, <code>futures-io</code>, <code>tracing</code>) are optional features, off by default. Without the default <code>std</code> feature the framing, message, and correlation layers are <code>no_std</code> (they need only <code>alloc</code>).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0.</strong> 0.3.0 hardens the foundation and adds the async adapter, typed params, and serving helpers; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0.</strong> 0.4.0 moves onto jsonx-lib 0.5 with typed params and results through its <code>ToJson</code>/<code>FromJson</code>, follows MCP's stateless 2026-07-28 revision, and makes the 1.0 decisions; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -52,7 +52,7 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Every request gets exactly one response; no valid notification gets one (a malformed or oversized message is answered under `null`, as the specification requires). | A property test sends random batches mixing requests (answered at once, later, by a panicking handler, for a missing method, or cancelled), notifications, malformed elements, and stray responses, and checks the reply holds each request id exactly once with the right code. |
+| Every request gets exactly one response; no valid notification gets one (a malformed or oversized message is answered under `null`, as the specification requires, or with no `id` under `Config::omit_null_id`, as MCP has it). | A property test sends random batches mixing requests (answered at once, later, by a panicking handler, for a missing method, or cancelled), notifications, malformed elements, and stray responses, and checks the reply holds each request id exactly once with the right code. |
 | Malformed messages get the specification's codes (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`), under their own id when it can be read. | Every example in section 7 of the JSON-RPC 2.0 specification is a test, verbatim; a property test checks envelope classification against a reference built on a full parse. |
 | Every message shape survives encoding and decoding, through either framing. | Property tests over random requests, notifications, results, and errors (any id, any string, any JSON), fed through the decoder in random chunk sizes. |
 | No input makes it panic, memory stays bounded, and the framing does not depend on how the input is split. | Fuzz targets for both framings, message and batch decoding, and a live endpoint (`fuzz/`), whose checks also run in `cargo test` on random, JSON-shaped, and mutated inputs; the decoder's buffer is checked against its documented bound after every step. |
@@ -69,21 +69,24 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-rpc-io = "0.3"
-jsonx-lib = "0.2"   # to build and read JSON values
+rpc-io = "0.4"
 ```
+
+rpc-io 0.4 needs jsonx-lib 0.5, and is published once jsonx-lib 0.5.0 is on crates.io; until then it builds only against a local jsonx-lib (a `[patch.crates-io]` entry).
+
+JSON values are built and read with jsonx-lib, re-exported as `rpc_io::jsonx` (`rpc_io::jsonx::json!`, `rpc_io::jsonx::Value`, the `ToJson`/`FromJson` traits), so no separate dependency is needed and a crate on top always gets the same jsonx-lib version as rpc-io.
 
 The framing, message, and correlation layers without the standard library:
 
 ```toml
 [dependencies]
-rpc-io = { version = "0.3", default-features = false }
+rpc-io = { version = "0.4", default-features = false }
 ```
 
 | Feature | Default | Adds |
 |---|---|---|
 | `std` | yes | The endpoint, its handles, `serve`, `Queued`, `outbox`, progress helpers. |
-| `serde` | no | Typed params and results: `Router::request_typed`, `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed` (with `serde` and `serde_json`). |
+| `serde` | no | Typed params and results through `serde`, as an alternative to the built-in `ToJson`/`FromJson` API: `Router::request_typed`, `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed` (with `serde` and `serde_json`). |
 | `futures-io` | no | The async adapter: `Endpoint::run_async`, and `Outbox` as `AsyncRead`/`AsyncBufRead` with `write_to`. Runtime-agnostic. |
 | `tracing` | no | Spans for every call and events for what the endpoint does on its own. Off, the instrumentation compiles to nothing. |
 | `net` | no | `Server`: an accept loop over TCP and, on Unix, Unix domain sockets. |
@@ -96,7 +99,7 @@ rpc-io = { version = "0.3", default-features = false }
 A server on stdin and stdout is one call. This one takes newline-delimited messages, as MCP's stdio transport does; LSP uses `Framing::ContentLength`:
 
 ```rust
-use jsonx_lib::json;
+use rpc_io::jsonx::json;
 use rpc_io::{End, ErrorObject, Framing, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
@@ -127,7 +130,7 @@ An [`Endpoint`](./docs/API.md#endpoint) carries state for its handlers and sends
 
 ```rust
 use std::sync::mpsc;
-use jsonx_lib::json;
+use rpc_io::jsonx::json;
 use rpc_io::{Endpoint, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
@@ -153,7 +156,7 @@ fn main() -> Result<(), rpc_io::Error> {
 
 ### Long work, answered later and cancellable
 
-A deferred handler gets a `Responder` it can keep or move to a worker. If the peer cancels (`$/cancelRequest` in LSP, `notifications/cancelled` in MCP), the responder's token is set and the request is answered as the protocol says; a late answer is refused:
+A deferred handler gets a `Responder` it can keep or move to a worker. If the peer cancels (`$/cancelRequest` in LSP, `notifications/cancelled` in MCP), the responder's token is set and the request is answered as the protocol says; a late answer is refused, also after the peer has reused the request's id for a new request (the responder is bound to its own request, not to the id):
 
 ```rust
 use std::sync::mpsc;
@@ -178,26 +181,24 @@ fn main() -> Result<(), rpc_io::Error> {
 
 ### Protocol presets
 
-`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the `initialize` gate, and the limits each protocol wants (MCP turns batches off, as its 2025-06-18 revision removed them, and serves `ping` before `initialize`). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
+`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the opening gate, and the limits each protocol wants. LSP waits for `initialize`. MCP's current revision (2026-07-28) is stateless, so `Config::mcp()` has no gate, keeps batches off (MCP removed them in 2025-06-18), and writes errors for unreadable messages without an `id`, as MCP's schema has it; `Config::mcp_legacy()` adds the `initialize` gate for servers whose clients all speak a legacy revision (2025-11-25 and earlier). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` (refusing a value that does not increase, and, bound to its request by `Context::progress` or `Responder::progress`, any report once the request is answered or cancelled) and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
 
 ```rust
-use rpc_io::{Config, Endpoint, Progress, Router};
+use rpc_io::{Config, Endpoint, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
     let router = Router::new()
-        .request("initialize", |_: &mut (), _, _| Ok(jsonx_lib::json!({ "protocolVersion": "2025-06-18" })))
-        .request("tools/call", |_, params, cx| {
-            if let Some(progress) = Progress::from_params(&params, cx.peer()) {
+        .request("tools/call", |_: &mut (), params, cx| {
+            if let Some(progress) = cx.progress(&params) {
                 progress.report(1.0, Some(1.0), Some("done"))?;
             }
-            Ok(jsonx_lib::json!({ "content": [] }))
+            Ok(rpc_io::jsonx::json!({ "content": [] }))
         });
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut endpoint = Endpoint::new(tx, router, ()).with_config(Config::mcp());
-    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)?;
     endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"progressToken":"p"}}}"#)?;
     let sent: Vec<String> = rx.try_iter().collect();
-    assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1,"total":1,"message":"done"}}"#);
+    assert_eq!(sent[0], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"p","progress":1,"total":1,"message":"done"}}"#);
     Ok(())
 }
 ```
@@ -221,7 +222,51 @@ fn main() -> Result<(), rpc_io::FrameError> {
 }
 ```
 
-Typed params through `serde`, the async adapter, the TCP server, and the interceptor have examples in [`docs/API.md`](./docs/API.md).
+### Typed params and results
+
+jsonx-lib's `FromJson` and `ToJson` (hand-written, no derive) are the typed API, in every build: `Router::request_json` decodes a handler's params and encodes its result, `Params::decode` decodes params that borrow from the message, and `Peer::notify_json`, `request_json`, `Responder::ok_json`, and `Call::wait_json` do the same for the other directions. Results are written straight into a buffer the endpoint reuses, so a typed handler builds no `Value` and, once the buffer has grown, allocates nothing for its result.
+
+```rust
+use rpc_io::jsonx::{DecodeError, FromJson, Reader, ToJson, ValueWriter, Written};
+use rpc_io::{Endpoint, Router};
+
+struct Add { a: i64, b: i64 }
+struct Sum(i64);
+
+impl<'de> FromJson<'de> for Add {
+    fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
+        let (mut a, mut b) = (None, None);
+        let mut object = reader.read_object()?;
+        while let Some(key) = object.next_key()? {
+            match &*key {
+                "a" => object.field(&mut a)?,
+                "b" => object.field(&mut b)?,
+                _ => {}
+            }
+        }
+        Ok(Add { a: object.required(a, "a")?, b: object.required(b, "b")? })
+    }
+}
+
+impl ToJson for Sum {
+    fn to_json(&self, out: ValueWriter<'_>) -> Written {
+        out.object(|o| o.member("sum", &self.0))
+    }
+}
+
+fn main() -> Result<(), rpc_io::Error> {
+    let router = Router::new().request_json("add", |_: &mut (), p: Add, _| Ok(Sum(p.a + p.b)));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"add","params":{"a":2,"b":3}}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"sum":5}}"#));
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"add","params":{"a":2}}"#)?;
+    assert!(rx.try_recv().is_ok_and(|m| m.contains("-32602"))); // `b` is missing
+    Ok(())
+}
+```
+
+Typed params through `serde` (the `serde` feature), the async adapter, the TCP server, and the interceptor have examples in [`docs/API.md`](./docs/API.md).
 
 <hr>
 <br>
@@ -243,25 +288,45 @@ Runnable programs in [`examples/`](./examples):
 
 Decoding is one pass of `jsonx-lib`'s pull reader over each body: the envelope members are read as raw slices, so `params` and `result` are validated once and never copied or decoded unless a handler asks. Method names and string ids borrow from the body when they have no escapes, and deferred requests are looked up without copying their ids. `Framed` frames messages into a reused buffer and writes once per turn, however many messages a handler sends; `Queued` writes each batch of queued messages with one `write_all` and one `flush`. The decoder reads straight into its own buffer, searches for line ends eight bytes at a time, resumes each search where the last one stopped, and grows geometrically while a large message arrives.
 
-Measured with the benchmarks in [`benches/`](./benches), x86_64 Windows, Rust 1.99, release profile, on LSP-shaped `textDocument/hover` requests (about 160 bytes each). The machine was under heavy background load from other work, and repeated runs there differed by up to 40%, so these are lower bounds to compare trends with, not the crate's speed on a quiet machine. Across back-to-back runs of 0.2.0 and 0.3.0 there, neither was consistently faster: the differences between the versions were smaller than those between repeated runs.
+Throughput, measured with the benchmarks in [`benches/`](./benches): x86_64 Windows, rustc 1.99, release profile, LSP-shaped `textDocument/hover` requests (about 160 bytes each), jsonx-lib 0.5 at `2161d2c`. The machine was loaded by other work, so each figure is the range of medians over two rounds: a guide to scale, not a speed to quote.
 
-| Benchmark | What it measures | Windows |
+| Benchmark | What it measures | 0.4.0 |
 |---|---|---:|
-| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | ~2.7 GiB/s (6.8 ms) |
-| `framing/decode_100k_Newline` | The same with newline framing. | ~6.1 GiB/s (2.7 ms) |
-| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | ~1.8 / ~1.4 GiB/s |
-| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | ~1.6 M/s (~610 ns each) |
-| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | ~460 µs |
-| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | ~1.6 M/s |
-| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params`, build a result, encode, frame, write. | ~420 K/s (~2.4 µs each) |
-| `endpoint/run_100k_framed_requests` | The same, read from one Content-Length stream by `run`, written by `Framed`. | ~455 K/s |
-| `endpoint/run_100k_queued` | The same through a `Queued` sink: a writer thread does the writes, and the time includes waiting for it to finish. | ~355 K/s |
-| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | ~1.2 M pairs/s |
+| `framing/decode_100k_ContentLength` | Cut 100,000 Content-Length frames out of one 19 MiB stream. | 3.6-4.8 GiB/s |
+| `framing/decode_100k_Newline` | The same with newline framing. | 7.3-8.0 GiB/s |
+| `framing/encode_100k_*` | Frame 100,000 bodies (Content-Length / newline). | 2.1-2.7 / 1.5-2.0 GiB/s |
+| `messages/decode_100k_requests` | Decode 100,000 requests: envelope, id, method, `params` validated. | 2.5-2.7 M/s |
+| `messages/decode_batch_1024` | Decode a full batch of 1,024 requests. | 300-380 µs |
+| `messages/decode_and_write_100k_responses` | Decode 100,000 responses and write each back. | 2.5-2.8 M/s |
+| `endpoint/handle_100k_requests` | The whole server path, 100,000 times: decode, route, parse `params` into a `Value`, build a result, encode, frame, write. | 540-640 K/s |
+| `endpoint/handle_100k_unparsed` | The endpoint's own cost: the same 100,000 requests to a handler that reads nothing and answers `null`. | 1.70-1.95 M/s |
+| `endpoint/run_100k_framed_requests` | The same as `handle_100k_requests`, read from one Content-Length stream by `run`, written by `Framed`. | 560-610 K/s |
+| `endpoint/run_100k_queued` | The same through a `Queued` sink: a writer thread does the writes, and the time includes waiting for it to finish. | 505-540 K/s |
+| `pending/issue_then_settle_100k_out_of_order` | Issue 100,000 requests with deadlines, settle them in scrambled order. | 2.2-2.4 M pairs/s |
+| `typed/handle_100k_json_borrowed` | The hover path through a `FromJson` struct borrowed from the message and a `ToJson` result (`request_encoded` + `Params::decode`). | 1.13-1.14 M/s |
+| `typed/handle_100k_request_json` | The same through `request_json`, owned params. | 1.08-1.15 M/s |
+| `typed/handle_100k_serde` | The same through `serde` (the `serde` feature). | 1.39-1.47 M/s |
+| `typed/progress_100k_reports` | 100,000 MCP progress reports. | 10.4-11.0 M/s |
+
+Against 0.3.0, wall-clock time on the test machine drifted between rounds by more than the versions differ, so the comparison counts CPU cycles per request on the endpoint's thread instead (`QueryThreadCycleTime`, which leaves out time the thread is not running), with [`dev/ab`](./dev/ab): rpc-io 0.3.0 from crates.io and this tree in one binary, 100,000 distinct hover requests on a fresh endpoint per run, the two versions alternating within each round.
+
+| Per request, 0.4.0 against 0.3.0 (minimum cycles) | built with rustc 1.99 | built with rustc 1.95 |
+|---|---:|---:|
+| Endpoint path, handler reads nothing | -9.3% to -8.8% | +1.4% to +2.1% |
+| `decode` alone | -11.4% to -10.8% | +1.6% to +3.5% |
+| `run` over one Content-Length stream | -12.0% to -8.5% | +2.0% to +5.2% |
+| Handler parses `params` into a `Value` | -8.6% to -6.8% | -4.9% to -4.2% |
+| `serde` typed handler | -5.0% to -1.9% | +2.8% to +4.9% |
+| Progress report | -76.3% to -75.6% | -76.6% to -76.4% |
+
+The result depends on the compiler both versions are built with. With rustc 1.99 (GitHub CI's `stable`), 0.4.0 is cheaper on every path: 2-12%, and about 76% for progress reports. With rustc 1.95, the endpoint path, `decode`, `run`, and the serde path cost 1.4-5.2% more than 0.3.0's, while handlers that parse params are still 4-5% cheaper and progress reports still about 76% cheaper. The figures are the release verification's, from `dev/ab` and an equivalent harness of its own, 11 rounds per run against rpc-io 0.3.0 from crates.io, each harness built with both compilers; each range spans the two harnesses. Progress reports are cheaper on either compiler because they are encoded into a reused per-thread buffer instead of allocating their text and numbers. The `FromJson` path is 17-27% behind `serde_json`'s in throughput (rustc 1.99); it refuses repeated keys anywhere in the params (the endpoint's policy), where serde's derive ignores repeats of members it does not know.
 
 The queued path costs a hand-off to the writer thread per batch; it buys senders that do not wait on the peer while the connection is open. Use `Framed` for a peer that always reads (a local pipe), `Queued` for anything that might stall.
 
 ```bash
 cargo bench --bench bench
+cargo bench --features serde --bench typed
+cd dev/ab && cargo run --release -- 11   # the cycle A/B against 0.3.0 (Windows)
 ```
 
 Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by CPU and load; use the trend across runs, not a single absolute.
@@ -271,9 +336,9 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 
 ## Design notes
 
-- **Exactly one response.** A deferred request is tracked until answered; a `Responder` dropped without answering (a worker returned early, a panic unwound through it) answers `INTERNAL_ERROR` itself. A cancelled request is answered by the endpoint (`-32800` for LSP) or not at all (MCP), and a late answer from the worker returns `Error::AlreadyAnswered` instead of reaching the wire.
-- **Ids.** Request ids are strings or integers within `i64`. `null`, fractions, and other values are refused as invalid requests, as LSP and MCP require. A request whose id is still being answered by a deferred handler is refused under a `null` id, so the only response carrying that id is the real answer (a deliberate departure from the letter of JSON-RPC 2.0, which keeps `null` for ids that could not be read). Our own ids are positive integers counted from 1; answers to ids we are not waiting on are reported and dropped.
-- **Malformed messages.** A message with a `method` is answered under its own id when that id is valid and appears once; anything unreadable is answered under `null`, as the specification requires. A broken *response* is never answered (an error under its id would read as an answer to one of the peer's requests); it ends the call it names instead.
+- **Exactly one response.** A deferred request is tracked until answered; a `Responder` dropped without answering (a worker returned early, a panic unwound through it) answers `INTERNAL_ERROR` itself. A cancelled request is answered by the endpoint (`-32800` for LSP) or not at all (MCP), and a late answer from the worker returns `Error::AlreadyAnswered` instead of reaching the wire, even after the peer reused the id for a new request: a `Responder`, `Notifier`, or request-bound `Progress` is bound to its own request, never to a later one with the same id. (In 0.2 and 0.3, a stale `Responder` answered the later request.)
+- **Ids.** Request ids are strings or integers within `i64` by default. `null`, fractions, and other values are refused as invalid requests, as LSP and MCP require; `Limits::with_lenient_ids(true)` accepts them for generic JSON-RPC services and echoes each back exactly as it was sent. A request whose id is still being answered by a deferred handler is refused under a `null` id, so the only response carrying that id is the real answer (a deliberate departure from the letter of JSON-RPC 2.0, which keeps `null` for ids that could not be read). Our own ids are positive integers counted from 1; answers to ids we are not waiting on are reported and dropped.
+- **Malformed messages.** A message with a `method` is answered under its own id when that id is valid and appears once; anything unreadable is answered under `null`, as the specification requires (with no `id` under `Config::omit_null_id`). A repeated envelope member (`method`, `id`, `params`, `jsonrpc`, `result`, `error`) makes the message invalid, so no reader can see one method and run another; an error response without `id` (MCP's form) is read as one under `null`. A broken *response* is never answered (an error under its id would read as an answer to one of the peer's requests); it ends the call it names instead.
 - **Budgets.** `Limits` caps message bytes (64 MiB), header bytes (8 KiB, the terminating blank line included), header lines (32), batch size (1024, or 0 for no batches), the length an oversized body may announce and still be skipped, and every JSON budget of `jsonx-lib` (depth 128 by default). An oversized message is skipped as it arrives, never buffered, and answered; a broken frame ends the connection, since no reliable boundary is left. The defaults suit a local peer; `Limits::network()` and `Limits::strict()` suit remote ones, since a handler that parses `params` builds a value tree that can be several times the message's size.
 - **Output.** A `Sink` runs under the endpoint's lock. `Framed` writes in the sending thread, which is fine for a peer that always reads; with `Queued` and `outbox` a send does not wait on the peer: messages wait in a bounded queue (bytes, messages, and a no-progress write timeout), and a peer that stops reading closes the connection instead of freezing it. Closing takes the lock only to close the queue; the closing thread then waits for the drain without it, for at most `QueueLimits::close_timeout` (10 s), and other threads see the connection closed at once. Messages this side sends before the gate opens are held, within `Config::max_held_bytes`.
 - **Calls.** Dropping a `Call` before its outcome cancels the request: its pending slot is freed and the peer is told, as a dropped future should (a `select!` that took another branch). `Call` is `#[must_use]` for that reason, and `Call::detach` keeps a request outstanding without a waiter.
@@ -281,7 +346,7 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 - **Panics.** Handler, interceptor, and event-hook panics are caught; so are panics in a `Sink` or a `Queued` writer, which close the connection as an I/O error. This needs `panic = "unwind"`, Rust's default. An I/O error a handler forwards with `?` reaches the peer as "the transport failed", without the operating system's text.
 - **Threads.** Handlers run on the endpoint's thread, one at a time, in arrival order. `Peer`, `Call`, `Responder`, and `Canceller` are `Send` and work from any thread. The endpoint's lock is held to encode a message and hand it to the sink, never while a handler or hook runs; with `Queued` or `outbox`, never during a write either. A message sent from a worker goes out at once, even while a handler runs.
 - **Observability.** `Endpoint::stats()` and `Peer::stats()` give the connection's counters (traffic both ways, errors, timeouts, evictions, cancellations, panics) and gauges (pending, in flight, held). The `tracing` feature adds a span per call and events at documented levels. They record methods, ids, sizes, error codes, error messages, and panic messages, never `params`, results, or error `data` as such. Text the peer chose is clipped and escaped; an error message may quote part of what the peer sent (a `serde` error names the value that did not fit), clipped to 256 bytes.
-- **Serving.** `Server` closes a connection that leaves a message unfinished for `message_timeout` (30 s per message, counted from the read that brought its first bytes, so a client streaming messages back to back is never cut off; also the time a new connection has to send its first message) or stays idle for `idle_timeout` (300 s: no traffic either way and nothing in flight, so a client waiting on a long answer is kept, while a request of ours counts only within its timeout, so a client that never answers one cannot hold the connection; long-lived LSP or MCP sessions may want `with_idle_timeout(None)`), so silent or trickling sockets cannot hold its `max_connections` slots. Its defaults are for untrusted peers: `Limits::network()` (4 MiB messages) and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop (10 ms, doubling to 1 s) instead of ending it.
+- **Serving.** `Server` closes a connection that leaves a message unfinished for `message_timeout` (30 s per message, counted from the read that brought its first bytes, so a client streaming messages back to back is never cut off; also the time a new connection has to send its first message) or stays idle for `idle_timeout` (300 s: no traffic either way and nothing in flight, so a client waiting on a long answer is kept, while a request of ours counts only within its timeout, and while one of ours without a timeout is outstanding the client's own requests in flight do not count either, so a client that never answers cannot hold the connection; long-lived LSP or MCP sessions may want `with_idle_timeout(None)`; a client that takes longer than `idle_timeout` to answer a request of ours, a slow MCP `sampling/createMessage` for example, is disconnected unless that request has a timeout of its own, which keeps the connection busy until it passes), so silent or trickling sockets cannot hold its `max_connections` slots. Its defaults are for untrusted peers: `Limits::network()` (4 MiB messages) and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop (10 ms, doubling to 1 s) instead of ending it.
 
 <hr>
 <br>
@@ -297,7 +362,7 @@ cargo bench --bench bench
 cargo +nightly fuzz run content_length   # also: newline, message, batch, endpoint
 ```
 
-[`tests/properties.rs`](./tests/properties.rs) holds the crate to independent references: a classifier built on a full `jsonx-lib` parse decides what every random envelope should decode to, and random batches check one response per request id. [`tests/fuzz_harness.rs`](./tests/fuzz_harness.rs) runs the fuzz targets' checks on random, JSON-shaped, and mutated bytes in every `cargo test`. [`tests/endpoint.rs`](./tests/endpoint.rs) runs section 7 of the JSON-RPC 2.0 specification verbatim, [`tests/framing.rs`](./tests/framing.rs) runs the framings against malformed and hostile streams, [`tests/session.rs`](./tests/session.rs) covers cancellation, timeouts, the gate, a client and server over a pipe, and races, [`tests/output.rs`](./tests/output.rs) stalls the peer, and [`tests/adversarial.rs`](./tests/adversarial.rs) holds regression tests for the 0.2 review's findings; the 0.3 audits' regressions sit with the behaviour they cover (`tests/output.rs`, `tests/server.rs`, `tests/session.rs`, `tests/typed.rs`, `tests/tracing.rs`). Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+[`tests/properties.rs`](./tests/properties.rs) holds the crate to independent references: a classifier built on a full `jsonx-lib` parse decides what every random envelope should decode to, and random batches check one response per request id. [`tests/fuzz_harness.rs`](./tests/fuzz_harness.rs) runs the fuzz targets' checks on random, JSON-shaped, and mutated bytes in every `cargo test`. [`tests/endpoint.rs`](./tests/endpoint.rs) runs section 7 of the JSON-RPC 2.0 specification verbatim, [`tests/framing.rs`](./tests/framing.rs) runs the framings against malformed and hostile streams, [`tests/session.rs`](./tests/session.rs) covers cancellation, timeouts, the gate, a client and server over a pipe, and races, [`tests/output.rs`](./tests/output.rs) stalls the peer, and [`tests/adversarial.rs`](./tests/adversarial.rs) holds regression tests for the 0.2 review's findings; the 0.3 audits' regressions sit with the behaviour they cover (`tests/output.rs`, `tests/server.rs`, `tests/session.rs`, `tests/typed.rs`, `tests/tracing.rs`). For 0.4: [`tests/json.rs`](./tests/json.rs) covers the `ToJson`/`FromJson` API (borrowing, misfits, panics while encoding, nested encoding), [`tests/duplicates.rs`](./tests/duplicates.rs) refuses repeated envelope members (the jsonx-lib audit's smuggling case), [`tests/allocations.rs`](./tests/allocations.rs) counts the allocations the reused buffers avoid, and [`tests/protocols.rs`](./tests/protocols.rs) holds the MCP 2026-07-28 presets, progress rules, and `Notifier`. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

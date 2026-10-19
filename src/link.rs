@@ -23,7 +23,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, ThreadId},
     time::{Duration, Instant},
@@ -32,7 +32,7 @@ use std::{
 use crate::{
     config::{Cancellation, Config},
     error::{CallError, Error},
-    error_object::ErrorObject,
+    error_object::{ErrorCode, ErrorObject},
     handles::CancelToken,
     id::Id,
     message::{write_call, write_numbered_call, write_response},
@@ -48,9 +48,65 @@ use crate::{
 /// The encoding buffer is released after a message that grew it past this.
 const SCRATCH_KEEP: usize = 64 * 1024;
 
+/// The request a notification belongs to, checked under the lock it is sent
+/// under, so it cannot go out after that request's response.
+#[derive(Clone)]
+pub(crate) enum Scope {
+    /// No request: always sent.
+    Free,
+    /// A request answered by its handler's return value.
+    Turn(Arc<Turn>),
+    /// A deferred request: live while the in-flight entry under `id` is the
+    /// one with this `serial`. A later request that reuses the id gets
+    /// another serial, so a handle of the earlier one never reaches it.
+    Deferred { id: Id<'static>, serial: u64 },
+}
+
+/// The state of a request answered by its handler's return value, shared by
+/// its bound handles. Read and written only under the shared lock (atomics
+/// so it can be shared between threads at all).
+#[derive(Debug, Default)]
+pub(crate) struct Turn {
+    /// Set when the response is written.
+    done: AtomicBool,
+    /// The last progress value sent for the request, as `f64` bits; `NO_PROGRESS`
+    /// before the first.
+    progress: AtomicU64,
+}
+
+/// `Turn::progress` before any report: the bits of a NaN, which no report
+/// can carry (reports are finite).
+const NO_PROGRESS: u64 = u64::MAX;
+
+impl Turn {
+    pub(crate) fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            progress: AtomicU64::new(NO_PROGRESS),
+        }
+    }
+
+    /// Marks the request answered; called under the lock the response is
+    /// written under.
+    pub(crate) fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
 /// What the handles need from the shared state, with the sink type erased.
 pub(crate) trait Link: Send + Sync {
     fn notify(&self, method: &str, params: Option<&Json<'_>>) -> Result<(), Error>;
+    /// As `notify`, refused with `Error::AlreadyAnswered` once `scope`'s
+    /// request is answered or cancelled. With `progress`, refused with
+    /// `Error::ProgressNotIncreasing` unless it exceeds the last progress
+    /// value sent for that request (bound scopes only).
+    fn notify_in(
+        &self,
+        scope: &Scope,
+        progress: Option<f64>,
+        method: &str,
+        params: Option<&Json<'_>>,
+    ) -> Result<(), Error>;
     fn request(
         &self,
         method: &str,
@@ -59,9 +115,12 @@ pub(crate) trait Link: Send + Sync {
     ) -> Result<Issued, Error>;
     fn cancel(&self, id: u64) -> bool;
     fn expire(&self);
+    /// Answers the deferred request `id`, if the one in flight under it is
+    /// still the one with `serial`.
     fn respond(
         &self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error>;
     fn on_endpoint_thread(&self) -> bool;
@@ -104,6 +163,7 @@ impl<K: Sink> Shared<K> {
                 in_flight: IdMap::default(),
                 batches: BTreeMap::new(),
                 next_batch: 0,
+                next_serial: 0,
                 gate: if config.gate.is_some() {
                     GateState::Closed
                 } else {
@@ -144,6 +204,51 @@ impl<K: Sink> Link for Shared<K> {
         self.lock().notify(method, params)
     }
 
+    fn notify_in(
+        &self,
+        scope: &Scope,
+        progress: Option<f64>,
+        method: &str,
+        params: Option<&Json<'_>>,
+    ) -> Result<(), Error> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(Error::Closed);
+        }
+        let last = match scope {
+            Scope::Free => None,
+            Scope::Turn(turn) => {
+                if turn.done.load(Ordering::Acquire) {
+                    return Err(Error::AlreadyAnswered);
+                }
+                let bits = turn.progress.load(Ordering::Acquire);
+                (bits != NO_PROGRESS).then(|| f64::from_bits(bits))
+            }
+            Scope::Deferred { id, serial } => match inner.in_flight.get(id) {
+                Some(request) if request.serial == *serial => request.progress,
+                _ => return Err(Error::AlreadyAnswered),
+            },
+        };
+        if let (Some(next), Some(last)) = (progress, last) {
+            if next <= last {
+                return Err(Error::ProgressNotIncreasing { last, next });
+            }
+        }
+        inner.notify(method, params)?;
+        if let Some(next) = progress {
+            match scope {
+                Scope::Free => {}
+                Scope::Turn(turn) => turn.progress.store(next.to_bits(), Ordering::Release),
+                Scope::Deferred { id, .. } => {
+                    if let Some(request) = inner.in_flight.get_mut(id) {
+                        request.progress = Some(next);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn request(
         &self,
         method: &str,
@@ -164,9 +269,10 @@ impl<K: Sink> Link for Shared<K> {
     fn respond(
         &self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error> {
-        self.lock().respond_deferred(id, result)
+        self.lock().respond_deferred(id, serial, result)
     }
 
     fn on_endpoint_thread(&self) -> bool {
@@ -189,6 +295,8 @@ pub(crate) struct Settings {
     pub(crate) max_in_flight: usize,
     pub(crate) max_held_bytes: usize,
     pub(crate) timer: bool,
+    pub(crate) omit_null_id: bool,
+    pub(crate) overloaded_code: ErrorCode,
 }
 
 impl From<&Config> for Settings {
@@ -199,6 +307,8 @@ impl From<&Config> for Settings {
             max_in_flight: config.max_in_flight,
             max_held_bytes: config.max_held_bytes,
             timer: config.timer,
+            omit_null_id: config.omit_null_id,
+            overloaded_code: config.overloaded_code,
         }
     }
 }
@@ -284,14 +394,24 @@ pub(crate) enum GateState {
 struct InFlight {
     token: CancelToken,
     batch: Option<u64>,
+    /// Unique to this request among all the connection's deferred requests:
+    /// its handles carry it, so they never act on a later request that
+    /// reuses the id.
+    serial: u64,
+    /// The last progress value sent for it, shared by all its handles.
+    progress: Option<f64>,
 }
 
-/// Deferred requests by id. Integer and string ids are kept apart, so a
-/// lookup borrows the id it is given (`&str` for a string) instead of copying
-/// it into an owned key.
+/// Deferred requests by id. Integer, string, and other (lenient) ids are
+/// kept apart, so a lookup borrows the id it is given (`&str` for a string)
+/// instead of copying it into an owned key.
 struct IdMap<V> {
     numbers: BTreeMap<i64, V>,
     strings: BTreeMap<Box<str>, V>,
+    /// [`Id::RawNumber`] ids, by their text.
+    raw_numbers: BTreeMap<Box<str>, V>,
+    /// The one [`Id::Null`] request.
+    null: Option<V>,
 }
 
 impl<V> Default for IdMap<V> {
@@ -299,19 +419,26 @@ impl<V> Default for IdMap<V> {
         Self {
             numbers: BTreeMap::new(),
             strings: BTreeMap::new(),
+            raw_numbers: BTreeMap::new(),
+            null: None,
         }
     }
 }
 
 impl<V> IdMap<V> {
     fn len(&self) -> usize {
-        self.numbers.len() + self.strings.len()
+        self.numbers.len()
+            + self.strings.len()
+            + self.raw_numbers.len()
+            + usize::from(self.null.is_some())
     }
 
     fn contains(&self, id: &Id<'_>) -> bool {
         match id {
             Id::Number(n) => self.numbers.contains_key(n),
             Id::String(s) => self.strings.contains_key(&**s),
+            Id::RawNumber(s) => self.raw_numbers.contains_key(&**s),
+            Id::Null => self.null.is_some(),
         }
     }
 
@@ -319,6 +446,28 @@ impl<V> IdMap<V> {
         match id {
             Id::Number(n) => self.numbers.insert(n, value),
             Id::String(s) => self.strings.insert(s.into_owned().into_boxed_str(), value),
+            Id::RawNumber(s) => self
+                .raw_numbers
+                .insert(s.into_owned().into_boxed_str(), value),
+            Id::Null => self.null.replace(value),
+        }
+    }
+
+    fn get(&self, id: &Id<'_>) -> Option<&V> {
+        match id {
+            Id::Number(n) => self.numbers.get(n),
+            Id::String(s) => self.strings.get(&**s),
+            Id::RawNumber(s) => self.raw_numbers.get(&**s),
+            Id::Null => self.null.as_ref(),
+        }
+    }
+
+    fn get_mut(&mut self, id: &Id<'_>) -> Option<&mut V> {
+        match id {
+            Id::Number(n) => self.numbers.get_mut(n),
+            Id::String(s) => self.strings.get_mut(&**s),
+            Id::RawNumber(s) => self.raw_numbers.get_mut(&**s),
+            Id::Null => self.null.as_mut(),
         }
     }
 
@@ -326,11 +475,17 @@ impl<V> IdMap<V> {
         match id {
             Id::Number(n) => self.numbers.remove(n),
             Id::String(s) => self.strings.remove(&**s),
+            Id::RawNumber(s) => self.raw_numbers.remove(&**s),
+            Id::Null => self.null.take(),
         }
     }
 
     fn into_values(self) -> impl Iterator<Item = V> {
-        self.numbers.into_values().chain(self.strings.into_values())
+        self.numbers
+            .into_values()
+            .chain(self.strings.into_values())
+            .chain(self.raw_numbers.into_values())
+            .chain(self.null)
     }
 }
 
@@ -375,6 +530,8 @@ pub(crate) struct Inner<K> {
     in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
     next_batch: u64,
+    /// The serial the next deferred request gets.
+    next_serial: u64,
     pub(crate) gate: GateState,
     held: Vec<Held>,
     /// The bytes of the bodies in `held`.
@@ -439,6 +596,12 @@ impl<K: Sink> Inner<K> {
     }
 
     /// When the earliest outstanding request is due.
+    /// How many of our requests wait on the peer with no deadline.
+    #[cfg(feature = "net")]
+    pub(crate) fn open_ended(&self) -> usize {
+        self.pending.without_deadline()
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.pending
             .next_deadline()
@@ -739,7 +902,7 @@ impl<K: Sink> Inner<K> {
             bump(&mut self.stats.errors_out);
         }
         self.scratch.clear();
-        write_response(&mut self.scratch, id, result);
+        write_response(&mut self.scratch, id, result, self.settings.omit_null_id);
         let opening = match (&self.gate, id) {
             (GateState::Opening(opening), Some(id)) => opening == id,
             _ => false,
@@ -833,33 +996,45 @@ impl<K: Sink> Inner<K> {
         self.in_flight.contains(id)
     }
 
-    /// Records a deferred request; `None` when too many are in flight.
+    /// Records a deferred request: its cancel token and its serial; `None`
+    /// when too many are in flight.
     pub(crate) fn begin_deferred(
         &mut self,
         id: Id<'static>,
         batch: Option<u64>,
-    ) -> Option<CancelToken> {
+    ) -> Option<(CancelToken, u64)> {
         if self.in_flight.len() >= self.settings.max_in_flight {
             return None;
         }
         let token = CancelToken::new();
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
         let _fresh = self.in_flight.insert(
             id,
             InFlight {
                 token: token.clone(),
                 batch,
+                serial,
+                progress: None,
             },
         );
-        Some(token)
+        Some((token, serial))
     }
 
-    /// Answers a deferred request, if it is still in flight.
+    /// Answers a deferred request, if the one in flight under `id` is still
+    /// the one with `serial`: a responder of an earlier request that was
+    /// cancelled, whose id the peer has reused since, answers nothing.
     pub(crate) fn respond_deferred(
         &mut self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error> {
-        match self.in_flight.remove(id) {
+        let current = self
+            .in_flight
+            .get(id)
+            .is_some_and(|request| request.serial == serial);
+        match current.then(|| self.in_flight.remove(id)).flatten() {
             Some(request) => self.respond(Some(id), request.batch, result),
             None if self.closed => Err(Error::Closed),
             None => Err(Error::AlreadyAnswered),

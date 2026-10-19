@@ -9,7 +9,7 @@
 use alloc::{borrow::Cow, format, string::String, vec::Vec};
 use core::fmt;
 
-use jsonx_lib::{Event, Number, Parser, Reader};
+use jsonx_lib::{DuplicateKeys, Event, Number, Parser, RawValue, Reader};
 
 use crate::{
     error_object::ErrorObject,
@@ -20,19 +20,24 @@ use crate::{
 
 /// A request: a call that expects exactly one response.
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Request::new`] (a later version
+/// may keep more of the envelope).
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{Message, Raw, Request};
 ///
-/// let request = Request { id: 1.into(), method: "sum".into(), params: Some(Raw::new("[1, 2]")?) };
+/// let request = Request::new(1, "sum", Some(Raw::new("[1, 2]")?));
 /// assert_eq!(
 ///     Message::Request(request).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":1,"method":"sum","params":[1, 2]}"#,
 /// );
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Request<'a> {
     /// The id the response must carry.
     pub id: Id<'a>,
@@ -44,15 +49,19 @@ pub struct Request<'a> {
 
 /// A notification: a call that gets no response.
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Notification::new`].
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{Message, Notification};
 ///
-/// let n = Notification { method: "exit".into(), params: None };
+/// let n = Notification::new("exit", None);
 /// assert_eq!(Message::Notification(n).to_string(), r#"{"jsonrpc":"2.0","method":"exit"}"#);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Notification<'a> {
     /// The method to call.
     pub method: Cow<'a, str>,
@@ -65,27 +74,130 @@ pub struct Notification<'a> {
 /// `id` is `None` only for an error answering a message whose id could not be
 /// read (it is written as `"id": null`).
 ///
+/// The fields are public to read and to change; the struct is
+/// `#[non_exhaustive]`, so build one with [`Response::ok`],
+/// [`Response::err`], or [`Response::new`].
+///
 /// # Examples
 ///
 /// ```
 /// use rpc_io::{ErrorObject, Message, Raw, Response};
 ///
-/// let ok = Response { id: Some(4.into()), result: Ok(Raw::new("true")?) };
+/// let ok = Response::ok(4, Raw::new("true")?);
 /// assert_eq!(Message::Response(ok).to_string(), r#"{"jsonrpc":"2.0","id":4,"result":true}"#);
 ///
-/// let failed = Response { id: None, result: Err(ErrorObject::parse_error("bad JSON")) };
+/// let failed = Response::err(None, ErrorObject::parse_error("bad JSON"));
 /// assert_eq!(
 ///     Message::Response(failed).to_string(),
 ///     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
 /// );
-/// # Ok::<(), jsonx_lib::Error>(())
+/// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Response<'a> {
     /// The id of the request answered, `None` for `null`.
     pub id: Option<Id<'a>>,
     /// The `result` member, or the `error` member.
     pub result: Result<Raw<'a>, ErrorObject>,
+}
+
+impl<'a> Request<'a> {
+    /// A request for `method` under `id`, with `params` (an array or an
+    /// object; `None` for absent).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let request = rpc_io::Request::new("req-1", "shutdown", None);
+    /// assert_eq!(request.id.as_str(), Some("req-1"));
+    /// assert_eq!(request.method, "shutdown");
+    /// ```
+    #[must_use]
+    pub fn new(
+        id: impl Into<Id<'a>>,
+        method: impl Into<Cow<'a, str>>,
+        params: Option<Raw<'a>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl<'a> Notification<'a> {
+    /// A notification for `method`, with `params` (an array or an object;
+    /// `None` for absent).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let n = rpc_io::Notification::new("initialized", Some(rpc_io::Raw::new("{}")?));
+    /// assert_eq!(n.params.map(|p| p.as_str().to_owned()).as_deref(), Some("{}"));
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
+    /// ```
+    #[must_use]
+    pub fn new(method: impl Into<Cow<'a, str>>, params: Option<Raw<'a>>) -> Self {
+        Self {
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl<'a> Response<'a> {
+    /// A response under `id` (`None` for `null`) with `result`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Raw, Response};
+    ///
+    /// let response = Response::new(Some(7.into()), Ok(Raw::NULL));
+    /// assert!(response.result.is_ok());
+    /// ```
+    #[must_use]
+    pub const fn new(id: Option<Id<'a>>, result: Result<Raw<'a>, ErrorObject>) -> Self {
+        Self { id, result }
+    }
+
+    /// A successful response under `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ok = rpc_io::Response::ok("a", rpc_io::Raw::new("[1]")?);
+    /// assert_eq!(ok.id.and_then(|id| id.as_str().map(str::to_owned)).as_deref(), Some("a"));
+    /// # Ok::<(), rpc_io::jsonx::Error>(())
+    /// ```
+    #[must_use]
+    pub fn ok(id: impl Into<Id<'a>>, result: Raw<'a>) -> Self {
+        Self {
+            id: Some(id.into()),
+            result: Ok(result),
+        }
+    }
+
+    /// An error response under `id` (`None` for `null`, for a message whose
+    /// id could not be read).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{ErrorObject, Id, Response};
+    ///
+    /// let failed = Response::err(Some(Id::from(3)), ErrorObject::method_not_found("x"));
+    /// assert!(failed.result.is_err());
+    /// ```
+    #[must_use]
+    pub const fn err(id: Option<Id<'a>>, error: ErrorObject) -> Self {
+        Self {
+            id,
+            result: Err(error),
+        }
+    }
 }
 
 /// One JSON-RPC 2.0 message.
@@ -122,7 +234,7 @@ impl<'a> Message<'a> {
     /// ```
     /// use rpc_io::{Message, Notification};
     ///
-    /// let n = Message::Notification(Notification { method: "x".into(), params: None });
+    /// let n = Message::Notification(Notification::new("x", None));
     /// assert!(n.id().is_none());
     /// ```
     #[must_use]
@@ -141,7 +253,7 @@ impl<'a> Message<'a> {
     /// ```
     /// use rpc_io::{Message, Notification};
     ///
-    /// let n = Message::Notification(Notification { method: "x".into(), params: None });
+    /// let n = Message::Notification(Notification::new("x", None));
     /// assert_eq!(n.method(), Some("x"));
     /// ```
     #[must_use]
@@ -161,7 +273,7 @@ impl<'a> Message<'a> {
     /// use rpc_io::{Message, Notification};
     ///
     /// let mut out = String::new();
-    /// Message::Notification(Notification { method: "x".into(), params: None }).write(&mut out);
+    /// Message::Notification(Notification::new("x", None)).write(&mut out);
     /// assert_eq!(out, r#"{"jsonrpc":"2.0","method":"x"}"#);
     /// ```
     pub fn write(&self, out: &mut String) {
@@ -179,7 +291,7 @@ impl<'a> Message<'a> {
                     Ok(raw) => Ok(Json::Raw(raw.reborrow())),
                     Err(error) => Err(error),
                 };
-                write_response(out, r.id.as_ref(), result.as_ref().map_err(|e| *e));
+                write_response(out, r.id.as_ref(), result.as_ref().map_err(|e| *e), false);
             }
         }
     }
@@ -193,7 +305,7 @@ impl<'a> Message<'a> {
     ///
     /// let text = String::from("x");
     /// let owned: Message<'static> =
-    ///     Message::Notification(Notification { method: text.as_str().into(), params: None }).into_owned();
+    ///     Message::Notification(Notification::new(text.as_str(), None)).into_owned();
     /// drop(text);
     /// assert_eq!(owned.method(), Some("x"));
     /// ```
@@ -236,7 +348,7 @@ impl fmt::Display for Message<'_> {
 /// ```
 /// use rpc_io::{write_batch, Message, Notification};
 ///
-/// let ping = Message::Notification(Notification { method: "ping".into(), params: None });
+/// let ping = Message::Notification(Notification::new("ping", None));
 /// let mut out = String::new();
 /// write_batch(&mut out, &[ping.clone(), ping]);
 /// assert_eq!(out, r#"[{"jsonrpc":"2.0","method":"ping"},{"jsonrpc":"2.0","method":"ping"}]"#);
@@ -292,16 +404,22 @@ fn write_method_params(out: &mut String, method: &str, params: Option<&Json<'_>>
     out.push('}');
 }
 
-/// Writes a response.
+/// Writes a response. A `None` id is written as `"id":null`, or left out
+/// when `omit_null_id` (MCP's form).
 pub(crate) fn write_response(
     out: &mut String,
     id: Option<&Id<'_>>,
     result: Result<&Json<'_>, &ErrorObject>,
+    omit_null_id: bool,
 ) {
-    out.push_str("{\"jsonrpc\":\"2.0\",\"id\":");
+    out.push_str("{\"jsonrpc\":\"2.0\"");
     match id {
-        Some(id) => id.write(out),
-        None => out.push_str("null"),
+        Some(id) => {
+            out.push_str(",\"id\":");
+            id.write(out);
+        }
+        None if omit_null_id => {}
+        None => out.push_str(",\"id\":null"),
     }
     match result {
         Ok(value) => {
@@ -520,7 +638,7 @@ pub enum Incoming<'a> {
 /// ```
 #[must_use]
 pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
-    let parser = limits.parser();
+    let parser = envelope_parser(&limits.parser());
     let mut reader = match parser.reader_bytes(body) {
         Ok(reader) => reader,
         Err(error) => return Incoming::Single(Err(unreadable(Fail::Json(error), None))),
@@ -536,14 +654,14 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
             let read = read_members(&mut reader, &mut fields)
                 .and_then(|()| reader.finish().map_err(Fail::Json));
             match read {
-                Ok(()) => Incoming::Single(classify(fields, &parser)),
+                Ok(()) => Incoming::Single(classify(fields, &parser, limits.lenient_ids)),
                 Err(fail) => {
-                    let salvaged = fields.salvage();
+                    let salvaged = fields.salvage(limits.lenient_ids);
                     Incoming::Single(Err(unreadable(fail, salvaged)))
                 }
             }
         }
-        Event::StartArray => decode_batch(reader, &parser, limits.max_batch),
+        Event::StartArray => decode_batch(reader, &parser, limits),
         _ => match reader.finish() {
             Ok(()) => Incoming::Single(Err(Invalid::request(
                 None,
@@ -554,8 +672,18 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
     }
 }
 
+/// `parser` for reading an envelope: its budgets, with every repeated key
+/// passed through. The envelope reader decides about repeated envelope
+/// members itself (the message is `INVALID_REQUEST`, answered under its id
+/// when that id is not the repeated member), and repeats inside `params` or
+/// `result` are for whoever parses them (`Params::parse` refuses them).
+fn envelope_parser(parser: &Parser) -> Parser {
+    parser.duplicate_keys(DuplicateKeys::KeepAll)
+}
+
 /// Decodes the elements of a batch, the reader just past its `[`.
-fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Incoming<'a> {
+fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, limits: &Limits) -> Incoming<'a> {
+    let max = limits.max_batch;
     if max == 0 {
         // Batches are off: refused at the `[`, unread.
         return Incoming::Single(Err(Invalid::request(
@@ -588,7 +716,7 @@ fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Inco
                 if let Err(fail) = read_members(&mut reader, &mut fields) {
                     return Incoming::Single(Err(unreadable(fail, None)));
                 }
-                classify(fields, parser)
+                classify(fields, parser, limits.lenient_ids)
             }
             Event::StartArray => {
                 if let Err(fail) = skip_container(&mut reader) {
@@ -666,8 +794,10 @@ struct Fields<'a> {
     jsonrpc: Option<&'a str>,
     id: Option<&'a str>,
     method: Option<&'a str>,
-    params: Option<&'a str>,
-    result: Option<&'a str>,
+    /// Kept as jsonx-lib validated it, so a `Raw` made from it is written
+    /// into a `ToJson` value with no second scan.
+    params: Option<RawValue<'a>>,
+    result: Option<RawValue<'a>>,
     error: Option<&'a str>,
     /// The first envelope member that appeared twice.
     duplicate: Option<&'static str>,
@@ -679,14 +809,13 @@ struct Fields<'a> {
 impl<'a> Fields<'a> {
     /// The id to answer an unreadable message under: its own if it was read,
     /// valid, unrepeated, and the message has a method.
-    fn salvage(&self) -> Option<Id<'a>> {
+    fn salvage(&self, lenient: bool) -> Option<Id<'a>> {
         if self.method.is_none() || self.id_repeated {
             return None;
         }
-        match self.id.map(read_id) {
-            Some(IdValue::Valid(id)) => Some(id),
-            _ => None,
-        }
+        self.id
+            .map(read_id)
+            .and_then(|id| id.into_request_id(lenient))
     }
 }
 
@@ -699,13 +828,28 @@ fn read_members<'a>(reader: &mut Reader<'a>, fields: &mut Fields<'a>) -> Result<
             Some(Event::EndObject) => return Ok(()),
             _ => return Err(Fail::Shape),
         };
+        if matches!(&*key, "params" | "result") {
+            let value = reader
+                .read_raw_value()
+                .map_err(Fail::Json)?
+                .ok_or(Fail::Shape)?;
+            let (slot, name) = if *key == *"params" {
+                (&mut fields.params, "params")
+            } else {
+                (&mut fields.result, "result")
+            };
+            if slot.is_some() {
+                let _first = fields.duplicate.get_or_insert(name);
+            } else {
+                *slot = Some(value);
+            }
+            continue;
+        }
         let raw = reader.read_raw().map_err(Fail::Json)?.ok_or(Fail::Shape)?;
         let (slot, name) = match &*key {
             "jsonrpc" => (&mut fields.jsonrpc, "jsonrpc"),
             "id" => (&mut fields.id, "id"),
             "method" => (&mut fields.method, "method"),
-            "params" => (&mut fields.params, "params"),
-            "result" => (&mut fields.result, "result"),
             "error" => (&mut fields.error, "error"),
             _ => continue,
         };
@@ -720,29 +864,52 @@ fn read_members<'a>(reader: &mut Reader<'a>, fields: &mut Fields<'a>) -> Result<
 
 /// What an `id` member holds.
 enum IdValue<'a> {
+    /// A string, or an integer within `i64`: an id under any policy.
     Valid(Id<'a>),
     Null,
+    /// Any other number (validated JSON): an id only with lenient ids.
+    OtherNumber(&'a str),
     Invalid,
+}
+
+impl<'a> IdValue<'a> {
+    /// The id a request with this `id` member has, `None` if it may not be
+    /// one under this policy.
+    fn into_request_id(self, lenient: bool) -> Option<Id<'a>> {
+        match self {
+            IdValue::Valid(id) => Some(id),
+            IdValue::OtherNumber(text) if lenient => Some(Id::RawNumber(Cow::Borrowed(text))),
+            IdValue::Null if lenient => Some(Id::Null),
+            IdValue::Null | IdValue::OtherNumber(_) | IdValue::Invalid => None,
+        }
+    }
 }
 
 fn read_id(raw: &str) -> IdValue<'_> {
     match raw.as_bytes().first() {
         Some(b'"') => read_string(raw).map_or(IdValue::Invalid, |s| IdValue::Valid(Id::String(s))),
         Some(b'n') => IdValue::Null,
-        Some(b'-' | b'0'..=b'9') => Number::from_text(raw)
-            .and_then(|n| n.as_i64())
-            .map_or(IdValue::Invalid, |n| IdValue::Valid(Id::Number(n))),
+        Some(b'-' | b'0'..=b'9') => match Number::from_text(raw).and_then(|n| n.as_i64()) {
+            Some(n) => IdValue::Valid(Id::Number(n)),
+            None => IdValue::OtherNumber(raw),
+        },
         _ => IdValue::Invalid,
     }
 }
 
 /// The id in member `member` of a params object (the target of a cancel
-/// notification); `None` when absent, repeated, or not a valid id.
+/// notification); `None` when absent, repeated, or not an id under this
+/// policy (`null` never is: it cannot name one request).
 #[cfg(feature = "std")]
-pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser) -> Option<Id<'a>> {
+pub(crate) fn read_member_id<'a>(
+    params: &'a str,
+    member: &str,
+    parser: &Parser,
+    lenient: bool,
+) -> Option<Id<'a>> {
     match read_id(read_member(params, member, parser)?) {
-        IdValue::Valid(id) => Some(id),
-        IdValue::Null | IdValue::Invalid => None,
+        IdValue::Null => None,
+        other => other.into_request_id(lenient),
     }
 }
 
@@ -751,7 +918,7 @@ pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser)
 /// values: acting on either could be wrong).
 #[cfg(feature = "std")]
 pub(crate) fn read_member<'a>(object: &'a str, member: &str, parser: &Parser) -> Option<&'a str> {
-    let mut reader = parser.reader(object);
+    let mut reader = envelope_parser(parser).reader(object);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return None;
     }
@@ -793,11 +960,14 @@ fn read_string(raw: &str) -> Option<Cow<'_, str>> {
 }
 
 /// Sorts a fully read message object into a message or an `Invalid`.
-fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
+fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a> {
     let id = fields.id.map(read_id);
     let id_repeated = fields.id_repeated;
     let valid_id = match &id {
         Some(IdValue::Valid(id)) if !id_repeated => Some(id.clone()),
+        Some(IdValue::OtherNumber(text)) if lenient && !id_repeated => {
+            Some(Id::RawNumber(Cow::Borrowed(text)))
+        }
         _ => None,
     };
     let version_ok = fields
@@ -827,15 +997,19 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
             return fail("a request cannot have a `result` or an `error`");
         }
         let params = match fields.params {
-            None | Some("null") => None,
-            Some(p) if p.starts_with(['[', '{']) => Some(Raw::trusted(p)),
+            None => None,
+            Some(p) if p.as_str() == "null" => None,
+            Some(p) if p.as_str().starts_with(['[', '{']) => Some(Raw::checked(p)),
             Some(_) => return fail("`params` must be an array or an object"),
         };
-        return match id {
-            None => Ok(Message::Notification(Notification { method, params })),
-            Some(IdValue::Valid(id)) => Ok(Message::Request(Request { id, method, params })),
-            Some(IdValue::Null) => fail("a request id must not be null"),
-            Some(IdValue::Invalid) => fail("a request id must be a string or an integer"),
+        let Some(id) = id else {
+            return Ok(Message::Notification(Notification { method, params }));
+        };
+        let null = matches!(id, IdValue::Null);
+        return match id.into_request_id(lenient) {
+            Some(id) => Ok(Message::Request(Request { id, method, params })),
+            None if null => fail("a request id must not be null"),
+            None => fail("a request id must be a string or an integer"),
         };
     }
 
@@ -864,7 +1038,7 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
         (Some(_), Some(_)) => {
             return fail("a response cannot have both `result` and `error`".into());
         }
-        (Some(result), None) => Ok(Raw::trusted(result)),
+        (Some(result), None) => Ok(Raw::checked(result)),
         (None, Some(error)) => match read_error(error, parser) {
             Ok(error) => Err(error),
             Err(why) => return fail(format!("malformed `error`: {why}").into()),
@@ -872,8 +1046,15 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
         (None, None) => return fail("a response needs a `result` or an `error`".into()),
     };
     match id {
-        None => fail("a response needs an `id`".into()),
-        Some(IdValue::Invalid) => {
+        // MCP writes an error for a message whose id it could not read with
+        // no `id` at all (JSON-RPC 2.0 says `null`): the same answer.
+        None if result.is_err() => Ok(Message::Response(Response { id: None, result })),
+        None => fail("a successful response needs an `id`".into()),
+        Some(IdValue::OtherNumber(text)) if lenient => Ok(Message::Response(Response {
+            id: Some(Id::RawNumber(Cow::Borrowed(text))),
+            result,
+        })),
+        Some(IdValue::Invalid | IdValue::OtherNumber(_)) => {
             fail("a response id must be a string, an integer, or null".into())
         }
         Some(IdValue::Null) if result.is_ok() => {
@@ -891,24 +1072,33 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
 /// `code`, a string `message`, and optional `data`.
 fn read_error(raw: &str, parser: &Parser) -> Result<ErrorObject, &'static str> {
     const NOT_AN_OBJECT: &str = "it must be an object with `code` and `message`";
-    let mut reader = parser.reader(raw);
+    let mut reader = envelope_parser(parser).reader(raw);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return Err(NOT_AN_OBJECT);
     }
-    let (mut code, mut message, mut data) = (None, None, None);
+    let (mut code, mut message, mut data) = (None, None, None::<RawValue<'_>>);
     loop {
         let key = match reader.next_event() {
             Ok(Some(Event::Key(key))) => key,
             Ok(Some(Event::EndObject)) => break,
             _ => return Err(NOT_AN_OBJECT),
         };
+        if *key == *"data" {
+            // Kept as jsonx-lib validated it (see `Fields::params`).
+            let Ok(Some(value)) = reader.read_raw_value() else {
+                return Err(NOT_AN_OBJECT);
+            };
+            if data.replace(value).is_some() {
+                return Err("a member appears more than once");
+            }
+            continue;
+        }
         let Ok(Some(value)) = reader.read_raw() else {
             return Err(NOT_AN_OBJECT);
         };
         let slot = match &*key {
             "code" => &mut code,
             "message" => &mut message,
-            "data" => &mut data,
             _ => continue,
         };
         if slot.replace(value).is_some() {
@@ -922,7 +1112,7 @@ fn read_error(raw: &str, parser: &Parser) -> Result<ErrorObject, &'static str> {
     let message = message
         .and_then(read_string)
         .ok_or("`message` must be a string")?;
-    let data = data.map(|d| Raw::trusted(d).into_owned());
+    let data = data.map(|d| Raw::checked(d.into_owned()));
     Ok(ErrorObject::from_parts(code, clip_owned(message), data))
 }
 

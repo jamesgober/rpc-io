@@ -132,9 +132,80 @@ Deferred, with reasons:
   readiness-based server need a design of their own; v0.5.0, with the HTTP
   framings, which need the same.
 
+## v0.4.0 - Typed JSON, MCP 2026-07-28, and the 1.0 decisions (DONE, 2026-10-19; published once jsonx-lib 0.5 is)
+
+Release order: jsonx-lib 0.5.0 is published first. Until it is on crates.io,
+rpc-io 0.4 builds only through a local path patch, so CI and `cargo publish`
+fail on it (the 0.4.0 verification's RPC5-005).
+- [x] jsonx-lib 0.5 (from 0.2).
+- [x] Typed params and results through jsonx-lib's `ToJson`/`FromJson` (moved here from v0.5.0, see below).
+- [x] MCP's current revision, 2026-07-28: `Config::mcp()` stateless (no `initialize` gate, no `-32002`, no `-32000..=-32019` codes, errors for unreadable messages without `id`); `Config::mcp_legacy()` for legacy-only servers; id-less error responses read as errors under `null`.
+- [x] MCP progress rules: `Progress` values strictly increase; a `Progress` bound to its request (`Context::progress`, `Responder::progress`) stops when the request is answered or cancelled.
+- [x] The 1.0 decisions (moved here from v1.0.0, see below): `#[non_exhaustive]` on `Request`, `Notification`, `Response` with constructors; `ErrorCode` kept as a plain newtype; lenient ids behind `Limits::lenient_ids`.
+- [x] The 0.3.0 release verification's non-blocking leftovers: `docs/API.md` examples without hidden lines; benchmarks re-measured.
+- [x] mcp-io's request: `Notifier`, notifications bound to their request (MCP's `subscriptions/listen`).
+- [x] Repeated envelope members (jsonx-lib audit JX-SEC-02): rpc-io was not affected; regression tests, and envelopes read with repeats passed through to rpc-io's own check under jsonx-lib 0.5's stricter default.
+
+Delivered:
+- `Router::request_json`, `request_encoded`, `notification_json`;
+  `Params::decode` (borrowing from the message), `Raw::decode`,
+  `Call::wait_json`; `Peer`/`Context`/`Notifier` `notify_json`,
+  `request_json`; `Responder::ok_json`; `Json::encode`; `ToJson`/`FromJson`
+  for the crate's values. The serde feature stays as the alternative.
+- jsonx-lib 0.5's writer adopted where it removes allocations: typed results
+  are written into a buffer the endpoint reuses (no `Value`, no per-request
+  string), typed params, deferred answers, and progress reports into a
+  per-thread buffer.
+- `rpc_io::jsonx`, the re-export, so crates on top share rpc-io's
+  jsonx-lib version.
+- `Config::mcp()` for MCP 2026-07-28, `Config::mcp_legacy()`,
+  `Config::omit_null_id`, `Config::overloaded_code`, `Gate::mcp()` on
+  `-32600`; id-less error responses accepted.
+- `Progress` strictly increasing and bound to its request
+  (`Context::progress`, `Responder::progress`); `Notifier`.
+- `#[non_exhaustive]` message structs with constructors; `Id::RawNumber`,
+  `Id::Null`, `Limits::lenient_ids`.
+
+Not done here, with reasons:
+- **Resetting a `Call`'s deadline on a matching progress notification**
+  (MCP "MAY"): not asked for by mcp-io; needs correlating progress tokens to
+  our requests. Later, on request.
+- **`ToJson` for every `Raw` without a second validation**: a `Raw` holds a
+  `jsonx_lib::RawValue` (validated once when read or written by jsonx-lib)
+  when it comes from a message, `Raw::new`, `Raw::from_value`, or
+  `Json::encode`, and is written with no second scan. `Raw::from_string`,
+  `Raw::NULL`, progress tokens, and text the crate writes outside jsonx-lib
+  (message buffers, `serde` output) stay plain text, validated if one is ever
+  nested in a `ToJson` value: jsonx-lib
+  declined an unchecked raw write, since its writer's output must always
+  parse back.
+
+Moved, per the anti-deferral rule:
+- **Typed params through jsonx-lib's traits** (listed under v0.5.0, moved
+  there from v0.2.0) were delivered here: jsonx-lib 0.5 brings `ToJson` /
+  `FromJson`, and mcp-io 0.2 (D18) builds on this release.
+- **The 1.0 decisions** (listed under v1.0.0, moved there from v0.3.0) were
+  made here, so that 1.0 is a freeze: a 0.x minor may break, a 1.x may not.
+  `Request`, `Notification`, and `Response` are `#[non_exhaustive]` (a later
+  version can keep more of the envelope). `ErrorCode(pub i64)` stays a plain,
+  exhaustive newtype: it is the JSON integer and nothing more, and the tuple
+  constructor is how protocols spell their codes. `Id` gains `RawNumber` and
+  `Null`, produced only with `Limits::lenient_ids` (off in every preset), and
+  stays exhaustive: those are every id JSON-RPC 2.0 allows.
+- **MCP's stateless revision** was not on this roadmap: MCP 2026-07-28
+  removed the `initialize` handshake that 0.3's `Config::mcp()` gated on, so
+  the preset refused every modern client; found by the mcp-io baseline audit
+  (MCP-ARC-02, MCP-ARC-05).
+
+Out of scope for this release (owner's decision for this round):
+- **An `#[rpc]` proc-macro router**: stays after typed params; v0.5.0 or
+  later. A proc-macro needs `syn`/`quote`, which "ours, not rented" rules
+  out of the default build; `Router::request_json` covers typed routing by
+  hand.
+
 ## v0.5.0 - Implementation
 - [ ] HTTP framing (Streamable HTTP, SSE) and WebSocket messages over the owner's net crates.
-- [ ] Typed params and results through jsonx-lib's `ToJson`/`FromJson` (moved from v0.2.0: needs jsonx-lib 0.5, D25).
+- [x] ~~Typed params and results through jsonx-lib's `ToJson`/`FromJson`~~ (delivered in v0.4.0).
 - [ ] Windows named-pipe serving (moved from v0.3.0, see above).
 - [ ] A shared timer wheel and fewer threads per `Server` connection (moved from v0.3.0, see above).
 - [x] ~~Async adapter, progress notifications~~ (delivered in v0.3.0).
@@ -147,5 +218,5 @@ Deferred, with reasons:
 - [ ] Reentrant-sink detection (moved from v0.3.0).
 
 ## v1.0.0 - Stable
-- [ ] Decide `#[non_exhaustive]` on the message structs and `ErrorCode`, and lenient ids (moved from v0.3.0).
+- [x] ~~Decide `#[non_exhaustive]` on the message structs and `ErrorCode`, and lenient ids~~ (decided in v0.4.0).
 - [ ] Frozen after lsp-lang and mcp-io run on it (D18).

@@ -733,3 +733,15 @@ fn test_requests_after_close_fail_and_answers_after_close_are_refused() {
     assert!(matches!(e.peer().request("x", ()), Err(Error::Closed)));
     assert!(matches!(e.peer().notify("x", ()), Err(Error::Closed)));
 }
+
+#[test]
+fn test_handles_keep_their_auto_traits() {
+    fn send_sync<T: Send + Sync>() {}
+    // `Context` was `Sync` in 0.3; a handler may share `&Context` with
+    // scoped threads.
+    send_sync::<rpc_io::Context<'_>>();
+    send_sync::<rpc_io::Peer>();
+    send_sync::<rpc_io::Notifier>();
+    send_sync::<rpc_io::Progress>();
+    send_sync::<rpc_io::Responder>();
+}

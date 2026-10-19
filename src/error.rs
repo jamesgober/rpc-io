@@ -35,8 +35,8 @@ pub enum Error {
     /// params); this was another kind of value. Nothing was sent.
     InvalidParams(Kind),
     /// The request was already answered (the peer cancelled it, or the
-    /// connection answered it for a panicking handler). This reply was not
-    /// sent.
+    /// connection answered it for a panicking handler). This reply, or a
+    /// progress report for a request that is over, was not sent.
     AlreadyAnswered,
     /// The [`Gate`](crate::Gate) is shut and the messages held behind it
     /// already reach [`Config::max_held_bytes`](crate::Config). This one was
@@ -47,6 +47,15 @@ pub enum Error {
     /// are not strings, or a `Serialize` that failed); this says why. Nothing
     /// was sent.
     Serialize(String),
+    /// A [`Progress`](crate::Progress) report whose value does not exceed
+    /// the last one sent for its token: MCP requires `progress` to increase
+    /// with every report. Nothing was sent; report a larger value.
+    ProgressNotIncreasing {
+        /// The value last sent.
+        last: f64,
+        /// The value refused.
+        next: f64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -69,6 +78,10 @@ impl fmt::Display for Error {
                 "too much is already held until the opening request succeeds; nothing was sent",
             ),
             Error::Serialize(why) => write!(f, "the value is not JSON: {why}"),
+            Error::ProgressNotIncreasing { last, next } => write!(
+                f,
+                "progress must increase with every report: {next} does not exceed {last}; nothing was sent"
+            ),
         }
     }
 }

@@ -76,28 +76,14 @@ fn error_object() -> impl Strategy<Value = ErrorObject> {
 fn message() -> impl Strategy<Value = Message<'static>> {
     prop_oneof![
         (id(), text(), proptest::option::of(structured())).prop_map(|(id, method, params)| {
-            Message::Request(Request {
-                id,
-                method: method.into(),
-                params,
-            })
+            Message::Request(Request::new(id, method, params))
         }),
         (text(), proptest::option::of(structured())).prop_map(|(method, params)| {
-            Message::Notification(Notification {
-                method: method.into(),
-                params,
-            })
+            Message::Notification(Notification::new(method, params))
         }),
-        (id(), raw()).prop_map(|(id, result)| Message::Response(Response {
-            id: Some(id),
-            result: Ok(result)
-        })),
-        (proptest::option::of(id()), error_object()).prop_map(|(id, error)| Message::Response(
-            Response {
-                id,
-                result: Err(error)
-            }
-        )),
+        (id(), raw()).prop_map(|(id, result)| Message::Response(Response::ok(id, result))),
+        (proptest::option::of(id()), error_object())
+            .prop_map(|(id, error)| Message::Response(Response::err(id, error))),
     ]
 }
 
@@ -130,6 +116,26 @@ fn reframe(framing: Framing, bodies: &[String], chunk: usize) -> Vec<Vec<u8>> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn prop_lenient_numeric_ids_echo_verbatim(
+        int in "-?(0|[1-9][0-9]{0,30})",
+        frac in proptest::option::of("[0-9]{1,8}"),
+        exp in proptest::option::of("[eE][+-]?[0-9]{1,3}"),
+    ) {
+        let text = format!("{int}{}{}", frac.map(|f| format!(".{f}")).unwrap_or_default(), exp.unwrap_or_default());
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{text},"method":"m"}}"#);
+        let limits = Limits::new().with_lenient_ids(true);
+        let Incoming::Single(Ok(Message::Request(request))) = decode(body.as_bytes(), &limits) else {
+            return Err(TestCaseError::fail(format!("refused {body}")));
+        };
+        // An integer within i64 is a Number (and may print differently, as
+        // `-0` does); anything else comes back exactly as sent.
+        match request.id.as_i64() {
+            Some(n) => prop_assert_eq!(text.parse::<i64>().ok(), Some(n)),
+            None => prop_assert_eq!(request.id.to_string(), text),
+        }
+    }
 
     #[test]
     fn prop_message_round_trips(message in message()) {
@@ -448,9 +454,10 @@ fn reference(body: &str) -> Class {
         }
     }
     match id {
-        None | Some(RefId::Invalid) => Class::Dropped,
-        Some(RefId::Null) if result.is_some() => Class::Dropped,
-        Some(RefId::Null) => Class::Response {
+        Some(RefId::Invalid) => Class::Dropped,
+        None | Some(RefId::Null) if result.is_some() => Class::Dropped,
+        // An error with no `id` (MCP's form) is one under `null`.
+        None | Some(RefId::Null) => Class::Response {
             id: None,
             ok: false,
         },
@@ -465,6 +472,8 @@ fn id_key(id: &Id<'_>) -> String {
     match id {
         Id::Number(n) => format!("n:{n}"),
         Id::String(s) => format!("s:{s}"),
+        Id::RawNumber(s) => format!("r:{s}"),
+        Id::Null => "null".to_owned(),
     }
 }
 
