@@ -178,15 +178,15 @@ fn main() -> Result<(), rpc_io::Error> {
 
 ### Protocol presets
 
-`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the opening gate, and the limits each protocol wants. LSP waits for `initialize`. MCP's current revision (2026-07-28) is stateless, so `Config::mcp()` has no gate, keeps batches off (MCP removed them in 2025-06-18), and writes errors for unreadable messages without an `id`, as MCP's schema has it; `Config::mcp_legacy()` adds the `initialize` gate for servers whose clients all speak a legacy revision (2025-11-25 and earlier). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
+`Config::lsp()` and `Config::mcp()` set the cancellation spelling, the opening gate, and the limits each protocol wants. LSP waits for `initialize`. MCP's current revision (2026-07-28) is stateless, so `Config::mcp()` has no gate, keeps batches off (MCP removed them in 2025-06-18), and writes errors for unreadable messages without an `id`, as MCP's schema has it; `Config::mcp_legacy()` adds the `initialize` gate for servers whose clients all speak a legacy revision (2025-11-25 and earlier). `Limits::network()` and `Limits::strict()` cut every budget for peers across a network. [`Progress`](./docs/API.md#progress-and-workdone) sends MCP's `notifications/progress` (refusing a value that does not increase, and, bound to its request by `Context::progress` or `Responder::progress`, any report once the request is answered or cancelled) and [`WorkDone`](./docs/API.md#progress-and-workdone) LSP's `$/progress` for the token a request carries:
 
 ```rust
-use rpc_io::{Config, Endpoint, Progress, Router};
+use rpc_io::{Config, Endpoint, Router};
 
 fn main() -> Result<(), rpc_io::Error> {
     let router = Router::new()
         .request("tools/call", |_: &mut (), params, cx| {
-            if let Some(progress) = Progress::from_params(&params, cx.peer()) {
+            if let Some(progress) = cx.progress(&params) {
                 progress.report(1.0, Some(1.0), Some("done"))?;
             }
             Ok(jsonx_lib::json!({ "content": [] }))

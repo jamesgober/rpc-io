@@ -134,6 +134,11 @@ impl Peer {
         Self { link }
     }
 
+    /// The shared state this peer sends through.
+    pub(crate) fn link(&self) -> &Arc<dyn Link> {
+        &self.link
+    }
+
     /// Sends a notification. `params` may be an array, an object, or `()`
     /// (`null`) for none.
     ///

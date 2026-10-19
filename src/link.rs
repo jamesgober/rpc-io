@@ -48,9 +48,30 @@ use crate::{
 /// The encoding buffer is released after a message that grew it past this.
 const SCRATCH_KEEP: usize = 64 * 1024;
 
+/// The request a notification belongs to, checked under the lock it is sent
+/// under, so it cannot go out after that request's response.
+#[derive(Clone)]
+pub(crate) enum Scope {
+    /// No request: always sent.
+    Free,
+    /// A request answered by its handler's return value: set (under the
+    /// lock) when its response is written.
+    Turn(Arc<AtomicBool>),
+    /// A deferred request: live while it is in flight.
+    Deferred(Id<'static>),
+}
+
 /// What the handles need from the shared state, with the sink type erased.
 pub(crate) trait Link: Send + Sync {
     fn notify(&self, method: &str, params: Option<&Json<'_>>) -> Result<(), Error>;
+    /// As `notify`, refused with `Error::AlreadyAnswered` once `scope`'s
+    /// request is answered or cancelled.
+    fn notify_in(
+        &self,
+        scope: &Scope,
+        method: &str,
+        params: Option<&Json<'_>>,
+    ) -> Result<(), Error>;
     fn request(
         &self,
         method: &str,
@@ -142,6 +163,27 @@ impl<K> Drop for Shared<K> {
 impl<K: Sink> Link for Shared<K> {
     fn notify(&self, method: &str, params: Option<&Json<'_>>) -> Result<(), Error> {
         self.lock().notify(method, params)
+    }
+
+    fn notify_in(
+        &self,
+        scope: &Scope,
+        method: &str,
+        params: Option<&Json<'_>>,
+    ) -> Result<(), Error> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(Error::Closed);
+        }
+        let live = match scope {
+            Scope::Free => true,
+            Scope::Turn(done) => !done.load(Ordering::Acquire),
+            Scope::Deferred(id) => inner.in_flight(id),
+        };
+        if !live {
+            return Err(Error::AlreadyAnswered);
+        }
+        inner.notify(method, params)
     }
 
     fn request(

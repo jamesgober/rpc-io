@@ -2,16 +2,20 @@
 //! LSP's `$/progress` work-done reports ([`WorkDone`]), each tied to the
 //! token the peer put in its request.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use jsonx_lib::Number;
 
 use crate::{
     error::Error,
-    handles::Peer,
+    handles::{Peer, Responder},
+    link::Scope,
     message::{is_token, read_member},
     raw::{Json, Raw},
-    router::Params,
+    router::{Context, Params},
 };
 
 impl Params<'_> {
@@ -101,16 +105,28 @@ fn push_text(out: &mut String, name: &str, text: Option<&str>) {
 /// MCP progress for one request: `notifications/progress` with the request's
 /// progress token.
 ///
-/// MCP asks that `progress` grow with every report, even when the `total` is
-/// unknown, and that no report follows the request's response.
+/// MCP requires that `progress` increase with every report, even when the
+/// `total` is unknown, and that reports stop when the request completes (on
+/// stdio, also once the peer cancelled it). A `Progress` holds both rules:
+///
+/// - [`report`](Progress::report) refuses a value that does not exceed the
+///   last one sent for this handle and its clones, with
+///   [`Error::ProgressNotIncreasing`], and sends nothing;
+/// - one made by [`Context::progress`] or [`Responder::progress`] is bound to
+///   its request: once the request is answered or cancelled (or the
+///   connection closes), `report` refuses with [`Error::AlreadyAnswered`],
+///   checked under the lock the response is written under, so no report can
+///   follow the response on the wire. One made by [`Progress::new`] or
+///   [`Progress::from_params`] knows no request and leaves that rule to the
+///   caller.
 ///
 /// # Examples
 ///
 /// ```
-/// use rpc_io::{Endpoint, Progress, Router};
+/// use rpc_io::{Endpoint, Router};
 ///
-/// let router = Router::new().deferred("tools/call", |_: &mut (), params, cx, responder| {
-///     let progress = Progress::from_params(&params, cx.peer());
+/// let router = Router::new().deferred("tools/call", |_: &mut (), params, _cx, responder| {
+///     let progress = responder.progress(&params);
 ///     std::thread::spawn(move || {
 ///         for step in 1..=2 {
 ///             if let Some(progress) = &progress {
@@ -134,10 +150,16 @@ fn push_text(out: &mut String, name: &str, text: Option<&str>) {
 pub struct Progress {
     peer: Peer,
     token: Raw<'static>,
+    scope: Scope,
+    /// The value last sent, shared by the clones: held while a report is
+    /// checked and sent, so concurrent reports reach the wire in order.
+    last: Arc<Mutex<Option<f64>>>,
 }
 
 impl Progress {
-    /// Progress for `token`, sent through `peer`.
+    /// Progress for `token`, sent through `peer`, not bound to a request:
+    /// reports must still increase, but nothing stops one after the request
+    /// is answered. Prefer [`Context::progress`] or [`Responder::progress`].
     ///
     /// # Examples
     ///
@@ -152,18 +174,36 @@ impl Progress {
     /// ```
     #[must_use]
     pub fn new(peer: Peer, token: Raw<'_>) -> Self {
+        Self::scoped(peer, token, Scope::Free)
+    }
+
+    fn scoped(peer: Peer, token: Raw<'_>, scope: Scope) -> Self {
         Self {
             peer,
             token: token.into_owned(),
+            scope,
+            last: Arc::default(),
         }
     }
 
     /// Progress for the request whose params are `params`, if it carries a
-    /// progress token (see [`Params::progress_token`]).
+    /// progress token (see [`Params::progress_token`]), not bound to the
+    /// request (see [`Progress::new`]).
     ///
     /// # Examples
     ///
-    /// See [`Progress`].
+    /// ```
+    /// use rpc_io::{Endpoint, Progress, Router};
+    ///
+    /// let router = Router::new().request("work", |_: &mut (), params, cx| {
+    ///     let progress = Progress::from_params(&params, cx.peer());
+    ///     Ok(progress.is_some())
+    /// });
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// Endpoint::new(tx, router, ()).handle(br#"{"jsonrpc":"2.0","id":1,"method":"work","params":{"_meta":{"progressToken":"a"}}}"#)?;
+    /// assert!(rx.try_recv().is_ok_and(|r| r.ends_with(r#""result":true}"#)));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
     #[must_use]
     pub fn from_params(params: &Params<'_>, peer: Peer) -> Option<Self> {
         params.progress_token().map(|token| Self::new(peer, token))
@@ -184,8 +224,15 @@ impl Progress {
     ///
     /// # Errors
     ///
-    /// [`Error::Serialize`] for a number that is not finite (JSON has no
-    /// NaN or infinity); otherwise as [`Peer::notify`].
+    /// - [`Error::Serialize`] for a number that is not finite (JSON has no
+    ///   NaN or infinity);
+    /// - [`Error::ProgressNotIncreasing`] for a `progress` that does not
+    ///   exceed the last one sent;
+    /// - [`Error::AlreadyAnswered`] for a handle bound to a request that was
+    ///   answered or cancelled;
+    /// - otherwise as [`Peer::notify`].
+    ///
+    /// Nothing is sent when it fails.
     ///
     /// # Examples
     ///
@@ -201,6 +248,7 @@ impl Progress {
     ///     Some(r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":0.5}}"#),
     /// );
     /// assert!(matches!(progress.report(f64::NAN, None, None), Err(Error::Serialize(_))));
+    /// assert!(matches!(progress.report(0.5, None, None), Err(Error::ProgressNotIncreasing { .. })));
     /// # Ok::<(), rpc_io::Error>(())
     /// ```
     pub fn report(
@@ -217,10 +265,79 @@ impl Progress {
         }
         push_text(&mut params, "message", message);
         params.push('}');
-        self.peer.notify(
-            "notifications/progress",
-            Json::Raw(Raw::trusted_owned(params)),
-        )
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(last) = *last {
+            if progress <= last {
+                return Err(Error::ProgressNotIncreasing {
+                    last,
+                    next: progress,
+                });
+            }
+        }
+        let params = Json::Raw(Raw::trusted_owned(params));
+        self.peer
+            .link()
+            .notify_in(&self.scope, "notifications/progress", Some(&params))?;
+        *last = Some(progress);
+        Ok(())
+    }
+}
+
+impl Context<'_> {
+    /// MCP progress for the request being handled, if it carries a progress
+    /// token: a [`Progress`] bound to this request, which refuses to report
+    /// once the request is answered (for a request answered by the handler's
+    /// return value, as soon as the handler returns) or cancelled. `None`
+    /// for a notification, or a request without a token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Error, Progress, Router};
+    ///
+    /// let router = Router::new().request("work", |kept: &mut Option<Progress>, params, cx| {
+    ///     let progress = cx.progress(&params);
+    ///     if let Some(progress) = &progress {
+    ///         progress.report(1.0, Some(1.0), None)?;
+    ///     }
+    ///     *kept = progress; // too late to use once the handler returns
+    ///     Ok("done")
+    /// });
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, None);
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work","params":{"_meta":{"progressToken":7}}}"#)?;
+    /// let sent: Vec<String> = rx.try_iter().collect();
+    /// assert!(sent[0].contains("notifications/progress"));
+    /// assert_eq!(sent[1], r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#);
+    /// let late = endpoint.state().as_ref().map(|p| p.report(2.0, None, None));
+    /// assert!(matches!(late, Some(Err(Error::AlreadyAnswered))));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn progress(&self, params: &Params<'_>) -> Option<Progress> {
+        let scope = self.scope()?;
+        let token = params.progress_token()?;
+        Some(Progress::scoped(self.peer(), token, scope))
+    }
+}
+
+impl Responder {
+    /// MCP progress for this deferred request, if `params` (its params)
+    /// carry a progress token: a [`Progress`] bound to the request, which
+    /// refuses to report once it is answered (through this responder, or by
+    /// the connection) or cancelled by the peer.
+    ///
+    /// # Examples
+    ///
+    /// See [`Progress`].
+    #[must_use]
+    pub fn progress(&self, params: &Params<'_>) -> Option<Progress> {
+        let token = params.progress_token()?;
+        Some(Progress::scoped(
+            self.peer(),
+            token,
+            Scope::Deferred(self.id().clone()),
+        ))
     }
 }
 

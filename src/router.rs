@@ -2,7 +2,13 @@
 //! [`Params`] and a [`Context`]. [`Event`]s report what the endpoint did on
 //! its own.
 
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    cell::OnceCell,
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use jsonx_lib::{Parser, Value};
 
@@ -12,7 +18,7 @@ use crate::{
     framing::FrameError,
     handles::{Call, Peer, Responder},
     id::Id,
-    link::Link,
+    link::{Link, Scope},
     raw::{Json, Raw},
 };
 
@@ -506,6 +512,11 @@ pub struct Context<'a> {
     stop: &'a mut bool,
     id: Option<&'a Id<'a>>,
     method: &'a str,
+    /// Whether the request is deferred (answered through a `Responder`).
+    deferred: bool,
+    /// Set when a request answered by the handler's return value has its
+    /// response written; made only if a scoped progress handle asks for it.
+    turn: OnceCell<Arc<AtomicBool>>,
 }
 
 impl<'a> Context<'a> {
@@ -514,13 +525,33 @@ impl<'a> Context<'a> {
         stop: &'a mut bool,
         id: Option<&'a Id<'a>>,
         method: &'a str,
+        deferred: bool,
     ) -> Self {
         Self {
             link,
             stop,
             id,
             method,
+            deferred,
+            turn: OnceCell::new(),
         }
+    }
+
+    /// The request this call is, for a notification that must not outlive
+    /// it; `None` for a notification.
+    pub(crate) fn scope(&self) -> Option<Scope> {
+        let id = self.id?;
+        Some(if self.deferred {
+            Scope::Deferred(id.clone().into_owned())
+        } else {
+            Scope::Turn(Arc::clone(self.turn.get_or_init(Arc::default)))
+        })
+    }
+
+    /// The flag to set when the response is written, if a scoped handle
+    /// took one.
+    pub(crate) fn take_turn(&mut self) -> Option<Arc<AtomicBool>> {
+        self.turn.take()
     }
 
     /// The method being handled.

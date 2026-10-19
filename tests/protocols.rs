@@ -385,3 +385,150 @@ fn test_lsp_error_codes_have_names() {
     }
     assert_eq!(ErrorCode::CONTENT_MODIFIED.0, -32801);
 }
+
+/// The `progress` values of the progress notifications in `sent`.
+fn progress_values(sent: &[String]) -> Vec<f64> {
+    sent.iter()
+        .filter(|m| m.contains("notifications/progress"))
+        .filter_map(|m| {
+            let at = m.find(r#""progress":"#)? + 11;
+            let rest = &m[at..];
+            let end = rest.find([',', '}'])?;
+            rest[..end].parse().ok()
+        })
+        .collect()
+}
+
+#[test]
+fn test_progress_must_increase_across_clones() {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let Ok(token) = Raw::new("5") else {
+        panic!("not JSON")
+    };
+    let progress = Progress::new(endpoint.peer(), token);
+    let clone = progress.clone();
+    assert!(progress.report(-1.0, None, None).is_ok());
+    assert!(matches!(
+        progress.report(-1.0, None, None),
+        Err(rpc_io::Error::ProgressNotIncreasing { last, next }) if last == -1.0 && next == -1.0
+    ));
+    assert!(clone.report(0.5, None, None).is_ok());
+    assert!(matches!(
+        progress.report(0.25, None, None),
+        Err(rpc_io::Error::ProgressNotIncreasing { .. })
+    ));
+    // A refused number leaves the last value as it was.
+    assert!(progress.report(f64::NAN, None, None).is_err());
+    assert!(progress.report(0.75, None, None).is_ok());
+    assert_eq!(progress_values(&sent(&rx)), [-1.0, 0.5, 0.75]);
+    let error = progress
+        .report(0.0, None, None)
+        .err()
+        .map(|e| e.to_string());
+    assert!(error.is_some_and(|e| e.contains("must increase")));
+}
+
+#[test]
+fn test_concurrent_progress_reaches_the_wire_in_order() {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let Ok(token) = Raw::new(r#""p""#) else {
+        panic!("not JSON")
+    };
+    let progress = Progress::new(endpoint.peer(), token);
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let progress = progress.clone();
+            let counter = std::sync::Arc::clone(&counter);
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Values taken out of order are refused, never sent late.
+                    let _sent_or_refused = progress.report(n as f64, None, None);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert!(thread.join().is_ok());
+    }
+    let values = progress_values(&sent(&rx));
+    assert!(!values.is_empty());
+    assert!(values.windows(2).all(|w| w[0] < w[1]), "{values:?}");
+}
+
+#[test]
+fn test_bound_progress_stops_when_its_request_is_answered_or_cancelled() {
+    use rpc_io::{Error, Responder};
+
+    #[derive(Default)]
+    struct Kept {
+        responders: Vec<Responder>,
+        progress: Vec<Progress>,
+    }
+    let router = Router::new()
+        .deferred("slow", |kept: &mut Kept, params, cx, responder| {
+            // Both ways of binding: through the context and the responder.
+            kept.progress.extend(cx.progress(&params));
+            kept.progress.extend(responder.progress(&params));
+            kept.responders.push(responder);
+        })
+        .request("now", |kept: &mut Kept, params, cx| {
+            kept.progress.extend(cx.progress(&params));
+            Ok(())
+        })
+        .notification("note", |kept: &mut Kept, params, cx| {
+            kept.progress.extend(cx.progress(&params));
+        });
+    let (e, rx) = endpoint(router, Kept::default());
+    let mut e = e.with_config(Config::mcp());
+    let meta = r#""params":{"_meta":{"progressToken":"t"}}"#;
+    for body in [
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"slow",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":2,"method":"slow",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":3,"method":"now",{meta}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","method":"note",{meta}}}"#),
+    ] {
+        assert!(e.handle(body.as_bytes()).is_ok());
+    }
+    // Five handles: two each for requests 1 and 2, and the immediate
+    // request's, already over; a notification gets none.
+    let kept = std::mem::take(e.state_mut());
+    assert_eq!(kept.progress.len(), 5);
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":3,"result":null}"#]);
+    assert!(matches!(
+        kept.progress[4].report(1.0, None, None),
+        Err(Error::AlreadyAnswered)
+    ));
+    // While in flight, reports go out.
+    assert!(kept.progress[0].report(1.0, None, None).is_ok());
+    assert!(kept.progress[3].report(1.0, None, None).is_ok());
+    assert_eq!(progress_values(&sent(&rx)), [1.0, 1.0]);
+    // Request 1 cancelled by the peer (MCP: no response, no more messages).
+    let cancel =
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+    assert!(e.handle(cancel).is_ok());
+    for progress in &kept.progress[..2] {
+        assert!(matches!(
+            progress.report(2.0, None, None),
+            Err(Error::AlreadyAnswered)
+        ));
+    }
+    // Request 2 answered.
+    let mut responders = kept.responders.into_iter();
+    let _first = responders.next();
+    assert!(responders.next().is_some_and(|r| r.ok(()).is_ok()));
+    assert!(matches!(
+        kept.progress[2].report(2.0, None, None),
+        Err(Error::AlreadyAnswered)
+    ));
+    assert_eq!(sent(&rx), [r#"{"jsonrpc":"2.0","id":2,"result":null}"#]);
+    // A closed connection refuses too.
+    e.close();
+    assert!(matches!(
+        kept.progress[3].report(9.0, None, None),
+        Err(Error::Closed)
+    ));
+}

@@ -9,7 +9,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     panic::{self, AssertUnwindSafe},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     thread,
     time::Instant,
 };
@@ -841,8 +841,9 @@ impl<S, K: Sink> Endpoint<S, K> {
         match handler {
             RequestHandler::Now(handler) => {
                 let state = &mut self.state;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method);
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, false);
                 let outcome = contain(|| handler(state, params, &mut cx));
+                let turn = cx.take_turn();
                 let error;
                 let result = match &outcome {
                     Ok(Ok(value)) => Ok(value),
@@ -861,7 +862,13 @@ impl<S, K: Sink> Endpoint<S, K> {
                         Err(&error)
                     }
                 };
-                let _reported = self.shared.lock().respond(Some(&id), batch, result);
+                let mut inner = self.shared.lock();
+                if let Some(turn) = turn {
+                    // Under the lock the response is written under: no
+                    // progress report can follow it.
+                    turn.store(true, Ordering::Release);
+                }
+                let _reported = inner.respond(Some(&id), batch, result);
             }
             RequestHandler::Deferred(handler) => {
                 let owned = id.clone().into_owned();
@@ -878,7 +885,7 @@ impl<S, K: Sink> Endpoint<S, K> {
                 drop(inner);
                 let responder = Responder::new(owned, token, Arc::clone(&self.link));
                 let state = &mut self.state;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method);
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, true);
                 // A panic drops the responder while unwinding, which answers
                 // the request with `INTERNAL_ERROR`.
                 if let Err(payload) = contain(|| handler(state, params, &mut cx, responder)) {
@@ -991,7 +998,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             return;
         };
         let state = &mut self.state;
-        let mut cx = Context::new(&self.link, stop, None, &method);
+        let mut cx = Context::new(&self.link, stop, None, &method, false);
         match contain(|| handler(state, params, &mut cx)) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => report(

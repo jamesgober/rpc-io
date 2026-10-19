@@ -650,16 +650,22 @@ assert!(seen.is_cancelled());
 
 ## `Progress` and `WorkDone`
 
-`Progress` sends MCP's `notifications/progress` for one progress token: `new(peer, token)`, `from_params(&params, peer)` (when the request carries `_meta.progressToken`), `token()`, and `report(progress: f64, total: Option<f64>, message: Option<&str>)`. Whole numbers are written without a fraction; a number that is not finite is `Error::Serialize`. MCP asks that `progress` grow with every report and that none follow the request's response.
+`Progress` sends MCP's `notifications/progress` for one progress token, and holds MCP's two rules for it:
+
+- `progress` must increase with every report: `report` refuses a value that does not exceed the last one sent (by this handle or a clone) with `Error::ProgressNotIncreasing { last, next }`, and sends nothing. The check and the send happen under one lock, so reports from several threads reach the wire in increasing order.
+- Reports stop when the request completes (and, on stdio, once the peer cancelled it): a handle from `Context::progress(&params)` or `Responder::progress(&params)` is bound to its request and refuses with `Error::AlreadyAnswered` once the request is answered (for a request answered by the handler's return value, as soon as the handler returns) or cancelled, checked under the lock the response is written under; `Error::Closed` once the connection closed. Both return `None` when the request carries no `_meta.progressToken` (and `Context::progress` for a notification).
+
+`new(peer, token)` and `from_params(&params, peer)` make a handle bound to no request: the first rule holds, the second is the caller's. `token()`, and `report(progress: f64, total: Option<f64>, message: Option<&str>)`. Whole numbers are written without a fraction; a number that is not finite is `Error::Serialize`.
 
 `WorkDone` sends LSP's `$/progress` for one work-done token: `new(peer, token)`, `from_params(&params, peer)` (when the request carries `workDoneToken`), `token()`, `begin(title, cancellable, message, percentage)`, `report(message, percentage)`, `end(message)`. Percentages are capped at 100. Both are `Clone`, and send through their `Peer` from any thread.
 
 ```rust
-use rpc_io::{Endpoint, Progress, Router, WorkDone};
+use rpc_io::{Endpoint, Router, WorkDone};
 
 let router = Router::new().request("work", |_: &mut (), params, cx| {
-    if let Some(progress) = Progress::from_params(&params, cx.peer()) {
+    if let Some(progress) = cx.progress(&params) {
         progress.report(50.0, Some(100.0), None)?;
+        assert!(progress.report(40.0, None, None).is_err()); // must increase
     }
     if let Some(work) = WorkDone::from_params(&params, cx.peer()) {
         work.begin("Working", false, None, None)?;
