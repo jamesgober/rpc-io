@@ -9,7 +9,7 @@
 use alloc::{borrow::Cow, format, string::String, vec::Vec};
 use core::fmt;
 
-use jsonx_lib::{DuplicateKeys, Event, Number, Parser, Reader};
+use jsonx_lib::{DuplicateKeys, Event, Number, Parser, RawValue, Reader};
 
 use crate::{
     error_object::ErrorObject,
@@ -794,8 +794,10 @@ struct Fields<'a> {
     jsonrpc: Option<&'a str>,
     id: Option<&'a str>,
     method: Option<&'a str>,
-    params: Option<&'a str>,
-    result: Option<&'a str>,
+    /// Kept as jsonx-lib validated it, so a `Raw` made from it is written
+    /// into a `ToJson` value with no second scan.
+    params: Option<RawValue<'a>>,
+    result: Option<RawValue<'a>>,
     error: Option<&'a str>,
     /// The first envelope member that appeared twice.
     duplicate: Option<&'static str>,
@@ -826,13 +828,28 @@ fn read_members<'a>(reader: &mut Reader<'a>, fields: &mut Fields<'a>) -> Result<
             Some(Event::EndObject) => return Ok(()),
             _ => return Err(Fail::Shape),
         };
+        if matches!(&*key, "params" | "result") {
+            let value = reader
+                .read_raw_value()
+                .map_err(Fail::Json)?
+                .ok_or(Fail::Shape)?;
+            let (slot, name) = if *key == *"params" {
+                (&mut fields.params, "params")
+            } else {
+                (&mut fields.result, "result")
+            };
+            if slot.is_some() {
+                let _first = fields.duplicate.get_or_insert(name);
+            } else {
+                *slot = Some(value);
+            }
+            continue;
+        }
         let raw = reader.read_raw().map_err(Fail::Json)?.ok_or(Fail::Shape)?;
         let (slot, name) = match &*key {
             "jsonrpc" => (&mut fields.jsonrpc, "jsonrpc"),
             "id" => (&mut fields.id, "id"),
             "method" => (&mut fields.method, "method"),
-            "params" => (&mut fields.params, "params"),
-            "result" => (&mut fields.result, "result"),
             "error" => (&mut fields.error, "error"),
             _ => continue,
         };
@@ -980,8 +997,9 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a>
             return fail("a request cannot have a `result` or an `error`");
         }
         let params = match fields.params {
-            None | Some("null") => None,
-            Some(p) if p.starts_with(['[', '{']) => Some(Raw::trusted(p)),
+            None => None,
+            Some(p) if p.as_str() == "null" => None,
+            Some(p) if p.as_str().starts_with(['[', '{']) => Some(Raw::checked(p)),
             Some(_) => return fail("`params` must be an array or an object"),
         };
         let Some(id) = id else {
@@ -1020,7 +1038,7 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a>
         (Some(_), Some(_)) => {
             return fail("a response cannot have both `result` and `error`".into());
         }
-        (Some(result), None) => Ok(Raw::trusted(result)),
+        (Some(result), None) => Ok(Raw::checked(result)),
         (None, Some(error)) => match read_error(error, parser) {
             Ok(error) => Err(error),
             Err(why) => return fail(format!("malformed `error`: {why}").into()),
@@ -1058,20 +1076,29 @@ fn read_error(raw: &str, parser: &Parser) -> Result<ErrorObject, &'static str> {
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return Err(NOT_AN_OBJECT);
     }
-    let (mut code, mut message, mut data) = (None, None, None);
+    let (mut code, mut message, mut data) = (None, None, None::<RawValue<'_>>);
     loop {
         let key = match reader.next_event() {
             Ok(Some(Event::Key(key))) => key,
             Ok(Some(Event::EndObject)) => break,
             _ => return Err(NOT_AN_OBJECT),
         };
+        if *key == *"data" {
+            // Kept as jsonx-lib validated it (see `Fields::params`).
+            let Ok(Some(value)) = reader.read_raw_value() else {
+                return Err(NOT_AN_OBJECT);
+            };
+            if data.replace(value).is_some() {
+                return Err("a member appears more than once");
+            }
+            continue;
+        }
         let Ok(Some(value)) = reader.read_raw() else {
             return Err(NOT_AN_OBJECT);
         };
         let slot = match &*key {
             "code" => &mut code,
             "message" => &mut message,
-            "data" => &mut data,
             _ => continue,
         };
         if slot.replace(value).is_some() {
@@ -1085,7 +1112,7 @@ fn read_error(raw: &str, parser: &Parser) -> Result<ErrorObject, &'static str> {
     let message = message
         .and_then(read_string)
         .ok_or("`message` must be a string")?;
-    let data = data.map(|d| Raw::trusted(d).into_owned());
+    let data = data.map(|d| Raw::checked(d.into_owned()));
     Ok(ErrorObject::from_parts(code, clip_owned(message), data))
 }
 

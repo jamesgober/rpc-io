@@ -2,9 +2,12 @@
 //! or raw.
 
 use alloc::{borrow::Cow, string::String};
-use core::fmt;
+use core::{
+    fmt,
+    hash::{Hash, Hasher},
+};
 
-use jsonx_lib::{DuplicateKeys, Kind, Parser, Value};
+use jsonx_lib::{DuplicateKeys, Kind, Parser, RawValue, Value};
 
 /// One JSON value kept as its exact, validated source text.
 ///
@@ -30,12 +33,27 @@ use jsonx_lib::{DuplicateKeys, Kind, Parser, Value};
 /// assert!(Raw::new("{").is_err());
 /// # Ok::<(), rpc_io::jsonx::Error>(())
 /// ```
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Raw<'a>(Cow<'a, str>);
+///
+/// Raws compare and hash by their text.
+#[derive(Clone)]
+pub struct Raw<'a>(Repr<'a>);
+
+/// How a [`Raw`] holds its text.
+#[derive(Clone)]
+enum Repr<'a> {
+    /// Validated by jsonx-lib, in a read or by its writer: written into a
+    /// `ToJson` value as it is, with no second scan.
+    Checked(RawValue<'a>),
+    /// Text the crate validated or wrote itself, outside a `RawValue`
+    /// (message buffers, `serde` output): written into a `ToJson` value after
+    /// a validation pass, since jsonx-lib's writer takes raw text only as a
+    /// `RawValue`.
+    Text(Cow<'a, str>),
+}
 
 impl<'a> Raw<'a> {
     /// `null`.
-    pub const NULL: Raw<'static> = Raw(Cow::Borrowed("null"));
+    pub const NULL: Raw<'static> = Raw(Repr::Text(Cow::Borrowed("null")));
 
     /// Validates `text` as one JSON value (the default `jsonx_lib` budgets)
     /// and keeps it, minus surrounding whitespace, as a borrowed slice.
@@ -75,14 +93,14 @@ impl<'a> Raw<'a> {
         // Syntax and budgets only: whether a repeated key is acceptable is
         // for whoever parses the value (`parse_with`'s policy).
         let mut reader = parser.duplicate_keys(DuplicateKeys::KeepAll).reader(text);
-        match reader.read_raw()? {
+        match reader.read_raw_value()? {
             Some(value) => {
                 reader.finish()?;
-                Ok(Raw(Cow::Borrowed(value)))
+                Ok(Raw(Repr::Checked(value)))
             }
-            // `read_raw` finds no value only in input that holds none, which
-            // the parser refuses with the precise error.
-            None => parser.parse(text).map(|_| Raw(Cow::Borrowed(text.trim()))),
+            // `read_raw_value` finds no value only in input that holds none,
+            // which the parser refuses with the precise error.
+            None => parser.parse(text).map(|_| Raw::trusted(text.trim())),
         }
     }
 
@@ -102,7 +120,8 @@ impl<'a> Raw<'a> {
     pub fn from_string(text: String) -> Result<Raw<'static>, jsonx_lib::Error> {
         let value = Raw::new(&text)?;
         if value.as_str().len() == text.len() {
-            Ok(Raw(Cow::Owned(text)))
+            // Validated just now: kept without a copy.
+            Ok(Raw::trusted_owned(text))
         } else {
             Ok(value.into_owned())
         }
@@ -120,19 +139,34 @@ impl<'a> Raw<'a> {
     /// ```
     #[must_use]
     pub fn from_value(value: &Value<'_>) -> Raw<'static> {
-        Raw(Cow::Owned(jsonx_lib::to_string(value)))
+        Raw(Repr::Checked(RawValue::encode(value)))
     }
 
     /// Wraps text the crate has already validated as one JSON value.
     #[inline]
     pub(crate) const fn trusted(text: &'a str) -> Self {
-        Raw(Cow::Borrowed(text))
+        Raw(Repr::Text(Cow::Borrowed(text)))
     }
 
     /// Wraps an owned string the crate wrote itself as one JSON value.
     #[inline]
     pub(crate) const fn trusted_owned(text: String) -> Raw<'static> {
-        Raw(Cow::Owned(text))
+        Raw(Repr::Text(Cow::Owned(text)))
+    }
+
+    /// Wraps a value jsonx-lib validated.
+    #[inline]
+    pub(crate) const fn checked(value: RawValue<'a>) -> Self {
+        Raw(Repr::Checked(value))
+    }
+
+    /// The `RawValue`, when the text is held as one.
+    #[inline]
+    pub(crate) fn raw_value(&self) -> Option<&RawValue<'a>> {
+        match &self.0 {
+            Repr::Checked(value) => Some(value),
+            Repr::Text(_) => None,
+        }
     }
 
     /// The JSON text.
@@ -145,7 +179,10 @@ impl<'a> Raw<'a> {
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            Repr::Checked(value) => value.as_str(),
+            Repr::Text(text) => text,
+        }
     }
 
     /// The kind of value, read from its first byte without parsing.
@@ -218,13 +255,30 @@ impl<'a> Raw<'a> {
     /// ```
     #[must_use]
     pub fn into_owned(self) -> Raw<'static> {
-        Raw(Cow::Owned(self.0.into_owned()))
+        Raw(match self.0 {
+            Repr::Checked(value) => Repr::Checked(value.into_owned()),
+            Repr::Text(text) => Repr::Text(Cow::Owned(text.into_owned())),
+        })
     }
 
-    /// A borrowed view of this value.
+    /// A borrowed view of this value's text, for writing it.
     #[inline]
     pub(crate) fn reborrow(&self) -> Raw<'_> {
-        Raw(Cow::Borrowed(&self.0))
+        Raw::trusted(self.as_str())
+    }
+}
+
+impl PartialEq for Raw<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Raw<'_> {}
+
+impl Hash for Raw<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 
@@ -328,7 +382,7 @@ impl Json<'_> {
     /// The value as a `Raw`, serializing a built value.
     pub(crate) fn into_raw(self) -> Raw<'static> {
         match self {
-            Json::Value(value) => Raw::trusted_owned(jsonx_lib::to_string(&value)),
+            Json::Value(value) => Raw::checked(RawValue::encode(&value)),
             Json::Raw(raw) => raw.into_owned(),
         }
     }

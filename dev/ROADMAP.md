@@ -166,11 +166,13 @@ Not done here, with reasons:
 - **Resetting a `Call`'s deadline on a matching progress notification**
   (MCP "MAY"): not asked for by mcp-io; needs correlating progress tokens to
   our requests. Later, on request.
-- **`ToJson` for `Raw` without a second validation**: jsonx-lib declined an
-  unchecked raw write (its writer's output must always parse back). `Raw`
-  could hold a `jsonx_lib::RawValue` instead, which touches every place the
-  crate wraps validated text; the cost falls only on a `Raw` nested inside a
-  user's `ToJson` value, since results and params are written as text.
+- **`ToJson` for every `Raw` without a second validation**: a `Raw` holds a
+  `jsonx_lib::RawValue` (validated once when read or written by jsonx-lib)
+  wherever users obtain one, and is written with no second scan. Text the
+  crate writes outside jsonx-lib (message buffers, `serde` output) stays plain
+  text and is validated if it is ever nested in a `ToJson` value: jsonx-lib
+  declined an unchecked raw write, since its writer's output must always
+  parse back.
 
 Moved, per the anti-deferral rule:
 - **Typed params through jsonx-lib's traits** (listed under v0.5.0, moved

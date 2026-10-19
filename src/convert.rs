@@ -63,7 +63,7 @@ impl Json<'static> {
     /// ```
     #[must_use]
     pub fn encode<T: ToJson + ?Sized>(value: &T) -> Json<'static> {
-        Json::Raw(Raw::trusted_owned(jsonx_lib::to_string(value)))
+        Json::Raw(Raw::checked(RawValue::encode(value)))
     }
 }
 
@@ -138,16 +138,25 @@ impl ToJson for ErrorObject {
     }
 }
 
-/// The text as it is. It is validated again on the way out: jsonx-lib's
-/// writer writes raw text only as a `RawValue`, which it validates (its
-/// output always parses back).
+/// The text as it is. A `Raw` from a message, `Raw::new`,
+/// `Raw::from_value`, or `Json::encode` holds a jsonx-lib `RawValue`,
+/// validated once when it was read or written, and is copied with no second
+/// scan; one holding text the crate wrote outside jsonx-lib (`serde` output)
+/// is validated on the way out, since jsonx-lib's writer takes raw text only
+/// as a `RawValue`.
 impl ToJson for Raw<'_> {
     fn to_json(&self, out: ValueWriter<'_>) -> Written {
-        match RawValue::new(self.as_str()) {
-            Ok(raw) => out.raw(&raw),
-            // A `Raw` holds one validated value, so this does not happen;
-            // `null` keeps the output JSON if it ever did.
-            Err(_) => out.null(),
+        if let Some(raw) = self.raw_value() {
+            return out.raw(raw);
+        }
+        match self.as_str() {
+            "null" => out.null(),
+            text => match RawValue::new(text) {
+                Ok(raw) => out.raw(&raw),
+                // A `Raw` holds one validated value, so this does not happen;
+                // `null` keeps the output JSON if it ever did.
+                Err(_) => out.null(),
+            },
         }
     }
 }
@@ -158,8 +167,8 @@ impl ToJson for Raw<'_> {
 impl<'de> FromJson<'de> for Raw<'de> {
     fn from_json(reader: &mut Reader<'de>) -> Result<Self, DecodeError> {
         let at = reader.offset();
-        match reader.read_raw()? {
-            Some(text) => Ok(Raw::trusted(text)),
+        match reader.read_raw_value()? {
+            Some(value) => Ok(Raw::checked(value)),
             None => Err(DecodeError::invalid_value("a JSON value", at)),
         }
     }
@@ -642,6 +651,45 @@ mod tests {
         let texts: alloc::vec::Vec<&str> = raws.iter().map(Raw::as_str).collect();
         assert_eq!(texts, [r#"{"k": 1}"#, r#""s""#]);
         assert!(jsonx_lib::from_str::<Raw<'_>>("").is_err());
+    }
+
+    #[test]
+    fn test_raws_users_get_are_written_without_a_second_scan() {
+        use crate::{
+            limits::Limits,
+            message::{Incoming, Message, decode},
+        };
+
+        // What users obtain holds a jsonx-lib `RawValue`, validated once.
+        assert!(Raw::new("[1]").is_ok_and(|r| r.raw_value().is_some()));
+        assert!(
+            Raw::from_value(&jsonx_lib::Value::Null)
+                .raw_value()
+                .is_some()
+        );
+        assert!(matches!(Json::encode(&1), Json::Raw(r) if r.raw_value().is_some()));
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{"a": [1]}}"#;
+        let Incoming::Single(Ok(Message::Request(request))) = decode(body, &Limits::new()) else {
+            panic!("refused");
+        };
+        assert!(
+            request
+                .params
+                .as_ref()
+                .is_some_and(|p| p.raw_value().is_some())
+        );
+        let body = br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"m","data":[2]}}"#;
+        let Incoming::Single(Ok(Message::Response(response))) = decode(body, &Limits::new()) else {
+            panic!("refused");
+        };
+        let data = response.result.err().and_then(|e| e.data().cloned());
+        assert!(data.is_some_and(|d| d.raw_value().is_some()));
+        // Equality goes by the text, whatever holds it.
+        let text = Raw::trusted("[1]");
+        assert!(text.raw_value().is_none());
+        assert_eq!(Raw::new("[1]").ok(), Some(text.clone()));
+        assert_eq!(jsonx_lib::to_string(&text), "[1]");
+        assert_eq!(jsonx_lib::to_string(&Raw::NULL), "null");
     }
 
     #[test]

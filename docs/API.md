@@ -1233,7 +1233,7 @@ assert_eq!(Id::raw_number("1e3").map(|id| id.to_string()).as_deref(), Some("1e3"
 
 ## `Raw`
 
-One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `decode::<T>()` (a jsonx-lib `FromJson`, borrowing from the text; `jsonx::DecodeError`); `deserialize::<T>()` (`serde`); `into_owned()`. `ToJson` (the text, validated again on the way out) and `FromJson` (a value's source text, borrowed, unparsed).
+One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `decode::<T>()` (a jsonx-lib `FromJson`, borrowing from the text; `jsonx::DecodeError`); `deserialize::<T>()` (`serde`); `into_owned()`. `ToJson` (the text as it is: a `Raw` from a message, `new`, `from_value`, or `Json::encode` holds a jsonx-lib `RawValue`, validated once, and is copied with no second scan; one wrapping `serde` output is validated on the way out) and `FromJson` (a value's source text, borrowed, unparsed).
 
 ```rust
 fn main() -> Result<(), rpc_io::jsonx::Error> {
