@@ -200,7 +200,7 @@ pub use endpoint::{End, Endpoint, Flow, Next, serve};
 pub use error::{CallError, Error};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-pub use handles::{Call, CancelToken, Canceller, Peer, Responder};
+pub use handles::{Call, CancelToken, Canceller, Notifier, Peer, Responder};
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub use progress::{Progress, WorkDone};

@@ -72,7 +72,7 @@ mod handlers {
     use crate::{
         error::Error,
         error_object::ErrorObject,
-        handles::{Call, Peer, Responder},
+        handles::{Call, Notifier, Peer, Responder},
         router::{Context, Params, Router},
     };
 
@@ -257,6 +257,34 @@ mod handlers {
             params: &T,
         ) -> Result<Call, Error> {
             self.peer().request_json(method, params)
+        }
+    }
+
+    impl Notifier {
+        /// Sends a notification with typed params, encoded as for
+        /// [`Peer::notify_json`], while the request is in flight.
+        ///
+        /// # Errors
+        ///
+        /// As [`Notifier::notify`].
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// let router: rpc_io::Router<()> = rpc_io::Router::new().request("m", |_, _, cx| {
+        ///     if let Some(n) = cx.notifier() {
+        ///         n.notify_json("tick", &[1])?;
+        ///     }
+        ///     Ok(())
+        /// });
+        /// # let _ = router;
+        /// ```
+        pub fn notify_json<T: ToJson + ?Sized>(
+            &self,
+            method: &str,
+            params: &T,
+        ) -> Result<(), Error> {
+            with_encoded(params, |raw| self.notify(method, raw))
         }
     }
 

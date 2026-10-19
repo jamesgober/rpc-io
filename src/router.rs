@@ -569,6 +569,38 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// A [`Notifier`](crate::Notifier) bound to the request being handled:
+    /// it sends while the request is in flight and refuses once it is
+    /// answered (for a request answered by the handler's return value, as
+    /// soon as the handler returns) or cancelled. `None` for a notification.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{Endpoint, Error, Notifier, Router};
+    ///
+    /// let router = Router::new().request("work", |kept: &mut Option<Notifier>, _, cx| {
+    ///     let notifier = cx.notifier();
+    ///     if let Some(n) = &notifier {
+    ///         n.notify("working", ())?;
+    ///     }
+    ///     *kept = notifier;
+    ///     Ok("done")
+    /// });
+    /// let (tx, rx) = std::sync::mpsc::channel::<String>();
+    /// let mut endpoint = Endpoint::new(tx, router, None);
+    /// endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)?;
+    /// assert_eq!(rx.try_iter().count(), 2); // the notification, then the result
+    /// let late = endpoint.state().as_ref().map(|n| n.notify("working", ()));
+    /// assert!(matches!(late, Some(Err(Error::AlreadyAnswered))));
+    /// # Ok::<(), rpc_io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn notifier(&self) -> Option<crate::Notifier> {
+        self.scope()
+            .map(|scope| crate::Notifier::new(self.peer(), scope))
+    }
+
     /// The flag to set when the response is written, if a scoped handle
     /// took one.
     pub(crate) fn take_turn(&mut self) -> Option<Arc<AtomicBool>> {

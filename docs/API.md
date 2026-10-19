@@ -34,6 +34,7 @@
 - [`Call`](#call)
 - [`Canceller`](#canceller)
 - [`Responder`](#responder)
+- [`Notifier`](#notifier)
 - [`CancelToken`](#canceltoken)
 - [`Progress` and `WorkDone`](#progress-and-workdone)
 - [`Config`](#config)
@@ -80,6 +81,7 @@
 | [`Peer`](#peer) | struct | Send notifications and requests, from any thread. |
 | [`Call`](#call), [`Canceller`](#canceller) | structs | One of our requests: await, poll, cancel. |
 | [`Responder`](#responder), [`CancelToken`](#canceltoken) | structs | Answer a deferred request once; learn it was cancelled. |
+| [`Notifier`](#notifier) | struct | Notifications sent only while their request is in flight. |
 | [`Progress`, `WorkDone`](#progress-and-workdone) | structs | MCP `notifications/progress`; LSP `$/progress`. |
 | [`Config`](#config), [`Cancellation`](#cancellation), [`Gate`](#gate), [`Limits`](#limits) | structs | Settings, presets, and budgets. |
 | [`Sink`](#sink-and-framed), [`Framed`](#sink-and-framed), [`Drain`](#sink-and-framed) | trait, structs | Where outgoing messages go; what closing waits for. |
@@ -466,6 +468,9 @@ What a handler can reach while it runs.
 | `request(&self, method, params) -> Result<Call, Error>` | Sends a request. Its `Call` cannot be waited on here (`CallError::WouldDeadlock`): keep it and `try_wait` later, or wait on another thread. |
 | `request_with_timeout(&self, method, params, timeout)` | The same with a deadline. |
 | `peer(&self) -> Peer` | A `Peer` to keep or move to a thread. |
+| `notifier(&self) -> Option<Notifier>` | Notifications bound to this request (see [`Notifier`](#notifier)); `None` for a notification. For a request answered by the handler's return value, it refuses as soon as the handler returns. |
+| `progress(&self, &Params) -> Option<Progress>` | MCP progress bound to this request (see [`Progress`](#progress-and-workdone)). |
+| `notify_json`, `request_json` | With `ToJson` params (see [typed params](#typed-params-and-results-tojson--fromjson)). |
 | `stop(&mut self)` | Stops after this message (`Flow::Stop`, `End::Stopped`); the current response is still sent. |
 
 `ErrorObject: From<Error>` (an `INTERNAL_ERROR`), so `cx.notify(..)?` works in a request handler.
@@ -641,7 +646,10 @@ The right to answer one deferred request, exactly once. `Send`.
 | `token(&self) -> CancelToken`, `is_cancelled(&self) -> bool` | The cancellation flag. |
 | `peer(&self) -> Peer` | Send progress while working. |
 | `respond(self, Result<J, ErrorObject>)`, `ok(self, value)`, `err(self, error)` | Answers. **Errors:** `Error::AlreadyAnswered` (cancelled first), `Error::Closed`, `Error::Io`. |
+| `ok_json(self, &T)` | Answers with a `ToJson` value, encoded in a per-thread reused buffer. |
 | `ok_typed(self, &T)` | Answers with a `serde` value (`serde`); one that cannot be serialized is answered `INTERNAL_ERROR` and returns `Error::Serialize`. |
+| `notifier(&self) -> Notifier` | Notifications bound to this request (see [`Notifier`](#notifier)). |
+| `progress(&self, &Params) -> Option<Progress>` | MCP progress bound to this request. |
 
 Dropped without answering, it answers `INTERNAL_ERROR`.
 
@@ -661,6 +669,30 @@ fn main() -> Result<(), rpc_io::Error> {
     endpoint.handle(br#"{"jsonrpc":"2.0","id":7,"method":"slow"}"#)?;
     let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
     assert_eq!(reply.as_deref(), Some(r#"{"jsonrpc":"2.0","id":7,"result":"done"}"#));
+    Ok(())
+}
+```
+
+## `Notifier`
+
+Notifications that belong to one request, sent only while it is in flight: `notify(method, params)` and `notify_json(method, &T)` refuse with `Error::AlreadyAnswered` once the request is answered or cancelled by the peer, and `Error::Closed` once the connection closed. The check runs under the lock the response is written under, so no notification can follow the response, or a cancellation the endpoint has handled, on the wire. For a stream of notifications tied to a request, such as MCP's `subscriptions/listen`. `Clone + Send + Sync`; from `Responder::notifier` or `Context::notifier`.
+
+```rust
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Config, Endpoint, Error, Router};
+
+    let router = Router::new().deferred("subscriptions/listen", |kept: &mut Vec<rpc_io::Responder>, _, _, responder| {
+        kept.push(responder);
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, Vec::new()).with_config(Config::mcp());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}"#)?;
+    let responder = endpoint.state_mut().remove(0);
+    let notifier = responder.notifier();
+    notifier.notify_json("notifications/resources/updated", &["file:///a"])?;
+    responder.ok(())?; // the stream ends with its response
+    assert!(matches!(notifier.notify("notifications/resources/updated", ()), Err(Error::AlreadyAnswered)));
+    assert_eq!(rx.try_iter().count(), 2);
     Ok(())
 }
 ```

@@ -532,3 +532,120 @@ fn test_bound_progress_stops_when_its_request_is_answered_or_cancelled() {
         Err(Error::Closed)
     ));
 }
+
+#[test]
+fn test_notifier_stops_at_cancel_even_while_a_worker_is_sending() {
+    use rpc_io::{Error, Notifier, Responder};
+
+    let router = Router::new().deferred(
+        "subscriptions/listen",
+        |kept: &mut Vec<(Notifier, Responder)>, _, _, responder| {
+            kept.push((responder.notifier(), responder));
+        },
+    );
+    let (e, rx) = endpoint(router, Vec::new());
+    let mut e = e.with_config(Config::mcp());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen"}"#)
+            .is_ok()
+    );
+    let (notifier, responder) = e.state_mut().remove(0);
+    let worker = std::thread::spawn(move || {
+        loop {
+            match notifier.notify_json("notifications/tools/list_changed", &()) {
+                Ok(()) => {}
+                Err(error) => return error,
+            }
+        }
+    });
+    // Let the worker send at least one.
+    let first = rx.recv_timeout(std::time::Duration::from_secs(10));
+    assert!(first.is_ok_and(|m| m.contains("list_changed")));
+    let cancel =
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#;
+    assert!(e.handle(cancel).is_ok());
+    // Everything sent for it was sent before the cancel was handled.
+    let _before: Vec<String> = rx.try_iter().collect();
+    let ended = worker.join();
+    assert!(matches!(ended, Ok(Error::AlreadyAnswered)), "{ended:?}");
+    assert!(
+        rx.try_recv().is_err(),
+        "a notification followed the cancellation"
+    );
+    // The responder's late answer is dropped too (MCP: nothing after a cancel).
+    assert!(responder.ok(()).is_err());
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn test_notifier_never_follows_the_response() {
+    use rpc_io::{Error, Notifier, Responder};
+
+    for _ in 0..20 {
+        let router = Router::new().deferred(
+            "listen",
+            |kept: &mut Vec<(Notifier, Responder)>, _, _, r| {
+                kept.push((r.notifier(), r));
+            },
+        );
+        let (mut e, rx) = endpoint(router, Vec::new());
+        assert!(
+            e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"listen"}"#)
+                .is_ok()
+        );
+        let (notifier, responder) = e.state_mut().remove(0);
+        let worker = std::thread::spawn(move || {
+            loop {
+                if let Err(error) = notifier.notify("tick", ()) {
+                    return error;
+                }
+            }
+        });
+        let first = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(first.is_ok_and(|m| m.contains("tick")));
+        assert!(responder.ok("closed").is_ok());
+        let ended = worker.join();
+        assert!(matches!(ended, Ok(Error::AlreadyAnswered)), "{ended:?}");
+        let rest: Vec<String> = rx.try_iter().collect();
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some(r#"{"jsonrpc":"2.0","id":1,"result":"closed"}"#)
+        );
+    }
+}
+
+#[test]
+fn test_notifier_refuses_after_close_and_for_notifications() {
+    use rpc_io::{Error, Notifier};
+
+    let router = Router::new()
+        .request("m", |kept: &mut Vec<Option<Notifier>>, _, cx| {
+            kept.push(cx.notifier());
+            Ok(())
+        })
+        .notification("n", |kept: &mut Vec<Option<Notifier>>, _, cx| {
+            kept.push(cx.notifier());
+        });
+    let (mut e, _rx) = endpoint(router, Vec::new());
+    assert!(e.handle(br#"{"jsonrpc":"2.0","method":"n"}"#).is_ok());
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#)
+            .is_ok()
+    );
+    let kept = std::mem::take(e.state_mut());
+    assert!(kept[0].is_none());
+    let notifier = kept[1].clone();
+    assert!(
+        notifier
+            .as_ref()
+            .is_some_and(|n| matches!(n.notify("x", ()), Err(Error::AlreadyAnswered)))
+    );
+    assert!(
+        notifier
+            .as_ref()
+            .is_some_and(|n| matches!(n.notify("x", 5), Err(Error::InvalidParams(_))))
+    );
+    assert!(format!("{notifier:?}").contains("Notifier"));
+    e.close();
+    assert!(notifier.is_some_and(|n| matches!(n.notify("x", ()), Err(Error::Closed))));
+}
