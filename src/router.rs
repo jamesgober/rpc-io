@@ -3,10 +3,9 @@
 //! its own.
 
 use std::{
-    cell::OnceCell,
     collections::BTreeMap,
     fmt,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -537,7 +536,8 @@ pub struct Context<'a> {
     deferred: bool,
     /// Set when a request answered by the handler's return value has its
     /// response written; made only if a scoped progress handle asks for it.
-    turn: OnceCell<Arc<AtomicBool>>,
+    /// A `OnceLock` rather than a `OnceCell`, so `Context` stays `Sync`.
+    turn: OnceLock<Arc<AtomicBool>>,
 }
 
 impl<'a> Context<'a> {
@@ -554,7 +554,7 @@ impl<'a> Context<'a> {
             id,
             method,
             deferred,
-            turn: OnceCell::new(),
+            turn: OnceLock::new(),
         }
     }
 
