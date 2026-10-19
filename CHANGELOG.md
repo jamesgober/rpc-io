@@ -51,6 +51,7 @@ Typed JSON through jsonx-lib 0.5, MCP as its current revision has it, and the 1.
 - The fuzz harness (and its checks in `cargo test`) covers lenient ids and errors written without `id`.
 - The README's benchmarks are re-measured against 0.3.0, alternating the versions in one session, as ranges (0.3.0 release verification), with CPU cycles and allocations per request counted alongside: a handler that parses params costs about 11% fewer cycles than in 0.3.0, and the endpoint path makes no allocation per request (0.3.0: one).
 - `Raw` holds a jsonx-lib `RawValue` wherever users obtain one (message params, results, and error data; `Raw::new`; `Raw::from_value`; `Json::encode`; `FromJson for Raw`), validated once when it was read or written, so `ToJson for Raw` copies it with no second scan. Equality and hashing go by the text, as before.
+- `Router::request_typed` (the `serde` feature) serializes its result into the buffer the endpoint reuses instead of a new string per request, which keeps the serde path at the cost it had in 0.3.0 (CPU cycles per request within -0.4% to +1.0% of 0.3.0's, measured interleaved; it was about 3.5% more without this).
 
 ### Fixed
 

@@ -118,6 +118,31 @@ fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Json<'static>, serde_js
     serde_json::to_string(value).map(|text| Json::Raw(Raw::trusted_owned(text)))
 }
 
+/// Serializes `value` into `out` (cleared first), compact.
+///
+/// `serde_json` writes bytes, so the buffer's bytes are lent to it and taken
+/// back as text with one UTF-8 check, keeping the buffer's allocation.
+fn serialize_into<T: Serialize + ?Sized>(
+    out: &mut String,
+    value: &T,
+) -> Result<(), serde_json::Error> {
+    let mut bytes = core::mem::take(out).into_bytes();
+    bytes.clear();
+    let written = serde_json::to_writer(&mut bytes, value);
+    match String::from_utf8(bytes) {
+        Ok(text) => *out = text,
+        // `serde_json` writes UTF-8; text it did not is refused, and the
+        // buffer is kept (emptied) for the next result.
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.clear();
+            *out = String::from_utf8(bytes).unwrap_or_default();
+            return written.and(Err(serde::ser::Error::custom("the value is not UTF-8")));
+        }
+    }
+    written
+}
+
 impl<S> Router<S> {
     /// Answers requests for `method` with a handler that takes its params as
     /// `P` and returns `R`, both through `serde`.
@@ -150,10 +175,14 @@ impl<S> Router<S> {
         R: Serialize,
         F: FnMut(&mut S, P, &mut Context<'_>) -> Result<R, ErrorObject> + Send + 'static,
     {
-        self.request(method, move |state, params, cx| {
+        // The result is written into the endpoint's reused buffer, as
+        // `request_json`'s is, instead of a string of its own.
+        self.request_into(method, move |state, params, cx, out| {
             let params = params.deserialize::<P>()?;
             let result = handler(state, params, cx)?;
-            Json::serialize(&result)
+            serialize_into(out, &result)
+                .map_err(|e| ErrorObject::internal_error(format!("the value is not JSON: {e}")))?;
+            Ok(Json::Raw(Raw::trusted(out)))
         })
     }
 
@@ -422,6 +451,31 @@ mod tests {
         let code = ErrorCode::METHOD_NOT_FOUND;
         assert_eq!(serde_json::to_string(&code).ok().as_deref(), Some("-32601"));
         assert_eq!(serde_json::from_str::<ErrorCode>("-32601").ok(), Some(code));
+    }
+
+    #[test]
+    fn test_results_are_written_whole_into_the_reused_buffer() {
+        let mut out = String::from("stale");
+        let value = ("é\u{2028}\"\n😀", 1.5, [Some(1), None]);
+        assert!(serialize_into(&mut out, &value).is_ok());
+        assert_eq!(out, serde_json::to_string(&value).unwrap_or_default());
+        let mut map = BTreeMap::new();
+        let _none = map.insert(vec![1u8], 1u8); // non-string keys
+        assert!(serialize_into(&mut out, &map).is_err());
+        // Through a typed handler, the failure is an `INTERNAL_ERROR` answer.
+        let router = Router::new().request_typed("m", |_: &mut (), _: (), _| {
+            let mut map = BTreeMap::new();
+            let _none = map.insert(vec![1u8], 1u8);
+            Ok(map)
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut endpoint = crate::Endpoint::new(tx, router, ());
+        assert!(
+            endpoint
+                .handle(br#"{"jsonrpc":"2.0","id":1,"method":"m"}"#)
+                .is_ok()
+        );
+        assert!(rx.try_recv().is_ok_and(|m| m.contains("-32603")));
     }
 
     #[test]
