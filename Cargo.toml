@@ -105,6 +105,13 @@ name              = "bench"
 harness           = false
 required-features = ["std"]
 
+# Typed handlers (`FromJson`/`ToJson`, and `serde` when the feature is on)
+# and progress reports.
+[[bench]]
+name              = "typed"
+harness           = false
+required-features = ["std"]
+
 
 # EXAMPLES
 # #################################

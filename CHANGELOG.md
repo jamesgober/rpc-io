@@ -24,6 +24,7 @@
 - **Typed params and results through jsonx-lib's `FromJson`**: `Router::request_json` (params `P: for<'de> FromJson<'de>`, result `R: ToJson`, written into the endpoint's reused buffer), `Router::notification_json`, `Params::decode` (with the endpoint's budgets and duplicate keys refused; borrows from the message where the type does), `Raw::decode`, `Call::wait_json`. Decode errors are `INVALID_PARAMS` naming the path and byte offset, clipped. `FromJson` for `Id`, `ErrorCode`, and `Raw`; `ToJson` for `ErrorObject`, `Raw`, and `Json`.
 - `rpc_io::jsonx`: jsonx-lib re-exported, so a crate on top (an LSP or MCP server) builds and reads JSON, and implements `ToJson`/`FromJson`, through rpc-io with no dependency of its own and always with rpc-io's jsonx-lib version. The examples use it.
 - `Notifier`, from `Responder::notifier` and `Context::notifier`: notifications that belong to one request (MCP 2026-07-28's `subscriptions/listen` stream), refused with `Error::AlreadyAnswered` once the request is answered or cancelled, checked under the lock the response is written under (requested by mcp-io); `notify` and `notify_json`.
+- The `typed` benchmarks (`benches/typed.rs`): 100k hover requests through `FromJson` params borrowed from the message with a `ToJson` result (`request_encoded` + `Params::decode`), through `request_json`, and, with `serde`, through `serde`; and 100k progress reports.
 
 ### Changed
 
