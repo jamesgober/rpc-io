@@ -70,7 +70,7 @@ What it guarantees, and how each guarantee is checked:
 ```toml
 [dependencies]
 rpc-io = "0.3"
-jsonx-lib = "0.2"   # to build and read JSON values
+jsonx-lib = "0.5"   # to build and read JSON values
 ```
 
 The framing, message, and correlation layers without the standard library:

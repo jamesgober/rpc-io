@@ -9,7 +9,7 @@
 use alloc::{borrow::Cow, format, string::String, vec::Vec};
 use core::fmt;
 
-use jsonx_lib::{Event, Number, Parser, Reader};
+use jsonx_lib::{DuplicateKeys, Event, Number, Parser, Reader};
 
 use crate::{
     error_object::ErrorObject,
@@ -638,7 +638,7 @@ pub enum Incoming<'a> {
 /// ```
 #[must_use]
 pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
-    let parser = limits.parser();
+    let parser = envelope_parser(&limits.parser());
     let mut reader = match parser.reader_bytes(body) {
         Ok(reader) => reader,
         Err(error) => return Incoming::Single(Err(unreadable(Fail::Json(error), None))),
@@ -670,6 +670,15 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
             Err(error) => Incoming::Single(Err(unreadable(Fail::Json(error), None))),
         },
     }
+}
+
+/// `parser` for reading an envelope: its budgets, with every repeated key
+/// passed through. The envelope reader decides about repeated envelope
+/// members itself (the message is `INVALID_REQUEST`, answered under its id
+/// when that id is not the repeated member), and repeats inside `params` or
+/// `result` are for whoever parses them (`Params::parse` refuses them).
+fn envelope_parser(parser: &Parser) -> Parser {
+    parser.duplicate_keys(DuplicateKeys::KeepAll)
 }
 
 /// Decodes the elements of a batch, the reader just past its `[`.
@@ -892,7 +901,7 @@ pub(crate) fn read_member_id<'a>(
 /// values: acting on either could be wrong).
 #[cfg(feature = "std")]
 pub(crate) fn read_member<'a>(object: &'a str, member: &str, parser: &Parser) -> Option<&'a str> {
-    let mut reader = parser.reader(object);
+    let mut reader = envelope_parser(parser).reader(object);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return None;
     }
@@ -1045,7 +1054,7 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a>
 /// `code`, a string `message`, and optional `data`.
 fn read_error(raw: &str, parser: &Parser) -> Result<ErrorObject, &'static str> {
     const NOT_AN_OBJECT: &str = "it must be an object with `code` and `message`";
-    let mut reader = parser.reader(raw);
+    let mut reader = envelope_parser(parser).reader(raw);
     if !matches!(reader.next_event(), Ok(Some(Event::StartObject))) {
         return Err(NOT_AN_OBJECT);
     }

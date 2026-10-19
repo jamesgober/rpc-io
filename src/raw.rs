@@ -4,7 +4,7 @@
 use alloc::{borrow::Cow, string::String};
 use core::fmt;
 
-use jsonx_lib::{Kind, Parser, Value};
+use jsonx_lib::{DuplicateKeys, Kind, Parser, Value};
 
 /// One JSON value kept as its exact, validated source text.
 ///
@@ -72,7 +72,9 @@ impl<'a> Raw<'a> {
     /// assert!(rpc_io::Raw::new_with("[[1]]", &shallow).is_err());
     /// ```
     pub fn new_with(text: &'a str, parser: &Parser) -> Result<Self, jsonx_lib::Error> {
-        let mut reader = parser.reader(text);
+        // Syntax and budgets only: whether a repeated key is acceptable is
+        // for whoever parses the value (`parse_with`'s policy).
+        let mut reader = parser.duplicate_keys(DuplicateKeys::KeepAll).reader(text);
         match reader.read_raw()? {
             Some(value) => {
                 reader.finish()?;

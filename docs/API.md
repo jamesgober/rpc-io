@@ -94,7 +94,7 @@
 ```toml
 [dependencies]
 rpc-io = "0.3"
-jsonx-lib = "0.2"
+jsonx-lib = "0.5"
 
 # Framing, messages, and correlation only, without std (alloc only):
 # rpc-io = { version = "0.3", default-features = false }

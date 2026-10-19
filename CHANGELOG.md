@@ -26,6 +26,7 @@
 - **Breaking:** `Request`, `Notification`, and `Response` are `#[non_exhaustive]`, decided for the 1.0 surface (audit RPC-CQ-05), so a later version can keep more of the envelope without a break. Their fields stay public to read and to change. Migration: build them with the new constructors instead of struct literals, and add `..` to struct patterns.
 - **Breaking:** `Id` has two more variants, `RawNumber(Cow<str>)` and `Null`, produced only with lenient ids. `Id` stays exhaustive, since these are every id JSON-RPC 2.0 allows. Migration: add arms (or `_`) to exhaustive `match`es on `Id`.
 - `docs/API.md`'s examples have no rustdoc-hidden (`# `) lines, which GitHub shows verbatim: each is a whole program, still compiled and run by `cargo test` (0.3.0 release verification, Info).
+- **Breaking:** built on jsonx-lib 0.5 (from 0.2). jsonx-lib's types are part of this crate's API (`Raw::parse` returns a `jsonx_lib::Value`, `Json` converts from one, `Raw::new_with` takes a `jsonx_lib::Parser`), so a crate that names them needs the same jsonx-lib. jsonx-lib 0.5 keeps the 0.2 surface these use. Migration: depend on `jsonx-lib = "0.5"`.
 
 ### Fixed
 
@@ -36,7 +37,7 @@
 
 ### Security
 
-- Repeated envelope members (the jsonx-lib baseline audit, JX-SEC-02: a pull-reader loop that keeps the last key lets `{"method":"initialize","method":"shutdown"}` be read as one method and run as another): rpc-io was **not affected, in 0.3.0 or before**. Its envelope reader records every repeated `jsonrpc`, `id`, `method`, `params`, `result`, or `error` and refuses the message with `-32600` (under no id when `id` is the repeated member); a repeated `code`, `message`, or `data` in an `error` makes the response invalid; a cancel target or progress token whose member repeats names nothing. New regression tests (`tests/duplicates.rs`) pin each case, through the gate and in batches, and pass unchanged on 0.3.0.
+- Repeated envelope members (the jsonx-lib baseline audit, JX-SEC-02: a pull-reader loop that keeps the last key lets `{"method":"initialize","method":"shutdown"}` be read as one method and run as another): rpc-io was **not affected, in 0.3.0 or before**. Its envelope reader records every repeated `jsonrpc`, `id`, `method`, `params`, `result`, or `error` and refuses the message with `-32600` (under no id when `id` is the repeated member); a repeated `code`, `message`, or `data` in an `error` makes the response invalid; a cancel target or progress token whose member repeats names nothing. New regression tests (`tests/duplicates.rs`) pin each case, through the gate and in batches, and pass unchanged on 0.3.0. jsonx-lib 0.5's readers refuse repeated keys under their default policy; rpc-io reads the envelope (and `Raw::new`, and the error object, cancel targets, and progress tokens) with repeats passed through, so its own envelope check decides, as in 0.3, and a repeated member inside `params` is still refused when the params are parsed (`-32602`).
 
 ---
 

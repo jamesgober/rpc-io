@@ -16,7 +16,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-jsonx-lib     = "0.2"
+jsonx-lib     = "0.5"
 libfuzzer-sys = "0.4"
 rpc-io        = { path = ".." }
 
