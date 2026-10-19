@@ -1139,7 +1139,7 @@ assert_eq!(d.next_frame(), Ok(Some(&b"ok"[..])));
 pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a>
 ```
 
-Decodes one body: a single message or a batch, in one pass of `jsonx-lib`'s pull reader. The body is validated in full first, so a syntax error anywhere is one `PARSE_ERROR`, except in a batch refused early: over `max_batch` (refused as soon as it passes the limit, the rest unread) or while batches are off (refused at its `[`). Rules beyond the specification: `jsonrpc` must be exactly `"2.0"`; unknown members are ignored; a repeated envelope member makes the message invalid; request ids are strings or `i64` integers; `"params": null` reads as absent; a message over a JSON budget is `INVALID_REQUEST`, under its id when the id and method were read first. `params`, `result`, and error `data` are slices of `body`.
+Decodes one body: a single message or a batch, in one pass of `jsonx-lib`'s pull reader. The body is validated in full first, so a syntax error anywhere is one `PARSE_ERROR`, except in a batch refused early: over `max_batch` (refused as soon as it passes the limit, the rest unread) or while batches are off (refused at its `[`). Rules beyond the specification: `jsonrpc` must be exactly `"2.0"`; unknown members are ignored; a repeated envelope member makes the message invalid; request ids are strings or `i64` integers (any number or `null` with `Limits::lenient_ids`); an error response without `id` (MCP's form) is one under `null`; `"params": null` reads as absent; a message over a JSON budget is `INVALID_REQUEST`, under its id when the id and method were read first. `params`, `result`, and error `data` are slices of `body`.
 
 ```rust
 use rpc_io::{decode, Incoming, Limits, Message};

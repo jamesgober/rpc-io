@@ -71,13 +71,19 @@
 //!
 //! - **Every request gets exactly one response; no valid notification gets
 //!   one.** A malformed message is answered under its own id when that id
-//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires.
+//!   could be read, and under `null` otherwise, as JSON-RPC 2.0 requires
+//!   (with no `id` at all under [`Config::omit_null_id`], as MCP has it).
 //! - **Handler panics are contained.** A request whose handler panics is
 //!   answered with `INTERNAL_ERROR` (the panic message goes to the event
 //!   hook, never to the peer), and the endpoint keeps serving. This needs
 //!   `panic = "unwind"`, Rust's default.
-//! - **Ids are strings or integers.** `null`, fractional, and out-of-range
-//!   request ids are refused as invalid requests (LSP and MCP forbid them).
+//! - **Ids are strings or integers by default.** `null`, fractional, and
+//!   out-of-range request ids are refused as invalid requests (LSP and MCP
+//!   forbid them); [`Limits::with_lenient_ids`] accepts them and echoes them
+//!   back as sent, for generic JSON-RPC services.
+//! - **Repeated envelope members are refused.** A message with two
+//!   `method`s (or `id`s, `params`, ...) is invalid, so no reader can see one
+//!   method and run another.
 //!
 //! ## Features
 //!
@@ -85,9 +91,11 @@
 //!   async-drained sinks, and the progress helpers. Without it the crate is
 //!   `no_std` (needs `alloc`): framing, the message model, and the
 //!   correlation map.
-//! - `serde`: typed params and results ([`Router::request_typed`],
-//!   `Params::deserialize`, `Peer::request_typed`, `Call::wait_typed`),
-//!   through `serde` and `serde_json`.
+//! - `serde`: typed params and results through `serde` and `serde_json`
+//!   (`Router::request_typed`, `Params::deserialize`, `Peer::request_typed`,
+//!   `Call::wait_typed`), an alternative to the typed API every build has:
+//!   jsonx-lib's `FromJson` and `ToJson` ([`Router::request_json`],
+//!   [`Params::decode`], [`Peer::notify_json`], [`Call::wait_json`]).
 //! - `futures-io`: the async adapter over `futures-io`'s traits
 //!   (`Endpoint::run_async`, `Outbox::write_to`); runtime-agnostic.
 //! - `tracing`: spans for every call and events for what the endpoint does
