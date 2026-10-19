@@ -106,25 +106,25 @@ jsonx-lib = "0.2"
 ## Quick start
 
 ```rust
-use jsonx_lib::json;
-use rpc_io::{End, Framing, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{End, Framing, Router};
 
-let router = Router::new()
-    .request("ping", |_, _, _| Ok("pong"))
-    .request("sum", |_, params, _| {
-        let p = params.parse()?;
-        Ok(p.as_array().map_or(0, |items| items.iter().filter_map(|v| v.as_i64()).sum::<i64>()))
-    })
-    .notification("exit", |_, _, cx| cx.stop());
+    let router = Router::new()
+        .request("ping", |_, _, _| Ok("pong"))
+        .request("sum", |_, params, _| {
+            let p = params.parse()?;
+            Ok(p.as_array().map_or(0, |items| items.iter().filter_map(|v| v.as_i64()).sum::<i64>()))
+        })
+        .notification("exit", |_, _, cx| cx.stop());
 
-let mut input = Vec::new();
-for body in [r#"{"jsonrpc":"2.0","id":1,"method":"sum","params":[1,2,3]}"#, r#"{"jsonrpc":"2.0","method":"exit"}"#] {
-    Framing::ContentLength.encode(body.as_bytes(), &mut input);
+    let mut input = Vec::new();
+    for body in [r#"{"jsonrpc":"2.0","id":1,"method":"sum","params":[1,2,3]}"#, r#"{"jsonrpc":"2.0","method":"exit"}"#] {
+        Framing::ContentLength.encode(body.as_bytes(), &mut input);
+    }
+    let end = rpc_io::serve(input.as_slice(), std::io::sink(), Framing::ContentLength, router)?;
+    assert_eq!(end, End::Stopped);
+    Ok(())
 }
-let end = rpc_io::serve(input.as_slice(), std::io::sink(), Framing::ContentLength, router)?;
-assert_eq!(end, End::Stopped);
-# let _ = json!(null);
-# Ok::<(), rpc_io::Error>(())
 ```
 
 ## Concepts
@@ -160,15 +160,17 @@ Request ids are strings or integers within `i64`. JSON-RPC 2.0 also allows `null
 With `Limits::with_lenient_ids(true)` (for generic JSON-RPC services) such requests are accepted: a `null` id is `Id::Null`, and any other number (a fraction, an exponent, an integer outside `i64`) is `Id::RawNumber`, kept as its exact text and echoed back as it was sent (`1.0` and `1.00` are different ids). A response from the peer may then carry a `RawNumber` id too; it matches none of ours. A `null` id names no one request: two `null`-id requests cannot both be in flight (the second is refused as a duplicate), and a cancel notification naming `null` cancels nothing.
 
 ```rust
-use rpc_io::{Config, Endpoint, Limits, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Config, Endpoint, Limits, Router};
 
-let router = Router::new().request("m", |_: &mut (), _, _| Ok(true));
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let config = Config::new().with_limits(Limits::new().with_lenient_ids(true));
-let mut endpoint = Endpoint::new(tx, router, ()).with_config(config);
-endpoint.handle(br#"{"jsonrpc":"2.0","id":2.50,"method":"m"}"#)?;
-assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":2.50,"result":true}"#));
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().request("m", |_: &mut (), _, _| Ok(true));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let config = Config::new().with_limits(Limits::new().with_lenient_ids(true));
+    let mut endpoint = Endpoint::new(tx, router, ()).with_config(config);
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2.50,"method":"m"}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":2.50,"result":true}"#));
+    Ok(())
+}
 ```
 
 A request that reuses the id of a request still being answered is refused with `-32600` under `null`. This deliberately departs from the letter of JSON-RPC 2.0 §5, which says a response's id must be the request's and keeps `null` for ids that could not be read: answering under the reused id would give the peer two responses with one id, one of them for a request it cannot tell apart. The in-flight request's answer stays the only response with that id.
@@ -204,12 +206,14 @@ The one-call server: reads framed messages from `input`, answers them through `o
 **Errors:** as [`Endpoint::run`](#endpointrun); `Error::Io` if the writer thread cannot start.
 
 ```rust
-use rpc_io::{End, Framing, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{End, Framing, Router};
 
-let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
-let router = Router::new().request("ping", |_, _, _| Ok("pong"));
-assert_eq!(rpc_io::serve(input, std::io::sink(), Framing::Newline, router)?, End::Eof);
-# Ok::<(), rpc_io::Error>(())
+    let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let router = Router::new().request("ping", |_, _, _| Ok("pong"));
+    assert_eq!(rpc_io::serve(input, std::io::sink(), Framing::Newline, router)?, End::Eof);
+    Ok(())
+}
 ```
 
 ## `Server`
@@ -230,29 +234,29 @@ With the `net` feature. An accept loop: one [`Endpoint`](#endpoint) per connecti
 At `max_connections` the loop stops accepting (the system queues further connections) until one ends. A connection that leaves a message unfinished past `message_timeout` (a per-message clock, started by the read that brings the message's first bytes and restarted when it completes, so back-to-back streaming is never cut off), or stays idle past `idle_timeout`, is closed, so silent or trickling sockets delay other clients by at most `message_timeout` and cannot lock them out. A read that times out closes the connection; the socket is not read again. Each connection's socket gets the queue's `write_timeout` as its write timeout, and a failed write shuts the connection down. A connection costs a reader thread, a writer thread, and, once a request with a deadline is sent on it, a timer thread. `Stopper::stop` stops accepting, shuts every open connection down (the peers see the stream end), and the serve call returns once every connection's thread has finished. `Connection` (`#[non_exhaustive]`) has `id` (counted from 0) and `addr`; the example below uses it, and the `Stopper`. **Errors:** the I/O error that ended the accept loop. Aborted and reset connections are skipped; running out of descriptors, buffers, or memory pauses the loop (10 ms, doubling to 1 s), and it carries on.
 
 ```rust
-# #[cfg(not(feature = "net"))] fn main() {}
-# #[cfg(feature = "net")] fn main() -> Result<(), Box<dyn std::error::Error>> {
-use std::{io::{BufRead, BufReader, Write}, net::{TcpListener, TcpStream}};
-use rpc_io::{Framing, Router, Server};
+#[cfg(not(feature = "net"))] fn main() {}
+#[cfg(feature = "net")] fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{io::{BufRead, BufReader, Write}, net::{TcpListener, TcpStream}};
+    use rpc_io::{Framing, Router, Server};
 
-let listener = TcpListener::bind("127.0.0.1:0")?;
-let addr = listener.local_addr()?;
-let server = Server::new(Framing::Newline).with_max_connections(16);
-let stopper = server.stopper();
-let serving = std::thread::spawn(move || {
-    server.serve_tcp(listener, |connection| {
-        (Router::new().request("whoami", |id: &mut u64, _, _| Ok(*id)), connection.id)
-    })
-});
-let mut client = TcpStream::connect(addr)?;
-client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"whoami\"}\n")?;
-let mut line = String::new();
-BufReader::new(&client).read_line(&mut line)?;
-assert_eq!(line, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":0}\n");
-stopper.stop();
-assert!(serving.join().is_ok_and(|served| served.is_ok()));
-# Ok(())
-# }
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let server = Server::new(Framing::Newline).with_max_connections(16);
+    let stopper = server.stopper();
+    let serving = std::thread::spawn(move || {
+        server.serve_tcp(listener, |connection| {
+            (Router::new().request("whoami", |id: &mut u64, _, _| Ok(*id)), connection.id)
+        })
+    });
+    let mut client = TcpStream::connect(addr)?;
+    client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"whoami\"}\n")?;
+    let mut line = String::new();
+    BufReader::new(&client).read_line(&mut line)?;
+    assert_eq!(line, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":0}\n");
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+    Ok(())
+}
 ```
 
 ## `Endpoint`
@@ -286,16 +290,18 @@ One JSON-RPC connection: a [`Router`](#router), the state `S` its handlers work 
 Malformed input is answered, not returned as an error. **Errors:** `Error::Closed` after `close`; `Error::Io` if the sink failed (now or since the last call), which closes the endpoint.
 
 ```rust
-use std::sync::mpsc;
-use rpc_io::{Endpoint, Flow, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use std::sync::mpsc;
+    use rpc_io::{Endpoint, Flow, Router};
 
-let router = Router::new().notification("exit", |_: &mut (), _, cx| cx.stop());
-let (tx, rx) = mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ());
-assert_eq!(endpoint.handle(b"[]")?, Flow::Continue);
-assert!(rx.try_recv().is_ok_and(|m| m.contains("-32600")));
-assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"exit"}"#)?, Flow::Stop);
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().notification("exit", |_: &mut (), _, cx| cx.stop());
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    assert_eq!(endpoint.handle(b"[]")?, Flow::Continue);
+    assert!(rx.try_recv().is_ok_and(|m| m.contains("-32600")));
+    assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"exit"}"#)?, Flow::Stop);
+    Ok(())
+}
 ```
 
 ### `Endpoint::run`
@@ -303,15 +309,17 @@ assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"exit"}"#)?, Flow::Stop
 A message over `Limits::max_message_bytes` is skipped without being buffered and answered with `-32600` under `null`; the session goes on. When the input ends, the endpoint closes. When a handler stops it, it stays open, and the bytes already read past the stopping message stay in the endpoint: the next `run` handles them first. Interrupted reads are retried. **Errors:** `Error::Frame` for a framing the input broke beyond recovery, `Error::Io`, `Error::Closed`; the endpoint is closed after any of them.
 
 ```rust
-use rpc_io::{End, Endpoint, Framed, Framing, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{End, Endpoint, Framed, Framing, Router};
 
-let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
-let mut endpoint = Endpoint::new(Framed::new(Vec::new(), Framing::Newline), router, ());
-let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
-assert_eq!(endpoint.run(input, Framing::Newline)?, End::Eof);
-let out = endpoint.with_sink(|s| s.get_ref().clone());
-assert_eq!(out, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n");
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    let mut endpoint = Endpoint::new(Framed::new(Vec::new(), Framing::Newline), router, ());
+    let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    assert_eq!(endpoint.run(input, Framing::Newline)?, End::Eof);
+    let out = endpoint.with_sink(|s| s.get_ref().clone());
+    assert_eq!(out, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n");
+    Ok(())
+}
 ```
 
 ### `Endpoint::next_read`, `commit`, `finish`
@@ -319,25 +327,27 @@ assert_eq!(out, b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n");
 `next_read` handles every complete message already buffered, then returns `Next::Read(buf)` (read the stream into `buf`, then `commit` the count) or `Next::Stopped`. At the end of the stream, `finish` handles what is left (a last line without its `\n`) and closes the endpoint. The read goes straight into the endpoint's decoder.
 
 ```rust
-use std::io::Read;
-use rpc_io::{End, Endpoint, Framed, Framing, Next, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use std::io::Read;
+    use rpc_io::{End, Endpoint, Framed, Framing, Next, Router};
 
-let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
-let mut endpoint = Endpoint::new(Framed::new(Vec::new(), Framing::Newline), router, ());
-let mut input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
-let end = loop {
-    let buf = match endpoint.next_read(Framing::Newline)? {
-        Next::Read(buf) => buf,
-        Next::Stopped => break End::Stopped,
+    let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    let mut endpoint = Endpoint::new(Framed::new(Vec::new(), Framing::Newline), router, ());
+    let mut input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+    let end = loop {
+        let buf = match endpoint.next_read(Framing::Newline)? {
+            Next::Read(buf) => buf,
+            Next::Stopped => break End::Stopped,
+        };
+        let n = input.read(buf).map_err(rpc_io::Error::Io)?; // or `.await` on any runtime
+        if n == 0 {
+            break endpoint.finish()?;
+        }
+        endpoint.commit(n);
     };
-    let n = input.read(buf).map_err(rpc_io::Error::Io)?; // or `.await` on any runtime
-    if n == 0 {
-        break endpoint.finish()?;
-    }
-    endpoint.commit(n);
-};
-assert_eq!(end, End::Eof);
-# Ok::<(), rpc_io::Error>(())
+    assert_eq!(end, End::Eof);
+    Ok(())
+}
 ```
 
 ## `Flow`, `End`, and `Next`
@@ -345,18 +355,20 @@ assert_eq!(end, End::Eof);
 `Flow` (`Continue`, `Stop`) is what `handle` returns: `Stop` after a handler called `Context::stop`. `End` (`#[non_exhaustive]`: `Eof`, `Stopped`) is why `run` returned without an error: the input ended (the endpoint is closed), or a handler stopped it (the endpoint is still open, and keeps what it read ahead). `Next` (`Read(&mut [u8])`, `Stopped`) is what `next_read` needs.
 
 ```rust
-use rpc_io::{End, Endpoint, Flow, Framing, Next, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{End, Endpoint, Flow, Framing, Next, Router};
 
-let router = Router::new().notification("pause", |_: &mut (), _, cx| cx.stop());
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ());
-assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"pause"}"#)?, Flow::Stop);
-let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}\n";
-assert_eq!(endpoint.run(input, Framing::Newline)?, End::Stopped); // still open
-assert!(matches!(endpoint.next_read(Framing::Newline)?, Next::Read(_)));
-assert_eq!(endpoint.finish()?, End::Eof); // now closed
-assert!(endpoint.is_closed());
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().notification("pause", |_: &mut (), _, cx| cx.stop());
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    assert_eq!(endpoint.handle(br#"{"jsonrpc":"2.0","method":"pause"}"#)?, Flow::Stop);
+    let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"pause\"}\n";
+    assert_eq!(endpoint.run(input, Framing::Newline)?, End::Stopped); // still open
+    assert!(matches!(endpoint.next_read(Framing::Newline)?, Next::Read(_)));
+    assert_eq!(endpoint.finish()?, End::Eof); // now closed
+    assert!(endpoint.is_closed());
+    Ok(())
+}
 ```
 
 ## `Router`
@@ -381,36 +393,36 @@ Registering a method again replaces its handler. Requests and notifications are 
 The interceptor runs for each request and notification after the gate and cancellation have had their say, before the handler is looked up: the place for authorization, rate limits, or an audit log. `Err(error)` answers a request with `error` (so an unauthorized caller cannot probe which methods exist) and drops a notification (`Event::Refused`).
 
 ```rust
-use jsonx_lib::json;
-use rpc_io::{Endpoint, ErrorCode, ErrorObject, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, ErrorCode, ErrorObject, Router};
 
-#[derive(Default)]
-struct Server { documents: Vec<String>, authorized: bool }
+    #[derive(Default)]
+    struct Server { documents: Vec<String>, authorized: bool }
 
-let router = Router::new()
-    .request("auth", |s: &mut Server, _, _| { s.authorized = true; Ok(()) })
-    .request("document/count", |s, _, _| Ok(s.documents.len()))
-    .notification("document/add", |s, params, _| {
-        if let Ok(p) = params.parse() {
-            s.documents.push(p["text"].as_str().unwrap_or_default().to_owned());
-        }
-    })
-    .intercept(|s, method, _, _| {
-        if s.authorized || method == "auth" {
-            Ok(())
-        } else {
-            Err(ErrorObject::new(ErrorCode(1003), "authenticate first"))
-        }
-    });
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, Server::default());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"document/count"}"#)?;
-assert!(rx.try_recv().is_ok_and(|m| m.contains("1003")));
-endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"auth"}"#)?;
-endpoint.handle(br#"{"jsonrpc":"2.0","method":"document/add","params":{"text":"a"}}"#)?;
-assert_eq!(endpoint.state().documents, ["a"]);
-# let _ = json!(null);
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new()
+        .request("auth", |s: &mut Server, _, _| { s.authorized = true; Ok(()) })
+        .request("document/count", |s, _, _| Ok(s.documents.len()))
+        .notification("document/add", |s, params, _| {
+            if let Ok(p) = params.parse() {
+                s.documents.push(p["text"].as_str().unwrap_or_default().to_owned());
+            }
+        })
+        .intercept(|s, method, _, _| {
+            if s.authorized || method == "auth" {
+                Ok(())
+            } else {
+                Err(ErrorObject::new(ErrorCode(1003), "authenticate first"))
+            }
+        });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, Server::default());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"document/count"}"#)?;
+    assert!(rx.try_recv().is_ok_and(|m| m.contains("1003")));
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"auth"}"#)?;
+    endpoint.handle(br#"{"jsonrpc":"2.0","method":"document/add","params":{"text":"a"}}"#)?;
+    assert_eq!(endpoint.state().documents, ["a"]);
+    Ok(())
+}
 ```
 
 ## `Params`
@@ -429,15 +441,17 @@ A call's `params`: validated, a slice of the message, parsed only when asked.
 | `into_owned(self) -> Params<'static>` | Copies, to keep beyond the call or move to a thread. |
 
 ```rust
-use rpc_io::{Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
 
-let router = Router::new().request("echo", |_: &mut (), params, _| {
-    Ok(params.into_raw().map_or(rpc_io::Raw::NULL, rpc_io::Raw::into_owned))
-});
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-Endpoint::new(tx, router, ()).handle(br#"{"jsonrpc":"2.0","id":1,"method":"echo","params":{"a": [1, 2]}}"#)?;
-assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"a": [1, 2]}}"#));
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().request("echo", |_: &mut (), params, _| {
+        Ok(params.into_raw().map_or(rpc_io::Raw::NULL, rpc_io::Raw::into_owned))
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    Endpoint::new(tx, router, ()).handle(br#"{"jsonrpc":"2.0","id":1,"method":"echo","params":{"a": [1, 2]}}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"a": [1, 2]}}"#));
+    Ok(())
+}
 ```
 
 ## `Context`
@@ -457,20 +471,22 @@ What a handler can reach while it runs.
 `ErrorObject: From<Error>` (an `INTERNAL_ERROR`), so `cx.notify(..)?` works in a request handler.
 
 ```rust
-use rpc_io::{Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
 
-let router = Router::new().request("work", |_: &mut (), _, cx| {
-    cx.notify("$/progress", jsonx_lib::json!({ "token": cx.method() }))?;
-    Ok("done")
-});
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-Endpoint::new(tx, router, ()).handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)?;
-let sent: Vec<String> = rx.try_iter().collect();
-assert_eq!(sent, [
-    r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"work"}}"#,
-    r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#,
-]);
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().request("work", |_: &mut (), _, cx| {
+        cx.notify("$/progress", jsonx_lib::json!({ "token": cx.method() }))?;
+        Ok("done")
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    Endpoint::new(tx, router, ()).handle(br#"{"jsonrpc":"2.0","id":1,"method":"work"}"#)?;
+    let sent: Vec<String> = rx.try_iter().collect();
+    assert_eq!(sent, [
+        r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"work"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#,
+    ]);
+    Ok(())
+}
 ```
 
 ## `Event`
@@ -491,18 +507,20 @@ assert_eq!(sent, [
 | `Cancelled { id }` | The peer cancelled one of its deferred requests. |
 
 ```rust
-use rpc_io::{Endpoint, Event, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Event, Router};
 
-let router = Router::new().on_event(|log: &mut Vec<String>, event| {
-    if let Event::Unmatched { id } = event {
-        log.push(format!("unmatched {id}"));
-    }
-});
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, Vec::new());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":42,"result":null}"#)?;
-assert_eq!(endpoint.state(), &["unmatched 42"]);
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new().on_event(|log: &mut Vec<String>, event| {
+        if let Event::Unmatched { id } = event {
+            log.push(format!("unmatched {id}"));
+        }
+    });
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, Vec::new());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":42,"result":null}"#)?;
+    assert_eq!(endpoint.state(), &["unmatched 42"]);
+    Ok(())
+}
 ```
 
 ## `Stats`
@@ -523,14 +541,16 @@ assert_eq!(endpoint.state(), &["unmatched 42"]);
 | `pending`, `in_flight`, `held` | gauge | our requests awaiting answers, deferred requests being answered, messages held behind the gate | near their limits |
 
 ```rust
-use rpc_io::{Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
 
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"missing"}"#)?;
-let stats = endpoint.stats();
-assert_eq!((stats.requests_in, stats.errors_out), (1, 1));
-# Ok::<(), rpc_io::Error>(())
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"missing"}"#)?;
+    let stats = endpoint.stats();
+    assert_eq!((stats.requests_in, stats.errors_out), (1, 1));
+    Ok(())
+}
 ```
 
 ## `Peer`
@@ -549,17 +569,19 @@ assert_eq!((stats.requests_in, stats.errors_out), (1, 1));
 **Errors:** `Error::InvalidParams` for params that are not an array, an object, or null; `Error::Closed`; `Error::Io` (which closes the connection); `Error::Backlog` while the gate is shut and its budget is spent.
 
 ```rust
-use std::time::Duration;
-use rpc_io::{CallError, Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use std::time::Duration;
+    use rpc_io::{CallError, Endpoint, Router};
 
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
-let peer = endpoint.peer();
-let call = peer.request_with_timeout("slow", (), Duration::from_millis(10))?;
-assert_eq!(call.wait(), Err(CallError::TimedOut));
-let sent: Vec<String> = rx.try_iter().collect();
-assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#);
-# Ok::<(), rpc_io::Error>(())
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let peer = endpoint.peer();
+    let call = peer.request_with_timeout("slow", (), Duration::from_millis(10))?;
+    assert_eq!(call.wait(), Err(CallError::TimedOut));
+    let sent: Vec<String> = rx.try_iter().collect();
+    assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}"#);
+    Ok(())
+}
 ```
 
 ## `Call`
@@ -578,15 +600,17 @@ One of our requests. Ends in exactly one outcome. Dropping it before its outcome
 | `canceller(&self) -> Canceller` | A handle that cancels from elsewhere. |
 
 ```rust
-use rpc_io::{Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
 
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
-let call = endpoint.peer().request("x", ())?;
-let call = match call.try_wait() { Ok(_) => unreachable!(), Err(call) => call };
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":[42]}"#)?;
-assert_eq!(call.wait().map(|r| r.as_str().to_owned()), Ok("[42]".to_owned()));
-# Ok::<(), rpc_io::Error>(())
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let call = endpoint.peer().request("x", ())?;
+    let call = match call.try_wait() { Ok(_) => unreachable!(), Err(call) => call };
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":[42]}"#)?;
+    assert_eq!(call.wait().map(|r| r.as_str().to_owned()), Ok("[42]".to_owned()));
+    Ok(())
+}
 ```
 
 ## `Canceller`
@@ -594,15 +618,17 @@ assert_eq!(call.wait().map(|r| r.as_str().to_owned()), Ok("[42]".to_owned()));
 `Clone + Send + Sync`: `cancel(&self) -> bool` (as `Call::cancel`) and `id(&self) -> u64`.
 
 ```rust
-use rpc_io::{CallError, Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{CallError, Endpoint, Router};
 
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
-let call = endpoint.peer().request("slow", ())?;
-let canceller = call.canceller();
-std::thread::spawn(move || canceller.cancel());
-assert_eq!(call.wait(), Err(CallError::Cancelled));
-# Ok::<(), rpc_io::Error>(())
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let call = endpoint.peer().request("slow", ())?;
+    let canceller = call.canceller();
+    std::thread::spawn(move || canceller.cancel());
+    assert_eq!(call.wait(), Err(CallError::Cancelled));
+    Ok(())
+}
 ```
 
 ## `Responder`
@@ -620,21 +646,23 @@ The right to answer one deferred request, exactly once. `Send`.
 Dropped without answering, it answers `INTERNAL_ERROR`.
 
 ```rust
-use rpc_io::{Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
 
-let router = Router::new().deferred("slow", |_: &mut (), _, _, responder| {
-    std::thread::spawn(move || {
-        if !responder.is_cancelled() {
-            responder.ok("done").ok();
-        }
+    let router = Router::new().deferred("slow", |_: &mut (), _, _, responder| {
+        std::thread::spawn(move || {
+            if !responder.is_cancelled() {
+                responder.ok("done").ok();
+            }
+        });
     });
-});
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":7,"method":"slow"}"#)?;
-let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
-assert_eq!(reply.as_deref(), Some(r#"{"jsonrpc":"2.0","id":7,"result":"done"}"#));
-# Ok::<(), rpc_io::Error>(())
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":7,"method":"slow"}"#)?;
+    let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).ok();
+    assert_eq!(reply.as_deref(), Some(r#"{"jsonrpc":"2.0","id":7,"result":"done"}"#));
+    Ok(())
+}
 ```
 
 ## `CancelToken`
@@ -660,28 +688,30 @@ assert!(seen.is_cancelled());
 `WorkDone` sends LSP's `$/progress` for one work-done token: `new(peer, token)`, `from_params(&params, peer)` (when the request carries `workDoneToken`), `token()`, `begin(title, cancellable, message, percentage)`, `report(message, percentage)`, `end(message)`. Percentages are capped at 100. Both are `Clone`, and send through their `Peer` from any thread.
 
 ```rust
-use rpc_io::{Endpoint, Router, WorkDone};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router, WorkDone};
 
-let router = Router::new().request("work", |_: &mut (), params, cx| {
-    if let Some(progress) = cx.progress(&params) {
-        progress.report(50.0, Some(100.0), None)?;
-        assert!(progress.report(40.0, None, None).is_err()); // must increase
-    }
-    if let Some(work) = WorkDone::from_params(&params, cx.peer()) {
-        work.begin("Working", false, None, None)?;
-        work.end(Some("done"))?;
-    }
+    let router = Router::new().request("work", |_: &mut (), params, cx| {
+        if let Some(progress) = cx.progress(&params) {
+            progress.report(50.0, Some(100.0), None)?;
+            assert!(progress.report(40.0, None, None).is_err()); // must increase
+        }
+        if let Some(work) = WorkDone::from_params(&params, cx.peer()) {
+            work.begin("Working", false, None, None)?;
+            work.end(Some("done"))?;
+        }
+        Ok(())
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work","params":{"_meta":{"progressToken":7}}}"#)?;
+    let sent: Vec<String> = rx.try_iter().collect();
+    assert_eq!(sent[0], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":7,"progress":50,"total":100}}"#);
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"work","params":{"workDoneToken":"w"}}"#)?;
+    let sent: Vec<String> = rx.try_iter().collect();
+    assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"w","value":{"kind":"end","message":"done"}}}"#);
     Ok(())
-});
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"work","params":{"_meta":{"progressToken":7}}}"#)?;
-let sent: Vec<String> = rx.try_iter().collect();
-assert_eq!(sent[0], r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":7,"progress":50,"total":100}}"#);
-endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"work","params":{"workDoneToken":"w"}}"#)?;
-let sent: Vec<String> = rx.try_iter().collect();
-assert_eq!(sent[1], r#"{"jsonrpc":"2.0","method":"$/progress","params":{"token":"w","value":{"kind":"end","message":"done"}}}"#);
-# Ok::<(), rpc_io::Error>(())
+}
 ```
 
 ## `Config`
@@ -742,20 +772,22 @@ assert_eq!(custom.method, "$/cancel");
 Until the opening request succeeds: other requests are refused with `code`, except those in `allow_requests`; notifications are dropped except those in `allow`; everything this side sends but responses is held, within `Config::max_held_bytes`, and sent in order right after the opening response. If the opening request fails (an error answer, or cancelled under a cancellation with no reply), held traffic is discarded, held requests end `Cancelled`, and the gate shuts again. A held request that times out or is cancelled is never sent; an answer to one is unmatched. A repeated opening request after success, and one in a batch, are refused with `-32600`.
 
 ```rust
-use rpc_io::{Config, Endpoint, Gate, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Config, Endpoint, Gate, Router};
 
-let router = Router::new()
-    .request("initialize", |_: &mut (), _, _| Ok(jsonx_lib::json!({ "capabilities": {} })))
-    .request("hover", |_, _, _| Ok("text"));
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ())
-    .with_config(Config::new().with_gate(Some(Gate::new("initialize").allow("exit"))));
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"hover"}"#)?;
-assert!(rx.try_recv().is_ok_and(|m| m.contains("-32002")));
-endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}"#)?;
-endpoint.handle(br#"{"jsonrpc":"2.0","id":3,"method":"hover"}"#)?;
-assert_eq!(rx.try_iter().last().as_deref(), Some(r#"{"jsonrpc":"2.0","id":3,"result":"text"}"#));
-# Ok::<(), rpc_io::Error>(())
+    let router = Router::new()
+        .request("initialize", |_: &mut (), _, _| Ok(jsonx_lib::json!({ "capabilities": {} })))
+        .request("hover", |_, _, _| Ok("text"));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ())
+        .with_config(Config::new().with_gate(Some(Gate::new("initialize").allow("exit"))));
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"hover"}"#)?;
+    assert!(rx.try_recv().is_ok_and(|m| m.contains("-32002")));
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}"#)?;
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":3,"method":"hover"}"#)?;
+    assert_eq!(rx.try_iter().last().as_deref(), Some(r#"{"jsonrpc":"2.0","id":3,"result":"text"}"#));
+    Ok(())
+}
 ```
 
 ## `Limits`
@@ -805,13 +837,15 @@ Each `send` is one unframed body; `flush` is called at the end of each turn and 
 `Framed` frames into a reused buffer and writes once per turn, or whenever the flush threshold (64 KiB by default) is waiting, in the sending thread. A buffer grown past twice the threshold by one large message is released after it is written. `Framed` has `new(writer, framing)`, `with_flush_threshold(bytes)`, `flush_threshold()`, `framing()`, `get_ref()`, `get_mut()`, `into_inner()`.
 
 ```rust
-use rpc_io::{Framed, Framing, Sink};
+fn main() -> Result<(), std::io::Error> {
+    use rpc_io::{Framed, Framing, Sink};
 
-let mut framed = Framed::new(Vec::new(), Framing::ContentLength);
-framed.send("{}")?;
-framed.flush()?;
-assert_eq!(framed.get_ref().as_slice(), b"Content-Length: 2\r\n\r\n{}");
-# Ok::<(), std::io::Error>(())
+    let mut framed = Framed::new(Vec::new(), Framing::ContentLength);
+    framed.send("{}")?;
+    framed.flush()?;
+    assert_eq!(framed.get_ref().as_slice(), b"Content-Length: 2\r\n\r\n{}");
+    Ok(())
+}
 ```
 
 ## `Queued` and `Outbox`
@@ -823,20 +857,22 @@ Outgoing queues whose senders do not wait on the peer: messages are framed into 
 - **`QueueLimits`** (`#[non_exhaustive]`, `Copy`): `max_bytes` (64 MiB), `max_messages` (65,536), `write_timeout` (60 s; `None` waits forever), `close_timeout` (10 s; `Duration::MAX` waits as long as the writes make progress), with `new()` and `with_*`. A message that would take the queue past a limit fails it (one message is always taken when it is empty). `write_timeout` is a no-progress timeout: every byte the peer takes restarts it, so a slow but steady reader is never cut off; it is checked at each send, flush, and close, which then fail. A writer blocked in a write cannot check it itself: give the writer its own write timeout (as `Server` does with its sockets) to have the write fail. A failed queue refuses everything with the same I/O error, which closes the endpoint.
 
 ```rust
-use std::task::{Context, Poll, Waker};
-use rpc_io::{Endpoint, Framing, QueueLimits, Queued, Router};
+fn main() -> Result<(), std::io::Error> {
+    use std::task::{Context, Poll, Waker};
+    use rpc_io::{Endpoint, Framing, QueueLimits, Queued, Router};
 
-// A thread-written sink for a byte stream:
-let endpoint = Endpoint::new(Queued::new(std::io::sink(), Framing::ContentLength)?, Router::<()>::new(), ());
-endpoint.peer().notify("ready", ()).ok();
+    // A thread-written sink for a byte stream:
+    let endpoint = Endpoint::new(Queued::new(std::io::sink(), Framing::ContentLength)?, Router::<()>::new(), ());
+    endpoint.peer().notify("ready", ()).ok();
 
-// An async-drained one:
-let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new().with_max_bytes(1 << 20));
-let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
-endpoint.peer().notify("ready", ()).ok();
-let Poll::Ready(chunk) = outbox.poll_chunk(&mut Context::from_waker(Waker::noop())) else { panic!() };
-assert_eq!(chunk, b"{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\n");
-# Ok::<(), std::io::Error>(())
+    // An async-drained one:
+    let (sink, mut outbox) = rpc_io::outbox(Framing::Newline, QueueLimits::new().with_max_bytes(1 << 20));
+    let endpoint = Endpoint::new(sink, Router::<()>::new(), ());
+    endpoint.peer().notify("ready", ()).ok();
+    let Poll::Ready(chunk) = outbox.poll_chunk(&mut Context::from_waker(Waker::noop())) else { panic!() };
+    assert_eq!(chunk, b"{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}\n");
+    Ok(())
+}
 ```
 
 ## Typed params and results (`serde`)
@@ -855,34 +891,34 @@ With the `serde` feature, protocol types written against `serde` (`lsp-types`, M
 | `Serialize`/`Deserialize` for `Id<'static>` and `ErrorCode` | An integer or a string; an integer. |
 
 ```rust
-# #[cfg(not(feature = "serde"))] fn main() {}
-# #[cfg(feature = "serde")] fn main() -> Result<(), rpc_io::Error> {
-use rpc_io::{Endpoint, Router};
-use serde::{Deserialize, Serialize};
+#[cfg(not(feature = "serde"))] fn main() {}
+#[cfg(feature = "serde")] fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{Endpoint, Router};
+    use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HoverParams { text_document: Document, position: Position }
-#[derive(Deserialize)]
-struct Document { uri: String }
-#[derive(Deserialize, Serialize)]
-struct Position { line: u32, character: u32 }
-#[derive(Serialize)]
-struct Hover { contents: String }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct HoverParams { text_document: Document, position: Position }
+    #[derive(Deserialize)]
+    struct Document { uri: String }
+    #[derive(Deserialize, Serialize)]
+    struct Position { line: u32, character: u32 }
+    #[derive(Serialize)]
+    struct Hover { contents: String }
 
-let router = Router::new().request_typed("textDocument/hover", |_: &mut (), p: HoverParams, _| {
-    Ok(Hover { contents: format!("{} line {}", p.text_document.uri, p.position.line) })
-});
-let (tx, rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, router, ());
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{"textDocument":{"uri":"a.rs"},"position":{"line":3,"character":0}}}"#)?;
-assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"contents":"a.rs line 3"}}"#));
+    let router = Router::new().request_typed("textDocument/hover", |_: &mut (), p: HoverParams, _| {
+        Ok(Hover { contents: format!("{} line {}", p.text_document.uri, p.position.line) })
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, router, ());
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{"textDocument":{"uri":"a.rs"},"position":{"line":3,"character":0}}}"#)?;
+    assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":1,"result":{"contents":"a.rs line 3"}}"#));
 
-let call = endpoint.peer().request_typed("cursor", &Position { line: 1, character: 2 })?;
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":{"line":5,"character":6}}"#)?;
-assert_eq!(call.wait_typed::<Position>().map(|p| p.line), Ok(5));
-# Ok(())
-# }
+    let call = endpoint.peer().request_typed("cursor", &Position { line: 1, character: 2 })?;
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"result":{"line":5,"character":6}}"#)?;
+    assert_eq!(call.wait_typed::<Position>().map(|p| p.line), Ok(5));
+    Ok(())
+}
 ```
 
 ## The async adapter (`futures-io`)
@@ -894,35 +930,35 @@ Runtime-agnostic: `futures-io`'s `AsyncRead`/`AsyncWrite` are implemented by smo
 - `Call` is a `Future` with or without the feature.
 
 ```rust
-# #[cfg(not(feature = "futures-io"))] fn main() {}
-# #[cfg(feature = "futures-io")] fn main() -> Result<(), rpc_io::Error> {
-use std::{future::Future, pin::pin, sync::Arc, task::{Context, Poll, Wake, Waker}};
-use rpc_io::{End, Endpoint, Framing, QueueLimits, Router};
+#[cfg(not(feature = "futures-io"))] fn main() {}
+#[cfg(feature = "futures-io")] fn main() -> Result<(), rpc_io::Error> {
+    use std::{future::Future, pin::pin, sync::Arc, task::{Context, Poll, Wake, Waker}};
+    use rpc_io::{End, Endpoint, Framing, QueueLimits, Router};
 
-// Any executor will do; this one parks the thread between polls.
-fn block_on<F: Future>(future: F) -> F::Output {
-    struct Unpark(std::thread::Thread);
-    impl Wake for Unpark { fn wake(self: Arc<Self>) { self.0.unpark() } }
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut future = pin!(future);
-    loop {
-        if let Poll::Ready(out) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
-            return out;
+    // Any executor will do; this one parks the thread between polls.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct Unpark(std::thread::Thread);
+        impl Wake for Unpark { fn wake(self: Arc<Self>) { self.0.unpark() } }
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut future = pin!(future);
+        loop {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                return out;
+            }
+            std::thread::park();
         }
-        std::thread::park();
     }
-}
 
-let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
-let (sink, mut outbox) = rpc_io::outbox(Framing::ContentLength, QueueLimits::new());
-let mut endpoint = Endpoint::new(sink, router, ());
-let input: &[u8] = b"Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-assert_eq!(block_on(endpoint.run_async(input, Framing::ContentLength))?, End::Eof);
-let mut output = Vec::new();
-block_on(outbox.write_to(&mut output)).map_err(rpc_io::Error::Io)?;
-assert!(output.ends_with(br#"{"jsonrpc":"2.0","id":1,"result":"pong"}"#));
-# Ok(())
-# }
+    let router = Router::new().request("ping", |_: &mut (), _, _| Ok("pong"));
+    let (sink, mut outbox) = rpc_io::outbox(Framing::ContentLength, QueueLimits::new());
+    let mut endpoint = Endpoint::new(sink, router, ());
+    let input: &[u8] = b"Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+    assert_eq!(block_on(endpoint.run_async(input, Framing::ContentLength))?, End::Eof);
+    let mut output = Vec::new();
+    block_on(outbox.write_to(&mut output)).map_err(rpc_io::Error::Io)?;
+    assert!(output.ends_with(br#"{"jsonrpc":"2.0","id":1,"result":"pong"}"#));
+    Ok(())
+}
 ```
 
 ## `Framing`
@@ -957,25 +993,27 @@ Sans-IO. Bytes go in through `space` + `commit` (read straight into the buffer) 
 | `buffered()`, `capacity()`, `memory_bound()` | Bytes held; bytes allocated now; the most it can hold. |
 
 ```rust
-use std::io::Read;
-use rpc_io::{Framing, Limits};
+fn main() -> Result<(), rpc_io::FrameError> {
+    use std::io::Read;
+    use rpc_io::{Framing, Limits};
 
-let mut input: &[u8] = b"Content-Length: 2\r\n\r\n{}Content-Length: 4\r\n\r\nnull";
-let mut decoder = Framing::ContentLength.decoder(&Limits::new());
-let mut bodies = Vec::new();
-loop {
-    while let Some(body) = decoder.next_frame()? {
-        bodies.push(body.to_vec());
+    let mut input: &[u8] = b"Content-Length: 2\r\n\r\n{}Content-Length: 4\r\n\r\nnull";
+    let mut decoder = Framing::ContentLength.decoder(&Limits::new());
+    let mut bodies = Vec::new();
+    loop {
+        while let Some(body) = decoder.next_frame()? {
+            bodies.push(body.to_vec());
+        }
+        let n = input.read(decoder.space()).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        decoder.commit(n);
     }
-    let n = input.read(decoder.space()).unwrap_or(0);
-    if n == 0 {
-        break;
-    }
-    decoder.commit(n);
+    assert_eq!(decoder.finish()?, None);
+    assert_eq!(bodies, [b"{}".to_vec(), b"null".to_vec()]);
+    Ok(())
 }
-assert_eq!(decoder.finish()?, None);
-assert_eq!(bodies, [b"{}".to_vec(), b"null".to_vec()]);
-# Ok::<(), rpc_io::FrameError>(())
 ```
 
 ## `FrameError`
@@ -1051,16 +1089,18 @@ assert_eq!(owned.to_string(), r#"{"jsonrpc":"2.0","id":7,"method":"hover"}"#);
 Structs with public fields: `Request { id: Id, method: Cow<str>, params: Option<Raw> }`, `Notification { method, params }`, `Response { id: Option<Id>, result: Result<Raw, ErrorObject> }` (`id: None` is `null`, only for errors). All three are `#[non_exhaustive]` (since 0.4.0), so a later version can keep more of the envelope without a break: read and change the fields freely, build with the constructors, and add `..` to struct patterns. Constructors: `Request::new(id, method, params)`, `Notification::new(method, params)`, `Response::new(id, result)`, `Response::ok(id, raw)`, `Response::err(id, error)`.
 
 ```rust
-use rpc_io::{ErrorObject, Message, Raw, Response};
+fn main() -> Result<(), jsonx_lib::Error> {
+    use rpc_io::{ErrorObject, Message, Raw, Response};
 
-let ok = Response::ok(4, Raw::new("true")?);
-assert_eq!(Message::Response(ok).to_string(), r#"{"jsonrpc":"2.0","id":4,"result":true}"#);
-let failed = Response::err(None, ErrorObject::parse_error("bad JSON"));
-assert_eq!(
-    Message::Response(failed).to_string(),
-    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
-);
-# Ok::<(), jsonx_lib::Error>(())
+    let ok = Response::ok(4, Raw::new("true")?);
+    assert_eq!(Message::Response(ok).to_string(), r#"{"jsonrpc":"2.0","id":4,"result":true}"#);
+    let failed = Response::err(None, ErrorObject::parse_error("bad JSON"));
+    assert_eq!(
+        Message::Response(failed).to_string(),
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad JSON"}}"#,
+    );
+    Ok(())
+}
 ```
 
 ## `Invalid`
@@ -1104,10 +1144,12 @@ assert_eq!(Id::raw_number("1e3").map(|id| id.to_string()).as_deref(), Some("1e3"
 One JSON value kept as its exact validated text. `NULL`; `new(&str)` and `new_with(&str, &Parser)` validate (trimming surrounding whitespace); `from_string(String)`; `from_value(&Value)`; `as_str()`; `kind()` (from the first byte); `parse()` and `parse_with(&Parser)`; `deserialize::<T>()` (`serde`); `into_owned()`.
 
 ```rust
-let raw = rpc_io::Raw::new(r#" {"line": 3} "#)?;
-assert_eq!(raw.as_str(), r#"{"line": 3}"#);
-assert_eq!(raw.parse()?["line"], 3);
-# Ok::<(), jsonx_lib::Error>(())
+fn main() -> Result<(), jsonx_lib::Error> {
+    let raw = rpc_io::Raw::new(r#" {"line": 3} "#)?;
+    assert_eq!(raw.as_str(), r#"{"line": 3}"#);
+    assert_eq!(raw.parse()?["line"], 3);
+    Ok(())
+}
 ```
 
 ## `Json`
@@ -1181,14 +1223,16 @@ assert!(matches!(endpoint.peer().notify("x", ()), Err(Error::Closed)));
 `#[non_exhaustive]`, why one of our requests produced no result: `Rejected(ErrorObject)` (the peer's error), `InvalidResponse(ErrorObject)` (a broken answer, or one that does not fit `wait_typed`'s type), `TimedOut`, `Cancelled`, `Evicted` (over `max_pending`), `Closed`, `WouldDeadlock` (waited on the endpoint's own thread; the call, consumed by `wait`, is cancelled).
 
 ```rust
-use rpc_io::{CallError, Endpoint, Router};
+fn main() -> Result<(), rpc_io::Error> {
+    use rpc_io::{CallError, Endpoint, Router};
 
-let (tx, _rx) = std::sync::mpsc::channel::<String>();
-let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
-let call = endpoint.peer().request("x", ())?;
-endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"no"}}"#)?;
-assert!(matches!(call.wait(), Err(CallError::Rejected(e)) if e.message() == "no"));
-# Ok::<(), rpc_io::Error>(())
+    let (tx, _rx) = std::sync::mpsc::channel::<String>();
+    let mut endpoint = Endpoint::new(tx, Router::<()>::new(), ());
+    let call = endpoint.peer().request("x", ())?;
+    endpoint.handle(br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"no"}}"#)?;
+    assert!(matches!(call.wait(), Err(CallError::Rejected(e)) if e.message() == "no"));
+    Ok(())
+}
 ```
 
 ## Feature flags
