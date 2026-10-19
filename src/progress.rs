@@ -127,7 +127,9 @@ fn push_text(out: &mut String, name: &str, text: Option<&str>) {
 ///   its request: once the request is answered or cancelled (or the
 ///   connection closes), `report` refuses with [`Error::AlreadyAnswered`],
 ///   checked under the lock the response is written under, so no report can
-///   follow the response on the wire. One made by [`Progress::new`] or
+///   follow the response on the wire. It is bound to its request, not to the
+///   request's id: when the peer reuses the id for a later request, it still
+///   refuses and never reports for the later one. One made by [`Progress::new`] or
 ///   [`Progress::from_params`] knows no request and leaves that rule to the
 ///   caller.
 ///

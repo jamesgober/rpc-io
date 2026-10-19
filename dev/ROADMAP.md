@@ -133,6 +133,10 @@ Deferred, with reasons:
   framings, which need the same.
 
 ## v0.4.0 - Typed JSON, MCP 2026-07-28, and the 1.0 decisions (DONE, 2026-10-19; published once jsonx-lib 0.5 is)
+
+Release order: jsonx-lib 0.5.0 is published first. Until it is on crates.io,
+rpc-io 0.4 builds only through a local path patch, so CI and `cargo publish`
+fail on it (the 0.4.0 verification's RPC5-005).
 - [x] jsonx-lib 0.5 (from 0.2).
 - [x] Typed params and results through jsonx-lib's `ToJson`/`FromJson` (moved here from v0.5.0, see below).
 - [x] MCP's current revision, 2026-07-28: `Config::mcp()` stateless (no `initialize` gate, no `-32002`, no `-32000..=-32019` codes, errors for unreadable messages without `id`); `Config::mcp_legacy()` for legacy-only servers; id-less error responses read as errors under `null`.
@@ -168,9 +172,11 @@ Not done here, with reasons:
   our requests. Later, on request.
 - **`ToJson` for every `Raw` without a second validation**: a `Raw` holds a
   `jsonx_lib::RawValue` (validated once when read or written by jsonx-lib)
-  wherever users obtain one, and is written with no second scan. Text the
-  crate writes outside jsonx-lib (message buffers, `serde` output) stays plain
-  text and is validated if it is ever nested in a `ToJson` value: jsonx-lib
+  when it comes from a message, `Raw::new`, `Raw::from_value`, or
+  `Json::encode`, and is written with no second scan. `Raw::from_string`,
+  `Raw::NULL`, progress tokens, and text the crate writes outside jsonx-lib
+  (message buffers, `serde` output) stay plain text, validated if one is ever
+  nested in a `ToJson` value: jsonx-lib
   declined an unchecked raw write, since its writer's output must always
   parse back.
 

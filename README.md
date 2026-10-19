@@ -72,6 +72,8 @@ What it guarantees, and how each guarantee is checked:
 rpc-io = "0.4"
 ```
 
+rpc-io 0.4 needs jsonx-lib 0.5, and is published once jsonx-lib 0.5.0 is on crates.io; until then it builds only against a local jsonx-lib (a `[patch.crates-io]` entry).
+
 JSON values are built and read with jsonx-lib, re-exported as `rpc_io::jsonx` (`rpc_io::jsonx::json!`, `rpc_io::jsonx::Value`, the `ToJson`/`FromJson` traits), so no separate dependency is needed and a crate on top always gets the same jsonx-lib version as rpc-io.
 
 The framing, message, and correlation layers without the standard library:
@@ -154,7 +156,7 @@ fn main() -> Result<(), rpc_io::Error> {
 
 ### Long work, answered later and cancellable
 
-A deferred handler gets a `Responder` it can keep or move to a worker. If the peer cancels (`$/cancelRequest` in LSP, `notifications/cancelled` in MCP), the responder's token is set and the request is answered as the protocol says; a late answer is refused:
+A deferred handler gets a `Responder` it can keep or move to a worker. If the peer cancels (`$/cancelRequest` in LSP, `notifications/cancelled` in MCP), the responder's token is set and the request is answered as the protocol says; a late answer is refused, also after the peer has reused the request's id for a new request (the responder is bound to its own request, not to the id):
 
 ```rust
 use std::sync::mpsc;
@@ -331,7 +333,7 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 
 ## Design notes
 
-- **Exactly one response.** A deferred request is tracked until answered; a `Responder` dropped without answering (a worker returned early, a panic unwound through it) answers `INTERNAL_ERROR` itself. A cancelled request is answered by the endpoint (`-32800` for LSP) or not at all (MCP), and a late answer from the worker returns `Error::AlreadyAnswered` instead of reaching the wire.
+- **Exactly one response.** A deferred request is tracked until answered; a `Responder` dropped without answering (a worker returned early, a panic unwound through it) answers `INTERNAL_ERROR` itself. A cancelled request is answered by the endpoint (`-32800` for LSP) or not at all (MCP), and a late answer from the worker returns `Error::AlreadyAnswered` instead of reaching the wire, even after the peer reused the id for a new request: a `Responder`, `Notifier`, or request-bound `Progress` is bound to its own request, never to a later one with the same id. (In 0.2 and 0.3, a stale `Responder` answered the later request.)
 - **Ids.** Request ids are strings or integers within `i64` by default. `null`, fractions, and other values are refused as invalid requests, as LSP and MCP require; `Limits::with_lenient_ids(true)` accepts them for generic JSON-RPC services and echoes each back exactly as it was sent. A request whose id is still being answered by a deferred handler is refused under a `null` id, so the only response carrying that id is the real answer (a deliberate departure from the letter of JSON-RPC 2.0, which keeps `null` for ids that could not be read). Our own ids are positive integers counted from 1; answers to ids we are not waiting on are reported and dropped.
 - **Malformed messages.** A message with a `method` is answered under its own id when that id is valid and appears once; anything unreadable is answered under `null`, as the specification requires (with no `id` under `Config::omit_null_id`). A repeated envelope member (`method`, `id`, `params`, `jsonrpc`, `result`, `error`) makes the message invalid, so no reader can see one method and run another; an error response without `id` (MCP's form) is read as one under `null`. A broken *response* is never answered (an error under its id would read as an answer to one of the peer's requests); it ends the call it names instead.
 - **Budgets.** `Limits` caps message bytes (64 MiB), header bytes (8 KiB, the terminating blank line included), header lines (32), batch size (1024, or 0 for no batches), the length an oversized body may announce and still be skipped, and every JSON budget of `jsonx-lib` (depth 128 by default). An oversized message is skipped as it arrives, never buffered, and answered; a broken frame ends the connection, since no reliable boundary is left. The defaults suit a local peer; `Limits::network()` and `Limits::strict()` suit remote ones, since a handler that parses `params` builds a value tree that can be several times the message's size.

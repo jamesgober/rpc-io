@@ -891,7 +891,10 @@ impl Responder {
 /// the request is answered or cancelled by the peer, and with
 /// [`Error::Closed`] once the connection closed. The check runs under the
 /// lock the response is written under, so no notification can follow the
-/// response, or a cancellation the endpoint has handled, on the wire. Made by
+/// response, or a cancellation the endpoint has handled, on the wire. It is
+/// bound to its request, not to the request's id: when the peer reuses the
+/// id for a later request, a notifier of the earlier one still refuses and
+/// never sends for the later one. Made by
 /// [`Responder::notifier`] for a deferred request, or by
 /// [`Context::notifier`](crate::Context::notifier) for the request being
 /// handled. `Clone`, and usable from any thread.
