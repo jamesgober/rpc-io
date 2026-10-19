@@ -244,6 +244,12 @@ impl<T> Pending<T> {
         self.deadlines.first().map(|&(at, _)| at)
     }
 
+    /// How many outstanding requests have no deadline.
+    #[cfg(feature = "net")]
+    pub(crate) fn without_deadline(&self) -> usize {
+        self.entries.len() - self.deadlines.len()
+    }
+
     /// Removes every outstanding request, oldest first.
     ///
     /// # Examples

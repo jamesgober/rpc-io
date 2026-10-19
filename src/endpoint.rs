@@ -369,6 +369,12 @@ impl<S, K: Sink> Endpoint<S, K> {
         self.shared.lock().next_deadline()
     }
 
+    /// How many of our requests wait on the peer with no deadline.
+    #[cfg(feature = "net")]
+    pub(crate) fn open_ended(&self) -> usize {
+        self.shared.lock().open_ended()
+    }
+
     /// Ends every one of our requests whose deadline has passed with
     /// [`CallError::TimedOut`], telling the peer to cancel each.
     ///

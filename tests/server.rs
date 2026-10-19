@@ -480,3 +480,48 @@ fn test_idle_and_unfinished_connections_are_closed() {
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
 }
+
+#[test]
+fn test_a_client_cannot_hold_a_connection_through_a_request_that_waits_on_it() {
+    // The rest of RPC4-001: the client's own request is answered later,
+    // by a handler that first asks the client something, with no timeout.
+    // A client that never answers the question kept the request in flight,
+    // and with it the connection out of the idle timeout, forever.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline).with_idle_timeout(Some(Duration::from_millis(300)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().deferred(
+                    "tools/call",
+                    |held: &mut Vec<(rpc_io::Call, rpc_io::Responder)>, _, cx, responder| {
+                        if let Ok(call) = cx.request("sampling/createMessage", ()) {
+                            held.push((call, responder));
+                        }
+                    },
+                ),
+                Vec::new(),
+            )
+        })
+    });
+    let (mut client, mut reader) = connect(addr);
+    assert!(
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n")
+            .is_ok()
+    );
+    let mut line = String::new();
+    assert!(reader.read_line(&mut line).is_ok_and(|n| n > 0));
+    assert!(line.contains("sampling/createMessage"), "{line}");
+    // Never answered: closed as idle all the same.
+    let started = Instant::now();
+    assert!(closed(&mut reader), "the connection stayed open");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}

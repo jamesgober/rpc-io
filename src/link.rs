@@ -596,6 +596,12 @@ impl<K: Sink> Inner<K> {
     }
 
     /// When the earliest outstanding request is due.
+    /// How many of our requests wait on the peer with no deadline.
+    #[cfg(feature = "net")]
+    pub(crate) fn open_ended(&self) -> usize {
+        self.pending.without_deadline()
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.pending
             .next_deadline()

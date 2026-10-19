@@ -63,7 +63,7 @@ pub struct Connection {
 /// | `queue` | [`QueueLimits::new`] with 8 MiB and 4,096 messages | every connection's outgoing queue |
 /// | `max_connections` | 256 | connections served at once; the next is not accepted until one ends |
 /// | `message_timeout` | 30 s | how long a message may take to arrive once it has begun, and a new connection to send its first one |
-/// | `idle_timeout` | 300 s | how long a connection may stay idle: no traffic either way, and nothing in flight |
+/// | `idle_timeout` | 300 s | how long a connection may stay idle: no traffic either way, and nothing outstanding the peer cannot stretch (see [`Server::with_idle_timeout`]) |
 ///
 /// Concurrency is bounded: at `max_connections`, the loop stops accepting
 /// (the operating system queues further connections in its backlog) until a
@@ -415,14 +415,17 @@ fn serve_connection<T: Stream, S>(
             // Part of a message: due `message_timeout` after its first bytes.
             busy_since = busy_since.or(Some(last_read));
         }
-        // Idle means no traffic either way and nothing outstanding: no
-        // deferred request of the peer's being answered, and no request of
-        // ours waiting for the peer within its deadline. One of ours with no
-        // deadline does not count: the peer could hold the connection open
-        // forever by never answering it.
+        // Idle means no traffic either way and nothing outstanding that the
+        // peer cannot stretch: a request of ours within its deadline, or a
+        // deferred request of the peer's being answered while we wait on
+        // the peer for nothing open-ended. A request of ours with no
+        // deadline never counts, and while one is outstanding the peer's
+        // deferred requests do not count either: their handler may be
+        // waiting on that very answer, so a peer that never sends it could
+        // otherwise hold the connection open forever.
         let stats = endpoint.stats();
-        let working =
-            stats.in_flight > 0 || (stats.pending > 0 && endpoint.next_deadline().is_some());
+        let open_ended = endpoint.open_ended();
+        let working = stats.pending > open_ended || (stats.in_flight > 0 && open_ended == 0);
         let now = Instant::now();
         if working || stats.bodies_out != sent {
             sent = stats.bodies_out;
@@ -529,10 +532,14 @@ impl Server {
     }
 
     /// Sets how long a connection may stay idle (`None`: no limit): no
-    /// traffic in either direction, no deferred request of the peer's being
-    /// answered, and no request of ours waiting for the peer within its
-    /// deadline (one sent without a timeout does not count, so a peer cannot
-    /// hold the connection open by never answering it). A connection
+    /// traffic in either direction, and nothing outstanding that the peer
+    /// cannot stretch. A request of ours within its deadline keeps the
+    /// connection busy; one sent without a timeout never does, so a peer
+    /// cannot hold the connection open by never answering it. A deferred
+    /// request of the peer's being answered keeps it busy too, except while a
+    /// request of ours without a timeout is outstanding: its handler may be
+    /// waiting on that answer, which the peer could withhold forever. A
+    /// connection
     /// idle past it is closed. Long-lived sessions whose peer may be quiet
     /// for a long time (an editor's LSP client, an MCP host between tool
     /// calls) may want `None`.
