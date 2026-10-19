@@ -318,12 +318,19 @@ impl Responder {
     }
 }
 
-/// An integer, or a string.
+/// An integer, a string, `null`, or for a [`RawNumber`](Id::RawNumber) the
+/// number through `serde_json::Number`: exact for integers within `u64`, the
+/// nearest `f64` otherwise.
 impl Serialize for Id<'_> {
     fn serialize<Z: Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
         match self {
             Id::Number(n) => serializer.serialize_i64(*n),
             Id::String(s) => serializer.serialize_str(s),
+            Id::RawNumber(text) => text
+                .parse::<serde_json::Number>()
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+            Id::Null => serializer.serialize_none(),
         }
     }
 }
@@ -393,6 +400,21 @@ mod tests {
         }
         assert!(serde_json::from_str::<Id<'static>>("18446744073709551615").is_err());
         assert!(serde_json::from_str::<Id<'static>>("1.5").is_err());
+        assert_eq!(
+            serde_json::to_string(&Id::Null).ok().as_deref(),
+            Some("null")
+        );
+        let big = Id::RawNumber("18446744073709551615".into());
+        assert_eq!(
+            serde_json::to_string(&big).ok().as_deref(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(
+            serde_json::to_string(&Id::RawNumber("0.5".into()))
+                .ok()
+                .as_deref(),
+            Some("0.5")
+        );
         assert_eq!(
             serde_json::from_str::<Id<'static>>("5").ok(),
             Some(Id::from(5))

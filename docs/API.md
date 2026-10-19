@@ -155,7 +155,21 @@ For any input, an [`Endpoint`](#endpoint):
 
 ### Ids
 
-Request ids are strings or integers within `i64`. JSON-RPC 2.0 also allows `null` and fractions; LSP and MCP forbid them, and so does this crate: such a request is refused with `-32600` under `null`. Ids compare by value (`7` and `"7"` differ; `-0` reads as `0`, and is echoed as `0`). Our own requests are numbered from 1 upward.
+Request ids are strings or integers within `i64`. JSON-RPC 2.0 also allows `null` and fractions, and discourages both; LSP and MCP forbid them, and by default so does this crate: such a request is refused with `-32600` under `null`. Ids compare by value (`7` and `"7"` differ; `-0` reads as `0`, and is echoed as `0`). Our own requests are numbered from 1 upward.
+
+With `Limits::with_lenient_ids(true)` (for generic JSON-RPC services) such requests are accepted: a `null` id is `Id::Null`, and any other number (a fraction, an exponent, an integer outside `i64`) is `Id::RawNumber`, kept as its exact text and echoed back as it was sent (`1.0` and `1.00` are different ids). A response from the peer may then carry a `RawNumber` id too; it matches none of ours. A `null` id names no one request: two `null`-id requests cannot both be in flight (the second is refused as a duplicate), and a cancel notification naming `null` cancels nothing.
+
+```rust
+use rpc_io::{Config, Endpoint, Limits, Router};
+
+let router = Router::new().request("m", |_: &mut (), _, _| Ok(true));
+let (tx, rx) = std::sync::mpsc::channel::<String>();
+let config = Config::new().with_limits(Limits::new().with_lenient_ids(true));
+let mut endpoint = Endpoint::new(tx, router, ()).with_config(config);
+endpoint.handle(br#"{"jsonrpc":"2.0","id":2.50,"method":"m"}"#)?;
+assert_eq!(rx.try_recv().ok().as_deref(), Some(r#"{"jsonrpc":"2.0","id":2.50,"result":true}"#));
+# Ok::<(), rpc_io::Error>(())
+```
 
 A request that reuses the id of a request still being answered is refused with `-32600` under `null`. This deliberately departs from the letter of JSON-RPC 2.0 §5, which says a response's id must be the request's and keeps `null` for ids that could not be read: answering under the reused id would give the peer two responses with one id, one of them for a request it cannot tell apart. The in-flight request's answer stays the only response with that id.
 
@@ -750,6 +764,7 @@ assert_eq!(rx.try_iter().last().as_deref(), Some(r#"{"jsonrpc":"2.0","id":3,"res
 | `max_batch` | 1024 | Messages in one batch; `0` turns batches off (`without_batches()`). |
 | `max_skip_bytes` | `u64::MAX` | The largest announced length of an oversized Content-Length body still skipped; above it the connection closes (`FrameError::TooLargeToSkip`). |
 | `json` | `jsonx_lib::Limits::new()` | Depth 128, 16 MiB strings, 1 KiB numbers, 4 Mi values; its `max_input_bytes` is replaced by `max_message_bytes`. |
+| `lenient_ids` | `false` | A policy, not a budget: accept `null` and non-`i64` numeric request ids (see [Ids](#ids)); off in every preset. |
 
 | Preset | Messages | Headers | Batch | Skip | JSON depth / strings / numbers / values |
 |---|---:|---:|---:|---:|---|
@@ -1068,13 +1083,14 @@ assert_eq!(out, r#"[{"jsonrpc":"2.0","method":"ping"},{"jsonrpc":"2.0","method":
 
 ## `Id`
 
-`Number(i64)` or `String(Cow<str>)`; `Ord + Hash`; `as_i64()`, `as_str()`, `into_owned()`; `From` `i64`, `i32`, `u32`, `&str`, `String`, `Cow<str>`; `Display` writes the JSON form. With `serde`, `Serialize`, and `Deserialize` for `Id<'static>`.
+`Number(i64)`, `String(Cow<str>)`, and, read only with lenient ids (see [Ids](#ids)), `RawNumber(Cow<str>)` (any other JSON number, as its text) and `Null`. Exhaustive: those are every id JSON-RPC 2.0 allows. `Ord + Hash`; `as_i64()`, `as_str()`, `is_null()`, `raw_number(&str)` (a `RawNumber`, or a `Number` for an `i64` integer; `None` for text that is not one JSON number), `into_owned()`; `From` `i64`, `i32`, `u32`, `&str`, `String`, `Cow<str>`; `Display` writes the JSON form. With `serde`, `Serialize` (a `RawNumber` through `serde_json::Number`: exact within `u64`, else the nearest `f64`), and `Deserialize` for `Id<'static>` (integers and strings).
 
 ```rust
 use rpc_io::Id;
 
 assert_eq!(Id::from("a\"b").to_string(), r#""a\"b""#);
 assert_eq!(Id::from(7).as_i64(), Some(7));
+assert_eq!(Id::raw_number("1e3").map(|id| id.to_string()).as_deref(), Some("1e3"));
 ```
 
 ## `Raw`

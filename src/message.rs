@@ -654,14 +654,14 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
             let read = read_members(&mut reader, &mut fields)
                 .and_then(|()| reader.finish().map_err(Fail::Json));
             match read {
-                Ok(()) => Incoming::Single(classify(fields, &parser)),
+                Ok(()) => Incoming::Single(classify(fields, &parser, limits.lenient_ids)),
                 Err(fail) => {
-                    let salvaged = fields.salvage();
+                    let salvaged = fields.salvage(limits.lenient_ids);
                     Incoming::Single(Err(unreadable(fail, salvaged)))
                 }
             }
         }
-        Event::StartArray => decode_batch(reader, &parser, limits.max_batch),
+        Event::StartArray => decode_batch(reader, &parser, limits),
         _ => match reader.finish() {
             Ok(()) => Incoming::Single(Err(Invalid::request(
                 None,
@@ -673,7 +673,8 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
 }
 
 /// Decodes the elements of a batch, the reader just past its `[`.
-fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Incoming<'a> {
+fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, limits: &Limits) -> Incoming<'a> {
+    let max = limits.max_batch;
     if max == 0 {
         // Batches are off: refused at the `[`, unread.
         return Incoming::Single(Err(Invalid::request(
@@ -706,7 +707,7 @@ fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, max: usize) -> Inco
                 if let Err(fail) = read_members(&mut reader, &mut fields) {
                     return Incoming::Single(Err(unreadable(fail, None)));
                 }
-                classify(fields, parser)
+                classify(fields, parser, limits.lenient_ids)
             }
             Event::StartArray => {
                 if let Err(fail) = skip_container(&mut reader) {
@@ -797,14 +798,13 @@ struct Fields<'a> {
 impl<'a> Fields<'a> {
     /// The id to answer an unreadable message under: its own if it was read,
     /// valid, unrepeated, and the message has a method.
-    fn salvage(&self) -> Option<Id<'a>> {
+    fn salvage(&self, lenient: bool) -> Option<Id<'a>> {
         if self.method.is_none() || self.id_repeated {
             return None;
         }
-        match self.id.map(read_id) {
-            Some(IdValue::Valid(id)) => Some(id),
-            _ => None,
-        }
+        self.id
+            .map(read_id)
+            .and_then(|id| id.into_request_id(lenient))
     }
 }
 
@@ -838,29 +838,52 @@ fn read_members<'a>(reader: &mut Reader<'a>, fields: &mut Fields<'a>) -> Result<
 
 /// What an `id` member holds.
 enum IdValue<'a> {
+    /// A string, or an integer within `i64`: an id under any policy.
     Valid(Id<'a>),
     Null,
+    /// Any other number (validated JSON): an id only with lenient ids.
+    OtherNumber(&'a str),
     Invalid,
+}
+
+impl<'a> IdValue<'a> {
+    /// The id a request with this `id` member has, `None` if it may not be
+    /// one under this policy.
+    fn into_request_id(self, lenient: bool) -> Option<Id<'a>> {
+        match self {
+            IdValue::Valid(id) => Some(id),
+            IdValue::OtherNumber(text) if lenient => Some(Id::RawNumber(Cow::Borrowed(text))),
+            IdValue::Null if lenient => Some(Id::Null),
+            IdValue::Null | IdValue::OtherNumber(_) | IdValue::Invalid => None,
+        }
+    }
 }
 
 fn read_id(raw: &str) -> IdValue<'_> {
     match raw.as_bytes().first() {
         Some(b'"') => read_string(raw).map_or(IdValue::Invalid, |s| IdValue::Valid(Id::String(s))),
         Some(b'n') => IdValue::Null,
-        Some(b'-' | b'0'..=b'9') => Number::from_text(raw)
-            .and_then(|n| n.as_i64())
-            .map_or(IdValue::Invalid, |n| IdValue::Valid(Id::Number(n))),
+        Some(b'-' | b'0'..=b'9') => match Number::from_text(raw).and_then(|n| n.as_i64()) {
+            Some(n) => IdValue::Valid(Id::Number(n)),
+            None => IdValue::OtherNumber(raw),
+        },
         _ => IdValue::Invalid,
     }
 }
 
 /// The id in member `member` of a params object (the target of a cancel
-/// notification); `None` when absent, repeated, or not a valid id.
+/// notification); `None` when absent, repeated, or not an id under this
+/// policy (`null` never is: it cannot name one request).
 #[cfg(feature = "std")]
-pub(crate) fn read_member_id<'a>(params: &'a str, member: &str, parser: &Parser) -> Option<Id<'a>> {
+pub(crate) fn read_member_id<'a>(
+    params: &'a str,
+    member: &str,
+    parser: &Parser,
+    lenient: bool,
+) -> Option<Id<'a>> {
     match read_id(read_member(params, member, parser)?) {
-        IdValue::Valid(id) => Some(id),
-        IdValue::Null | IdValue::Invalid => None,
+        IdValue::Null => None,
+        other => other.into_request_id(lenient),
     }
 }
 
@@ -911,11 +934,14 @@ fn read_string(raw: &str) -> Option<Cow<'_, str>> {
 }
 
 /// Sorts a fully read message object into a message or an `Invalid`.
-fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
+fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a> {
     let id = fields.id.map(read_id);
     let id_repeated = fields.id_repeated;
     let valid_id = match &id {
         Some(IdValue::Valid(id)) if !id_repeated => Some(id.clone()),
+        Some(IdValue::OtherNumber(text)) if lenient && !id_repeated => {
+            Some(Id::RawNumber(Cow::Borrowed(text)))
+        }
         _ => None,
     };
     let version_ok = fields
@@ -949,11 +975,14 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
             Some(p) if p.starts_with(['[', '{']) => Some(Raw::trusted(p)),
             Some(_) => return fail("`params` must be an array or an object"),
         };
-        return match id {
-            None => Ok(Message::Notification(Notification { method, params })),
-            Some(IdValue::Valid(id)) => Ok(Message::Request(Request { id, method, params })),
-            Some(IdValue::Null) => fail("a request id must not be null"),
-            Some(IdValue::Invalid) => fail("a request id must be a string or an integer"),
+        let Some(id) = id else {
+            return Ok(Message::Notification(Notification { method, params }));
+        };
+        let null = matches!(id, IdValue::Null);
+        return match id.into_request_id(lenient) {
+            Some(id) => Ok(Message::Request(Request { id, method, params })),
+            None if null => fail("a request id must not be null"),
+            None => fail("a request id must be a string or an integer"),
         };
     }
 
@@ -994,7 +1023,11 @@ fn classify<'a>(fields: Fields<'a>, parser: &Parser) -> Entry<'a> {
         // no `id` at all (JSON-RPC 2.0 says `null`): the same answer.
         None if result.is_err() => Ok(Message::Response(Response { id: None, result })),
         None => fail("a successful response needs an `id`".into()),
-        Some(IdValue::Invalid) => {
+        Some(IdValue::OtherNumber(text)) if lenient => Ok(Message::Response(Response {
+            id: Some(Id::RawNumber(Cow::Borrowed(text))),
+            result,
+        })),
+        Some(IdValue::Invalid | IdValue::OtherNumber(_)) => {
             fail("a response id must be a string, an integer, or null".into())
         }
         Some(IdValue::Null) if result.is_ok() => {

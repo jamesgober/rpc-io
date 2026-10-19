@@ -118,6 +118,26 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
+    fn prop_lenient_numeric_ids_echo_verbatim(
+        int in "-?(0|[1-9][0-9]{0,30})",
+        frac in proptest::option::of("[0-9]{1,8}"),
+        exp in proptest::option::of("[eE][+-]?[0-9]{1,3}"),
+    ) {
+        let text = format!("{int}{}{}", frac.map(|f| format!(".{f}")).unwrap_or_default(), exp.unwrap_or_default());
+        let body = format!(r#"{{"jsonrpc":"2.0","id":{text},"method":"m"}}"#);
+        let limits = Limits::new().with_lenient_ids(true);
+        let Incoming::Single(Ok(Message::Request(request))) = decode(body.as_bytes(), &limits) else {
+            return Err(TestCaseError::fail(format!("refused {body}")));
+        };
+        // An integer within i64 is a Number (and may print differently, as
+        // `-0` does); anything else comes back exactly as sent.
+        match request.id.as_i64() {
+            Some(n) => prop_assert_eq!(text.parse::<i64>().ok(), Some(n)),
+            None => prop_assert_eq!(request.id.to_string(), text),
+        }
+    }
+
+    #[test]
     fn prop_message_round_trips(message in message()) {
         let text = message.to_string();
         let decoded = decode(text.as_bytes(), &Limits::new());
@@ -452,6 +472,8 @@ fn id_key(id: &Id<'_>) -> String {
     match id {
         Id::Number(n) => format!("n:{n}"),
         Id::String(s) => format!("s:{s}"),
+        Id::RawNumber(s) => format!("r:{s}"),
+        Id::Null => "null".to_owned(),
     }
 }
 

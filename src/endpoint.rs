@@ -941,7 +941,12 @@ impl<S, K: Sink> Endpoint<S, K> {
         if let Some(cancellation) = &self.cancellation {
             if *method == *cancellation.method {
                 let target = params.as_ref().and_then(|p| {
-                    read_member_id(p.as_str(), &cancellation.id_member, &self.parser)
+                    read_member_id(
+                        p.as_str(),
+                        &cancellation.id_member,
+                        &self.parser,
+                        self.limits.lenient_ids,
+                    )
                 });
                 if let Some(target) = target {
                     if self.shared.lock().cancel_incoming(&target) {

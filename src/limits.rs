@@ -32,6 +32,10 @@ use jsonx_lib::Parser;
 /// | [`network`](Limits::network) | 4 MiB | 4 KiB, 16 | 128 | 64 MiB | 64 / 1 MiB / 256 Ki |
 /// | [`strict`](Limits::strict) | 1 MiB | 2 KiB, 8 | 16 | 4 MiB | 32 / 256 KiB / 64 Ki |
 ///
+/// One field is a policy rather than a budget: `lenient_ids` (off in every
+/// preset) accepts the request ids JSON-RPC 2.0 allows but LSP and MCP
+/// forbid; see [`Limits::with_lenient_ids`].
+///
 /// `#[non_exhaustive]`: start from [`Limits::new`] (or a preset) and chain
 /// the `with_*` methods, or assign the public fields of a `Limits::new()`.
 ///
@@ -66,6 +70,11 @@ pub struct Limits {
     /// The JSON parser's budgets (depth, string and number length, value
     /// count). Its `max_input_bytes` is ignored: `max_message_bytes` applies.
     pub json: jsonx_lib::Limits,
+    /// Whether a request id may be `null` or any JSON number (a fraction, an
+    /// exponent, an integer outside `i64`), as JSON-RPC 2.0 allows; off, such
+    /// a request is refused as invalid, as LSP and MCP require. See
+    /// [`Limits::with_lenient_ids`].
+    pub lenient_ids: bool,
 }
 
 impl Limits {
@@ -85,6 +94,7 @@ impl Limits {
             max_batch: 1024,
             max_skip_bytes: u64::MAX,
             json: jsonx_lib::Limits::new(),
+            lenient_ids: false,
         }
     }
 
@@ -142,6 +152,7 @@ impl Limits {
                 .with_max_string_bytes(1024 * 1024)
                 .with_max_number_bytes(128)
                 .with_max_elements(256 * 1024),
+            lenient_ids: false,
         }
     }
 
@@ -170,6 +181,7 @@ impl Limits {
                 .with_max_string_bytes(256 * 1024)
                 .with_max_number_bytes(64)
                 .with_max_elements(64 * 1024),
+            lenient_ids: false,
         }
     }
 
@@ -242,6 +254,40 @@ impl Limits {
     #[must_use]
     pub const fn with_max_batch(mut self, count: usize) -> Self {
         self.max_batch = count;
+        self
+    }
+
+    /// Accepts (`true`) or refuses (`false`, the default) the request ids
+    /// JSON-RPC 2.0 allows and discourages: `null`, and numbers that are not
+    /// integers within `i64`. Accepted, they are kept as [`Id::Null`] and
+    /// [`Id::RawNumber`] and the response carries them back exactly as they
+    /// were sent; a response from the peer may then carry a `RawNumber` id
+    /// too (it matches none of ours, which are integers). For generic
+    /// JSON-RPC services; LSP and MCP forbid such ids, and their presets
+    /// leave this off.
+    ///
+    /// A `null` id names no one request: two `null`-id requests cannot both
+    /// be in flight (the second is refused as a duplicate), and one cannot
+    /// be cancelled.
+    ///
+    /// [`Id::Null`]: crate::Id::Null
+    /// [`Id::RawNumber`]: crate::Id::RawNumber
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{decode, Id, Incoming, Limits, Message};
+    ///
+    /// let body = br#"{"jsonrpc":"2.0","id":1.5,"method":"m"}"#;
+    /// assert!(matches!(decode(body, &Limits::new()), Incoming::Single(Err(_))));
+    /// let Incoming::Single(Ok(Message::Request(request))) = decode(body, &Limits::new().with_lenient_ids(true)) else {
+    ///     panic!("refused");
+    /// };
+    /// assert_eq!(request.id, Id::RawNumber("1.5".into()));
+    /// ```
+    #[must_use]
+    pub const fn with_lenient_ids(mut self, lenient: bool) -> Self {
+        self.lenient_ids = lenient;
         self
     }
 

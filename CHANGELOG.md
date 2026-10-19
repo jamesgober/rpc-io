@@ -17,10 +17,12 @@
 - `Config::mcp_legacy()`: the `initialize`-gated preset, for servers whose MCP clients all speak a legacy revision (2025-11-25 and earlier).
 - `Config::omit_null_id` / `with_omit_null_id`: an error for a message whose id could not be read leaves `id` out instead of writing `"id": null` (MCP's schema has `id?: RequestId`, never `null`).
 - `Config::overloaded_code` / `with_overloaded_code`: the code of the refusal past `max_in_flight` (default `-32000`, as before).
+- **Lenient ids** (audit RPC-COR-06, decided for the 1.0 surface): `Limits::lenient_ids` / `with_lenient_ids(true)` accepts the request ids JSON-RPC 2.0 allows and discourages, `null` and numbers that are not integers within `i64`, and echoes them back exactly as sent, for generic JSON-RPC services. Off by default and in every preset (LSP and MCP forbid them). `Id::RawNumber`, `Id::Null`, `Id::raw_number`, `Id::is_null`.
 
 ### Changed
 
 - **Breaking:** `Request`, `Notification`, and `Response` are `#[non_exhaustive]`, decided for the 1.0 surface (audit RPC-CQ-05), so a later version can keep more of the envelope without a break. Their fields stay public to read and to change. Migration: build them with the new constructors instead of struct literals, and add `..` to struct patterns.
+- **Breaking:** `Id` has two more variants, `RawNumber(Cow<str>)` and `Null`, produced only with lenient ids. `Id` stays exhaustive, since these are every id JSON-RPC 2.0 allows. Migration: add arms (or `_`) to exhaustive `match`es on `Id`.
 
 ### Fixed
 

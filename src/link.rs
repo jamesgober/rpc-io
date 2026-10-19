@@ -290,12 +290,16 @@ struct InFlight {
     batch: Option<u64>,
 }
 
-/// Deferred requests by id. Integer and string ids are kept apart, so a
-/// lookup borrows the id it is given (`&str` for a string) instead of copying
-/// it into an owned key.
+/// Deferred requests by id. Integer, string, and other (lenient) ids are
+/// kept apart, so a lookup borrows the id it is given (`&str` for a string)
+/// instead of copying it into an owned key.
 struct IdMap<V> {
     numbers: BTreeMap<i64, V>,
     strings: BTreeMap<Box<str>, V>,
+    /// [`Id::RawNumber`] ids, by their text.
+    raw_numbers: BTreeMap<Box<str>, V>,
+    /// The one [`Id::Null`] request.
+    null: Option<V>,
 }
 
 impl<V> Default for IdMap<V> {
@@ -303,19 +307,26 @@ impl<V> Default for IdMap<V> {
         Self {
             numbers: BTreeMap::new(),
             strings: BTreeMap::new(),
+            raw_numbers: BTreeMap::new(),
+            null: None,
         }
     }
 }
 
 impl<V> IdMap<V> {
     fn len(&self) -> usize {
-        self.numbers.len() + self.strings.len()
+        self.numbers.len()
+            + self.strings.len()
+            + self.raw_numbers.len()
+            + usize::from(self.null.is_some())
     }
 
     fn contains(&self, id: &Id<'_>) -> bool {
         match id {
             Id::Number(n) => self.numbers.contains_key(n),
             Id::String(s) => self.strings.contains_key(&**s),
+            Id::RawNumber(s) => self.raw_numbers.contains_key(&**s),
+            Id::Null => self.null.is_some(),
         }
     }
 
@@ -323,6 +334,10 @@ impl<V> IdMap<V> {
         match id {
             Id::Number(n) => self.numbers.insert(n, value),
             Id::String(s) => self.strings.insert(s.into_owned().into_boxed_str(), value),
+            Id::RawNumber(s) => self
+                .raw_numbers
+                .insert(s.into_owned().into_boxed_str(), value),
+            Id::Null => self.null.replace(value),
         }
     }
 
@@ -330,11 +345,17 @@ impl<V> IdMap<V> {
         match id {
             Id::Number(n) => self.numbers.remove(n),
             Id::String(s) => self.strings.remove(&**s),
+            Id::RawNumber(s) => self.raw_numbers.remove(&**s),
+            Id::Null => self.null.take(),
         }
     }
 
     fn into_values(self) -> impl Iterator<Item = V> {
-        self.numbers.into_values().chain(self.strings.into_values())
+        self.numbers
+            .into_values()
+            .chain(self.strings.into_values())
+            .chain(self.raw_numbers.into_values())
+            .chain(self.null)
     }
 }
 
