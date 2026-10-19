@@ -49,7 +49,7 @@ Typed JSON through jsonx-lib 0.5, MCP as its current revision has it, and the 1.
 - **Breaking:** built on jsonx-lib 0.5 (from 0.2). jsonx-lib's types are part of this crate's API (`Raw::parse` returns a `jsonx_lib::Value`, `Json` converts from one, `Raw::new_with` takes a `jsonx_lib::Parser`), so a crate that names them needs the same jsonx-lib. jsonx-lib 0.5 keeps the 0.2 surface these use. Migration: depend on `jsonx-lib = "0.5"`.
 - `Progress::report` and the `WorkDone` reports encode their params in a per-thread reused buffer instead of allocating them per report (one string per MCP report, two per LSP report in 0.3).
 - The fuzz harness (and its checks in `cargo test`) covers lenient ids and errors written without `id`.
-- The README's benchmarks are re-measured against 0.3.0 in the same session, as ranges (0.3.0 release verification).
+- The README's benchmarks are re-measured against 0.3.0, alternating the versions in one session, as ranges (0.3.0 release verification), with CPU cycles and allocations per request counted alongside: a handler that parses params costs about 11% fewer cycles than in 0.3.0, and the endpoint path makes no allocation per request (0.3.0: one).
 - `Raw` holds a jsonx-lib `RawValue` wherever users obtain one (message params, results, and error data; `Raw::new`; `Raw::from_value`; `Json::encode`; `FromJson for Raw`), validated once when it was read or written, so `ToJson for Raw` copies it with no second scan. Equality and hashing go by the text, as before.
 
 ### Fixed
