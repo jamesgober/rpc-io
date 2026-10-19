@@ -1331,7 +1331,7 @@ fn main() -> Result<(), rpc_io::Error> {
 
 | Feature | Default | Effect |
 |---|---|---|
-| `std` | yes | The endpoint and everything it uses (`Endpoint`, `serve`, `Router`, handles, `Config`, `Sink`, `Framed`, `Queued`, `outbox`, `Progress`, `WorkDone`, `Stats`, `Error`, `CallError`); forwards to `jsonx-lib/std`. Without it, the crate is `no_std` + `alloc`: framing, the message model, `Pending`. |
+| `std` | yes | The endpoint and everything it uses (`Endpoint`, `serve`, `Router`, handles, `Config`, `Sink`, `Framed`, `Queued`, `outbox`, `Progress`, `WorkDone`, `Notifier`, `Stats`, `Error`, `CallError`, and the typed handler methods); forwards to `jsonx-lib/std`. Without it, the crate is `no_std` + `alloc`: framing, the message model, `Pending`, `Raw::decode`, `Json::encode`, and the `ToJson`/`FromJson` impls for the crate's values. |
 | `serde` | no | Typed params and results (above); adds `serde` and `serde_json`. |
 | `futures-io` | no | The async adapter (above); adds `futures-io`. |
 | `tracing` | no | A debug span per call (method and id) and events for what the endpoint does on its own, under the `rpc_io` target. Records methods, ids, sizes, error codes and messages, and panic messages; never `params`, results, or error `data` as such. Peer-chosen text is clipped and escaped (`Debug`), and an error message that quotes the peer's input (a `serde` error) is clipped to 256 bytes. Adds `tracing`. Off, the instrumentation compiles to nothing. |
