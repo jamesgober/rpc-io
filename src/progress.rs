@@ -351,11 +351,7 @@ impl Responder {
     #[must_use]
     pub fn progress(&self, params: &Params<'_>) -> Option<Progress> {
         let token = params.progress_token()?;
-        Some(Progress::scoped(
-            self.peer(),
-            token,
-            Scope::Deferred(self.id().clone()),
-        ))
+        Some(Progress::scoped(self.peer(), token, self.scope()))
     }
 }
 

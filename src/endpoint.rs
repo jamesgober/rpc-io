@@ -9,7 +9,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
     thread,
     time::Instant,
 };
@@ -848,7 +848,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             RequestHandler::Now(handler) => {
                 let state = &mut self.state;
                 let out = &mut self.result;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method, false);
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, None);
                 let outcome = contain(|| handler(state, params, &mut cx, out));
                 let turn = cx.take_turn();
                 let error;
@@ -873,7 +873,7 @@ impl<S, K: Sink> Endpoint<S, K> {
                 if let Some(turn) = turn {
                     // Under the lock the response is written under: no
                     // progress report can follow it.
-                    turn.store(true, Ordering::Release);
+                    turn.finish();
                 }
                 let _reported = inner.respond(Some(&id), batch, result);
                 drop(inner);
@@ -885,7 +885,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             RequestHandler::Deferred(handler) => {
                 let owned = id.clone().into_owned();
                 let mut inner = self.shared.lock();
-                let Some(token) = inner.begin_deferred(owned.clone(), batch) else {
+                let Some((token, serial)) = inner.begin_deferred(owned.clone(), batch) else {
                     let error = ErrorObject::new(
                         inner.settings.overloaded_code,
                         "too many requests are already being answered",
@@ -895,9 +895,9 @@ impl<S, K: Sink> Endpoint<S, K> {
                 };
                 // The handler sends through the same lock.
                 drop(inner);
-                let responder = Responder::new(owned, token, Arc::clone(&self.link));
+                let responder = Responder::new(owned, serial, token, Arc::clone(&self.link));
                 let state = &mut self.state;
-                let mut cx = Context::new(&self.link, stop, Some(&id), &method, true);
+                let mut cx = Context::new(&self.link, stop, Some(&id), &method, Some(serial));
                 // A panic drops the responder while unwinding, which answers
                 // the request with `INTERNAL_ERROR`.
                 if let Err(payload) = contain(|| handler(state, params, &mut cx, responder)) {
@@ -1010,7 +1010,7 @@ impl<S, K: Sink> Endpoint<S, K> {
             return;
         };
         let state = &mut self.state;
-        let mut cx = Context::new(&self.link, stop, None, &method, false);
+        let mut cx = Context::new(&self.link, stop, None, &method, None);
         match contain(|| handler(state, params, &mut cx)) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => report(

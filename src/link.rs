@@ -54,11 +54,32 @@ const SCRATCH_KEEP: usize = 64 * 1024;
 pub(crate) enum Scope {
     /// No request: always sent.
     Free,
-    /// A request answered by its handler's return value: set (under the
-    /// lock) when its response is written.
-    Turn(Arc<AtomicBool>),
-    /// A deferred request: live while it is in flight.
-    Deferred(Id<'static>),
+    /// A request answered by its handler's return value.
+    Turn(Arc<Turn>),
+    /// A deferred request: live while the in-flight entry under `id` is the
+    /// one with this `serial`. A later request that reuses the id gets
+    /// another serial, so a handle of the earlier one never reaches it.
+    Deferred { id: Id<'static>, serial: u64 },
+}
+
+/// The state of a request answered by its handler's return value, shared by
+/// its bound handles.
+#[derive(Debug, Default)]
+pub(crate) struct Turn {
+    /// Set (under the shared lock) when the response is written.
+    done: AtomicBool,
+}
+
+impl Turn {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the request answered; called under the lock the response is
+    /// written under.
+    pub(crate) fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+    }
 }
 
 /// What the handles need from the shared state, with the sink type erased.
@@ -80,9 +101,12 @@ pub(crate) trait Link: Send + Sync {
     ) -> Result<Issued, Error>;
     fn cancel(&self, id: u64) -> bool;
     fn expire(&self);
+    /// Answers the deferred request `id`, if the one in flight under it is
+    /// still the one with `serial`.
     fn respond(
         &self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error>;
     fn on_endpoint_thread(&self) -> bool;
@@ -125,6 +149,7 @@ impl<K: Sink> Shared<K> {
                 in_flight: IdMap::default(),
                 batches: BTreeMap::new(),
                 next_batch: 0,
+                next_serial: 0,
                 gate: if config.gate.is_some() {
                     GateState::Closed
                 } else {
@@ -177,8 +202,11 @@ impl<K: Sink> Link for Shared<K> {
         }
         let live = match scope {
             Scope::Free => true,
-            Scope::Turn(done) => !done.load(Ordering::Acquire),
-            Scope::Deferred(id) => inner.in_flight(id),
+            Scope::Turn(turn) => !turn.done.load(Ordering::Acquire),
+            Scope::Deferred { id, serial } => inner
+                .in_flight
+                .get(id)
+                .is_some_and(|request| request.serial == *serial),
         };
         if !live {
             return Err(Error::AlreadyAnswered);
@@ -206,9 +234,10 @@ impl<K: Sink> Link for Shared<K> {
     fn respond(
         &self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error> {
-        self.lock().respond_deferred(id, result)
+        self.lock().respond_deferred(id, serial, result)
     }
 
     fn on_endpoint_thread(&self) -> bool {
@@ -330,6 +359,10 @@ pub(crate) enum GateState {
 struct InFlight {
     token: CancelToken,
     batch: Option<u64>,
+    /// Unique to this request among all the connection's deferred requests:
+    /// its handles carry it, so they never act on a later request that
+    /// reuses the id.
+    serial: u64,
 }
 
 /// Deferred requests by id. Integer, string, and other (lenient) ids are
@@ -380,6 +413,15 @@ impl<V> IdMap<V> {
                 .raw_numbers
                 .insert(s.into_owned().into_boxed_str(), value),
             Id::Null => self.null.replace(value),
+        }
+    }
+
+    fn get(&self, id: &Id<'_>) -> Option<&V> {
+        match id {
+            Id::Number(n) => self.numbers.get(n),
+            Id::String(s) => self.strings.get(&**s),
+            Id::RawNumber(s) => self.raw_numbers.get(&**s),
+            Id::Null => self.null.as_ref(),
         }
     }
 
@@ -442,6 +484,8 @@ pub(crate) struct Inner<K> {
     in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
     next_batch: u64,
+    /// The serial the next deferred request gets.
+    next_serial: u64,
     pub(crate) gate: GateState,
     held: Vec<Held>,
     /// The bytes of the bodies in `held`.
@@ -900,33 +944,44 @@ impl<K: Sink> Inner<K> {
         self.in_flight.contains(id)
     }
 
-    /// Records a deferred request; `None` when too many are in flight.
+    /// Records a deferred request: its cancel token and its serial; `None`
+    /// when too many are in flight.
     pub(crate) fn begin_deferred(
         &mut self,
         id: Id<'static>,
         batch: Option<u64>,
-    ) -> Option<CancelToken> {
+    ) -> Option<(CancelToken, u64)> {
         if self.in_flight.len() >= self.settings.max_in_flight {
             return None;
         }
         let token = CancelToken::new();
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1);
         let _fresh = self.in_flight.insert(
             id,
             InFlight {
                 token: token.clone(),
                 batch,
+                serial,
             },
         );
-        Some(token)
+        Some((token, serial))
     }
 
-    /// Answers a deferred request, if it is still in flight.
+    /// Answers a deferred request, if the one in flight under `id` is still
+    /// the one with `serial`: a responder of an earlier request that was
+    /// cancelled, whose id the peer has reused since, answers nothing.
     pub(crate) fn respond_deferred(
         &mut self,
         id: &Id<'static>,
+        serial: u64,
         result: Result<&Json<'_>, &ErrorObject>,
     ) -> Result<(), Error> {
-        match self.in_flight.remove(id) {
+        let current = self
+            .in_flight
+            .get(id)
+            .is_some_and(|request| request.serial == serial);
+        match current.then(|| self.in_flight.remove(id)).flatten() {
             Some(request) => self.respond(Some(id), request.batch, result),
             None if self.closed => Err(Error::Closed),
             None => Err(Error::AlreadyAnswered),

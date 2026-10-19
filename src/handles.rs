@@ -652,18 +652,34 @@ impl fmt::Debug for Canceller {
 /// ```
 pub struct Responder {
     id: Id<'static>,
+    /// Which request under `id` this answers (see `Inner::respond_deferred`).
+    serial: u64,
     token: CancelToken,
     link: Arc<dyn Link>,
     answered: bool,
 }
 
 impl Responder {
-    pub(crate) fn new(id: Id<'static>, token: CancelToken, link: Arc<dyn Link>) -> Self {
+    pub(crate) fn new(
+        id: Id<'static>,
+        serial: u64,
+        token: CancelToken,
+        link: Arc<dyn Link>,
+    ) -> Self {
         Self {
             id,
+            serial,
             token,
             link,
             answered: false,
+        }
+    }
+
+    /// The scope of the request this answers.
+    pub(crate) fn scope(&self) -> Scope {
+        Scope::Deferred {
+            id: self.id.clone(),
+            serial: self.serial,
         }
     }
 
@@ -777,8 +793,8 @@ impl Responder {
     ) -> Result<(), Error> {
         self.answered = true;
         match result {
-            Ok(value) => self.link.respond(&self.id, Ok(&value.into())),
-            Err(error) => self.link.respond(&self.id, Err(&error)),
+            Ok(value) => self.link.respond(&self.id, self.serial, Ok(&value.into())),
+            Err(error) => self.link.respond(&self.id, self.serial, Err(&error)),
         }
     }
 
@@ -841,9 +857,11 @@ impl Drop for Responder {
         };
         // Already answered (cancelled) or closed: there is no one left to
         // tell, which is the point of answering here.
-        let _settled = self
-            .link
-            .respond(&self.id, Err(&ErrorObject::internal_error(message)));
+        let _settled = self.link.respond(
+            &self.id,
+            self.serial,
+            Err(&ErrorObject::internal_error(message)),
+        );
     }
 }
 
@@ -861,7 +879,7 @@ impl Responder {
     pub fn notifier(&self) -> Notifier {
         Notifier {
             peer: self.peer(),
-            scope: Scope::Deferred(self.id.clone()),
+            scope: self.scope(),
         }
     }
 }

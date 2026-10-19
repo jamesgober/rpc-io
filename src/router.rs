@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -17,7 +17,7 @@ use crate::{
     framing::FrameError,
     handles::{Call, Peer, Responder},
     id::Id,
-    link::{Link, Scope},
+    link::{Link, Scope, Turn},
     raw::{Json, Raw},
 };
 
@@ -532,12 +532,12 @@ pub struct Context<'a> {
     stop: &'a mut bool,
     id: Option<&'a Id<'a>>,
     method: &'a str,
-    /// Whether the request is deferred (answered through a `Responder`).
-    deferred: bool,
+    /// For a deferred request (answered through a `Responder`), its serial.
+    deferred: Option<u64>,
     /// Set when a request answered by the handler's return value has its
     /// response written; made only if a scoped progress handle asks for it.
     /// A `OnceLock` rather than a `OnceCell`, so `Context` stays `Sync`.
-    turn: OnceLock<Arc<AtomicBool>>,
+    turn: OnceLock<Arc<Turn>>,
 }
 
 impl<'a> Context<'a> {
@@ -546,7 +546,7 @@ impl<'a> Context<'a> {
         stop: &'a mut bool,
         id: Option<&'a Id<'a>>,
         method: &'a str,
-        deferred: bool,
+        deferred: Option<u64>,
     ) -> Self {
         Self {
             link,
@@ -562,10 +562,12 @@ impl<'a> Context<'a> {
     /// it; `None` for a notification.
     pub(crate) fn scope(&self) -> Option<Scope> {
         let id = self.id?;
-        Some(if self.deferred {
-            Scope::Deferred(id.clone().into_owned())
-        } else {
-            Scope::Turn(Arc::clone(self.turn.get_or_init(Arc::default)))
+        Some(match self.deferred {
+            Some(serial) => Scope::Deferred {
+                id: id.clone().into_owned(),
+                serial,
+            },
+            None => Scope::Turn(Arc::clone(self.turn.get_or_init(|| Arc::new(Turn::new())))),
         })
     }
 
@@ -603,7 +605,7 @@ impl<'a> Context<'a> {
 
     /// The flag to set when the response is written, if a scoped handle
     /// took one.
-    pub(crate) fn take_turn(&mut self) -> Option<Arc<AtomicBool>> {
+    pub(crate) fn take_turn(&mut self) -> Option<Arc<Turn>> {
         self.turn.take()
     }
 
