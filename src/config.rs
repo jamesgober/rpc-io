@@ -12,6 +12,7 @@ use crate::{error_object::ErrorCode, limits::Limits};
 /// | `max_pending` | 1024 | our requests awaiting answers; one more evicts the oldest |
 /// | `max_in_flight` | 1024 | deferred requests being answered; more are refused with `overloaded_code` |
 /// | `max_held_bytes` | 4 MiB | messages this side sends while the gate is shut, held until it opens |
+/// | `max_batch_bytes` | 16 MiB | answers held until the rest of their batch is answered, over all open batches |
 /// | `request_timeout` | none | deadline for our requests that set none themselves |
 /// | `cancellation` | [`Cancellation::lsp`] | the cancel notification, both ways; `None` turns cancellation off |
 /// | `gate` | none | an opening request every other request must wait for |
@@ -47,6 +48,15 @@ pub struct Config {
     /// past it fails with [`Error::Backlog`](crate::Error::Backlog) and is
     /// not held.
     pub max_held_bytes: usize,
+    /// Most bytes of answers held for open batches. A batch is answered as
+    /// one array, so the answers to its other members wait while one of
+    /// them is deferred. An answer that would take the held bytes past this
+    /// is replaced by a short `overloaded_code` error under its id. A new
+    /// batch that arrives while the budget is spent, or while a batch with
+    /// such a replaced answer is still open, is refused whole with one
+    /// `overloaded_code` error under `null`, unhandled. So the held answers
+    /// stay within this budget plus one short error per member of a batch.
+    pub max_batch_bytes: usize,
     /// The deadline for our requests that do not set their own.
     pub request_timeout: Option<Duration>,
     /// How cancellation is spelled, or `None` for none.
@@ -89,6 +99,7 @@ impl Config {
             max_pending: 1024,
             max_in_flight: 1024,
             max_held_bytes: 4 * 1024 * 1024,
+            max_batch_bytes: 16 * 1024 * 1024,
             request_timeout: None,
             cancellation: Some(Cancellation::lsp()),
             gate: None,
@@ -137,6 +148,19 @@ impl Config {
     #[must_use]
     pub fn with_max_in_flight(mut self, count: usize) -> Self {
         self.max_in_flight = count;
+        self
+    }
+
+    /// Sets `max_batch_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(rpc_io::Config::new().with_max_batch_bytes(1 << 20).max_batch_bytes, 1 << 20);
+    /// ```
+    #[must_use]
+    pub fn with_max_batch_bytes(mut self, bytes: usize) -> Self {
+        self.max_batch_bytes = bytes;
         self
     }
 
@@ -251,7 +275,7 @@ impl Config {
 }
 
 impl Config {
-    /// An LSP server: [`Limits::lsp`], [`Cancellation::lsp`], and
+    /// An LSP server: [`Limits::lsp`] (batches off), [`Cancellation::lsp`], and
     /// [`Gate::lsp`]. A client leaves the gate out (`with_gate(None)`): the
     /// gate belongs on the side that receives `initialize`.
     ///

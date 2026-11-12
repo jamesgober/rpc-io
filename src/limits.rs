@@ -16,6 +16,7 @@ use jsonx_lib::Parser;
 /// | `max_headers` | 32 | header lines in one header section |
 /// | `max_batch` | 1024 | messages in one batch |
 /// | `max_skip_bytes` | `u64::MAX` | the announced length of an oversized Content-Length message that is still skipped; above it the connection is closed |
+/// | `max_id_bytes` | 1 KiB | one request or response id, as JSON text (quotes and escapes included) |
 /// | `json` | `jsonx_lib::Limits::new()` | depth 128, 16 MiB strings, 1 KiB numbers, 4 Mi values |
 ///
 /// The defaults suit a local peer over stdio (an editor, an agent host).
@@ -25,12 +26,12 @@ use jsonx_lib::Parser;
 /// memory. For peers across a network use [`Limits::network`] or
 /// [`Limits::strict`].
 ///
-/// | Preset | Messages | Headers | Batch | Skip | JSON depth / strings / values |
-/// |---|---:|---:|---:|---:|---|
-/// | [`new`](Limits::new), [`lsp`](Limits::lsp) | 64 MiB | 8 KiB, 32 | 1024 | any | 128 / 16 MiB / 4 Mi |
-/// | [`mcp`](Limits::mcp) | 64 MiB | 8 KiB, 32 | off | any | 128 / 16 MiB / 4 Mi |
-/// | [`network`](Limits::network) | 4 MiB | 4 KiB, 16 | 128 | 64 MiB | 64 / 1 MiB / 256 Ki |
-/// | [`strict`](Limits::strict) | 1 MiB | 2 KiB, 8 | 16 | 4 MiB | 32 / 256 KiB / 64 Ki |
+/// | Preset | Messages | Headers | Batch | Skip | Ids | JSON depth / strings / values |
+/// |---|---:|---:|---:|---:|---:|---|
+/// | [`new`](Limits::new) | 64 MiB | 8 KiB, 32 | 1024 | any | 1 KiB | 128 / 16 MiB / 4 Mi |
+/// | [`lsp`](Limits::lsp), [`mcp`](Limits::mcp) | 64 MiB | 8 KiB, 32 | off | any | 1 KiB | 128 / 16 MiB / 4 Mi |
+/// | [`network`](Limits::network) | 4 MiB | 4 KiB, 16 | 128 | 64 MiB | 256 B | 64 / 1 MiB / 256 Ki |
+/// | [`strict`](Limits::strict) | 1 MiB | 2 KiB, 8 | 16 | 4 MiB | 128 B | 32 / 256 KiB / 64 Ki |
 ///
 /// One field is a policy rather than a budget: `lenient_ids` (off in every
 /// preset) accepts the request ids JSON-RPC 2.0 allows but LSP and MCP
@@ -67,6 +68,13 @@ pub struct Limits {
     /// a peer that announces a huge body would otherwise keep the connection
     /// discarding its input for as long as it likes.
     pub max_skip_bytes: u64,
+    /// The longest id, as JSON text: the quotes and any escapes of a string
+    /// id count. A request whose id is longer is refused as invalid under a
+    /// `null` id before the id is copied anywhere, and a response whose id is
+    /// longer matches none of ours (which are short integers). Without it,
+    /// each deferred request in flight would keep its id, of up to the
+    /// string budget, until it is answered.
+    pub max_id_bytes: usize,
     /// The JSON parser's budgets (depth, string and number length, value
     /// count). Its `max_input_bytes` is ignored: `max_message_bytes` applies.
     pub json: jsonx_lib::Limits,
@@ -93,23 +101,27 @@ impl Limits {
             max_headers: 32,
             max_batch: 1024,
             max_skip_bytes: u64::MAX,
+            max_id_bytes: 1024,
             json: jsonx_lib::Limits::new(),
             lenient_ids: false,
         }
     }
 
-    /// LSP over stdio: the defaults. Editors send whole files (`didOpen`),
-    /// so messages may be large; batches are allowed, though LSP clients do
-    /// not send them.
+    /// LSP over stdio: the defaults with batches off. Editors send whole
+    /// files (`didOpen`), so messages may be large. LSP has no batches, so a
+    /// batch is refused at its `[` rather than buffering its answers;
+    /// `with_max_batch` turns them back on.
     ///
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(rpc_io::Limits::lsp(), rpc_io::Limits::new());
+    /// use rpc_io::Limits;
+    ///
+    /// assert_eq!(Limits::lsp(), Limits::new().without_batches());
     /// ```
     #[must_use]
     pub const fn lsp() -> Self {
-        Self::new()
+        Self::new().without_batches()
     }
 
     /// MCP over stdio: the defaults with batches off. MCP removed JSON-RPC
@@ -147,6 +159,7 @@ impl Limits {
             max_headers: 16,
             max_batch: 128,
             max_skip_bytes: 64 * 1024 * 1024,
+            max_id_bytes: 256,
             json: jsonx_lib::Limits::new()
                 .with_max_depth(64)
                 .with_max_string_bytes(1024 * 1024)
@@ -176,6 +189,7 @@ impl Limits {
             max_headers: 8,
             max_batch: 16,
             max_skip_bytes: 4 * 1024 * 1024,
+            max_id_bytes: 128,
             json: jsonx_lib::Limits::new()
                 .with_max_depth(32)
                 .with_max_string_bytes(256 * 1024)
@@ -288,6 +302,26 @@ impl Limits {
     #[must_use]
     pub const fn with_lenient_ids(mut self, lenient: bool) -> Self {
         self.lenient_ids = lenient;
+        self
+    }
+
+    /// Sets `max_id_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rpc_io::{decode, Incoming, Limits};
+    ///
+    /// let limits = Limits::new().with_max_id_bytes(8);
+    /// let body = br#"{"jsonrpc":"2.0","id":"a-long-id","method":"m"}"#;
+    /// let Incoming::Single(Err(refused)) = decode(body, &limits) else {
+    ///     panic!("a long id was accepted");
+    /// };
+    /// assert_eq!(refused.id(), None);
+    /// ```
+    #[must_use]
+    pub const fn with_max_id_bytes(mut self, bytes: usize) -> Self {
+        self.max_id_bytes = bytes;
         self
     }
 

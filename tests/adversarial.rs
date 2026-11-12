@@ -263,3 +263,126 @@ fn test_header_terminator_counts_against_the_budget_however_the_input_is_split()
         assert_eq!(frames, [b"x".to_vec()], "chunk {chunk}");
     }
 }
+
+/// Review 0.4 F-1: a string id had no budget of its own, and each deferred
+/// request in flight kept two copies of it. A long id is now refused under
+/// `null` before any copy, and the handler never runs.
+#[test]
+fn test_overlong_request_id_is_refused_before_it_is_kept() {
+    let router = Router::new().deferred("work", |held: &mut Vec<Responder>, _, _, r| {
+        held.push(r);
+    });
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, Vec::new());
+    let long = "x".repeat(Limits::new().max_id_bytes);
+    let body = format!(r#"{{"jsonrpc":"2.0","id":"{long}","method":"work"}}"#);
+    assert!(e.handle(body.as_bytes()).is_ok());
+    let out: Vec<String> = rx.try_iter().collect();
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].starts_with(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600"#),
+        "{}",
+        out[0]
+    );
+    assert!(e.state_mut().is_empty(), "the handler ran");
+    assert_eq!(e.stats().in_flight, 0);
+    // An id at the limit (as JSON text, quotes included) is accepted.
+    let fits = "y".repeat(Limits::new().max_id_bytes - 2);
+    let body = format!(r#"{{"jsonrpc":"2.0","id":"{fits}","method":"work"}}"#);
+    assert!(e.handle(body.as_bytes()).is_ok());
+    assert_eq!(e.stats().in_flight, 1);
+    // The network preset is tighter.
+    assert!(Limits::network().max_id_bytes < Limits::new().max_id_bytes);
+}
+
+/// Review 0.4 F-2: a batch's answers waited for its slowest deferred member
+/// with no byte budget, so 164 KiB of input held 128 MiB. The answers held
+/// for open batches are now bounded by `Config::max_batch_bytes`: past it a
+/// member is answered with a short error, and a new batch is refused whole.
+#[test]
+fn test_open_batches_hold_at_most_max_batch_bytes() {
+    const BUDGET: usize = 256 * 1024;
+    let big = "y".repeat(32 * 1024);
+    let router = Router::new()
+        .deferred("slow", |held: &mut Vec<Responder>, _, _, r| held.push(r))
+        .request("get", move |_, _, _| Ok(big.clone()));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, Vec::new()).with_config(
+        Config::new()
+            .with_limits(Limits::network())
+            .with_max_batch_bytes(BUDGET),
+    );
+    let batch = |b: usize| {
+        let mut body = format!(r#"[{{"jsonrpc":"2.0","id":"s{b}","method":"slow"}}"#);
+        for i in 0..127 {
+            body.push_str(&format!(r#",{{"jsonrpc":"2.0","id":{i},"method":"get"}}"#));
+        }
+        body.push(']');
+        body
+    };
+    // The first batch fills the budget and stays open behind `slow`.
+    assert!(e.handle(batch(0).as_bytes()).is_ok());
+    assert_eq!(rx.try_iter().count(), 0);
+    // Every later batch is refused whole, at once, with one error.
+    for b in 1..8 {
+        assert!(e.handle(batch(b).as_bytes()).is_ok());
+        let out: Vec<String> = rx.try_iter().collect();
+        assert_eq!(out.len(), 1, "batch {b}");
+        assert!(
+            out[0].contains(r#""id":null,"error":{"code":-32000"#),
+            "{}",
+            out[0]
+        );
+    }
+    assert_eq!(e.state_mut().len(), 1, "refused batches were handled");
+    // Answering `slow` sends the first batch: within the budget plus one
+    // short error per member past it.
+    let slow = e.state_mut().pop();
+    assert!(slow.is_some_and(|r| r.ok("done").is_ok()));
+    let out: Vec<String> = rx.try_iter().collect();
+    assert_eq!(out.len(), 1);
+    assert!(out[0].len() < BUDGET + 128 * 160, "{} bytes", out[0].len());
+    assert!(out[0].contains("too large to hold"));
+    // With the batch sent, the budget is free again.
+    assert!(e.handle(batch(9).as_bytes()).is_ok());
+    assert_eq!(rx.try_iter().count(), 0);
+    assert_eq!(e.state_mut().len(), 1);
+}
+
+/// Review 0.4 F-4: a malformed message that reused the id of a request still
+/// being answered was answered under that id, and with a gate that error was
+/// taken as the opening request's failure. It is now refused under `null`.
+#[test]
+fn test_invalid_message_reusing_an_in_flight_id_is_answered_under_null() {
+    let router = Router::new()
+        .deferred("initialize", |held: &mut Vec<Responder>, _, _, r| {
+            held.push(r)
+        })
+        .request("hover", |_, _, _| Ok("ok"));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut e = Endpoint::new(tx, router, Vec::new())
+        .with_config(Config::new().with_gate(Some(Gate::new("initialize"))));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+            .is_ok()
+    );
+    assert!(
+        e.handle(br#"{"jsonrpc":"1.0","id":1,"method":"anything"}"#)
+            .is_ok()
+    );
+    let responder = e.state_mut().pop();
+    assert!(responder.is_some_and(|r| r.ok("initialized").is_ok()));
+    assert!(
+        e.handle(br#"{"jsonrpc":"2.0","id":2,"method":"hover"}"#)
+            .is_ok()
+    );
+    let out: Vec<String> = rx.try_iter().collect();
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(
+        out[0].contains(r#""id":null,"error":{"code":-32600"#),
+        "{}",
+        out[0]
+    );
+    assert_eq!(out[1], r#"{"jsonrpc":"2.0","id":1,"result":"initialized"}"#);
+    assert_eq!(out[2], r#"{"jsonrpc":"2.0","id":2,"result":"ok"}"#);
+}

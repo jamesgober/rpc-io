@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     fmt,
     io::{self, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -62,6 +62,7 @@ pub struct Connection {
 /// | `config` | [`Config::new`] with [`Limits::network`] | every endpoint's settings |
 /// | `queue` | [`QueueLimits::new`] with 8 MiB and 4,096 messages | every connection's outgoing queue |
 /// | `max_connections` | 256 | connections served at once; the next is not accepted until one ends |
+/// | `max_connections_per_address` | 32 | TCP connections open at once from one peer IP address; one more is closed at accept |
 /// | `message_timeout` | 30 s | how long a message may take to arrive once it has begun, and a new connection to send its first one |
 /// | `idle_timeout` | 300 s | how long a connection may stay idle: no traffic either way, and nothing outstanding the peer cannot stretch (see [`Server::with_idle_timeout`]) |
 ///
@@ -70,12 +71,19 @@ pub struct Connection {
 /// connection ends. So is the time a connection can hold a slot without
 /// doing anything: a connection that does not complete a message within
 /// `message_timeout` of starting it (or of connecting), or stays idle (no
-/// traffic either way and nothing in flight) for `idle_timeout`, is closed. The message deadline is per
+/// traffic either way and nothing in flight) for `idle_timeout`, is closed.
+/// Only a whole message, or our own traffic, makes a connection active again:
+/// bytes that form no message (a blank line) do not. The message deadline is per
 /// message: it starts with the read that brings a message's first bytes and
 /// restarts each time a message completes, so a client streaming messages
 /// back to back is never cut off, while one message trickled in forever is.
 /// A few silent or trickling sockets therefore delay other clients by at
-/// most `message_timeout`; they cannot lock them out. Each connection costs a reader thread, a writer
+/// most `message_timeout`; they cannot lock them out. A peer that sends a
+/// real message every idle period can keep a connection, as any client can,
+/// so one peer IP address may hold at most `max_connections_per_address` of
+/// the slots. That does not stop many addresses: an internet-facing `Server`
+/// still needs a connection limiter in front of it, and, for credentials, a
+/// TLS front end. Each connection costs a reader thread, a writer
 /// thread, and, once a request with a deadline is sent on it, a timer thread.
 /// The defaults bound a connection's memory to about a 4 MiB message (and
 /// the value tree a handler parses from it) plus an 8 MiB queue; raise them
@@ -128,6 +136,7 @@ pub struct Server {
     config: Config,
     queue: QueueLimits,
     max_connections: usize,
+    max_per_address: Option<usize>,
     deadlines: Deadlines,
     shared: Arc<Shared>,
 }
@@ -156,6 +165,10 @@ struct State {
     wake: Option<Box<dyn Fn() + Send>>,
     /// Shuts each open connection down.
     open: BTreeMap<u64, Box<dyn Fn() + Send>>,
+    /// Open connections per peer IP address (TCP only).
+    per_address: BTreeMap<IpAddr, usize>,
+    /// The peer IP address of each open TCP connection.
+    addresses: BTreeMap<u64, IpAddr>,
 }
 
 impl Shared {
@@ -184,6 +197,14 @@ impl Shared {
             let mut state = self.lock();
             state.active = state.active.saturating_sub(1);
             let _shut = state.open.remove(&id);
+            if let Some(ip) = state.addresses.remove(&id) {
+                if let Some(count) = state.per_address.get_mut(&ip) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        let _gone = state.per_address.remove(&ip);
+                    }
+                }
+            }
         }
         self.changed.notify_all();
     }
@@ -411,6 +432,10 @@ fn serve_connection<T: Stream, S>(
             // own `message_timeout` runs from there.
             done = finished;
             busy_since = endpoint.mid_message().then_some(last_read);
+            // Only a whole message makes the connection active again: bytes
+            // that form none (a blank line, a partial message) do not, or one
+            // byte per idle period would hold the slot forever.
+            last_active = last_active.max(last_read);
         } else if endpoint.mid_message() {
             // Part of a message: due `message_timeout` after its first bytes.
             busy_since = busy_since.or(Some(last_read));
@@ -431,7 +456,6 @@ fn serve_connection<T: Stream, S>(
             sent = stats.bodies_out;
             last_active = now;
         }
-        last_active = last_active.max(last_read);
         let deadline = match busy_since {
             Some(since) => deadlines.message.and_then(|t| since.checked_add(t)),
             None if working => deadlines
@@ -505,6 +529,7 @@ impl Server {
                 .with_max_bytes(8 * 1024 * 1024)
                 .with_max_messages(4096),
             max_connections: 256,
+            max_per_address: Some(32),
             deadlines: Deadlines {
                 message: Some(Duration::from_secs(30)),
                 idle: Some(Duration::from_secs(300)),
@@ -636,6 +661,40 @@ impl Server {
     pub fn with_max_connections(mut self, count: usize) -> Self {
         self.max_connections = count.max(1);
         self
+    }
+
+    /// Sets how many TCP connections one peer IP address may have open at
+    /// once (`None`: no limit; `Some(0)` counts as one). A connection past it
+    /// is closed as soon as it is accepted, without blocking the accept loop.
+    /// The default is 32, so a single address cannot take every one of the
+    /// 256 default slots.
+    ///
+    /// Behind a proxy or a load balancer every connection comes from the
+    /// proxy's address: raise or remove the limit there, and limit per client
+    /// in the proxy. Unix domain sockets have no peer address and are not
+    /// limited.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let server = rpc_io::Server::new(rpc_io::Framing::Newline).with_max_connections_per_address(Some(4));
+    /// assert_eq!(server.max_connections_per_address(), Some(4));
+    /// assert_eq!(rpc_io::Server::new(rpc_io::Framing::Newline).max_connections_per_address(), Some(32));
+    /// ```
+    #[must_use]
+    pub fn with_max_connections_per_address(mut self, count: Option<usize>) -> Self {
+        self.max_per_address = count.map(|count| count.max(1));
+        self
+    }
+
+    /// How many TCP connections one peer IP address may have open at once.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_max_connections_per_address`](Server::with_max_connections_per_address).
+    #[must_use]
+    pub fn max_connections_per_address(&self) -> Option<usize> {
+        self.max_per_address
     }
 
     /// Every endpoint's settings.
@@ -847,6 +906,12 @@ impl Server {
                 // The stopper's own wake-up connection, or one that raced it.
                 break Ok(());
             }
+            let ip = addr.parse::<SocketAddr>().ok().map(|addr| addr.ip());
+            if !self.admit_address(next, ip) {
+                event!(warn, address = %addr, "a connection over the per-address limit was closed");
+                drop(stream);
+                continue;
+            }
             let connection = Connection { id: next, addr };
             next = next.wrapping_add(1);
             let (router, state) = connect(&connection);
@@ -893,6 +958,22 @@ impl Server {
                 .0;
         }
         !state.stopped
+    }
+
+    /// Counts connection `id` against its peer address; `false` (and not
+    /// counted) when that address already has `max_per_address` open.
+    fn admit_address(&self, id: u64, ip: Option<IpAddr>) -> bool {
+        let (Some(ip), Some(max)) = (ip, self.max_per_address) else {
+            return true;
+        };
+        let mut state = self.shared.lock();
+        let count = state.per_address.entry(ip).or_insert(0);
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        let _fresh = state.addresses.insert(id, ip);
+        true
     }
 
     /// Waits until fewer than `max_connections` are open; `false` once
@@ -978,6 +1059,7 @@ impl fmt::Debug for Server {
             .field("config", &self.config)
             .field("queue", &self.queue)
             .field("max_connections", &self.max_connections)
+            .field("max_connections_per_address", &self.max_per_address)
             .field("message_timeout", &self.deadlines.message)
             .field("idle_timeout", &self.deadlines.idle)
             .field("connections", &self.connections())

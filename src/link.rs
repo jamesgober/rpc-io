@@ -162,6 +162,8 @@ impl<K: Sink> Shared<K> {
                 pending: Pending::new(config.max_pending),
                 in_flight: IdMap::default(),
                 batches: BTreeMap::new(),
+                batch_bytes: 0,
+                batches_over: 0,
                 next_batch: 0,
                 next_serial: 0,
                 gate: if config.gate.is_some() {
@@ -294,6 +296,7 @@ pub(crate) struct Settings {
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) max_in_flight: usize,
     pub(crate) max_held_bytes: usize,
+    pub(crate) max_batch_bytes: usize,
     pub(crate) timer: bool,
     pub(crate) omit_null_id: bool,
     pub(crate) overloaded_code: ErrorCode,
@@ -306,6 +309,7 @@ impl From<&Config> for Settings {
             request_timeout: config.request_timeout,
             max_in_flight: config.max_in_flight,
             max_held_bytes: config.max_held_bytes,
+            max_batch_bytes: config.max_batch_bytes,
             timer: config.timer,
             omit_null_id: config.omit_null_id,
             overloaded_code: config.overloaded_code,
@@ -493,6 +497,8 @@ impl<V> IdMap<V> {
 struct Batch {
     remaining: usize,
     body: String,
+    /// Whether an answer in it was replaced because of `max_batch_bytes`.
+    over: bool,
 }
 
 /// A message held back until the gate opens.
@@ -529,6 +535,12 @@ pub(crate) struct Inner<K> {
     pending: Pending<Waiter>,
     in_flight: IdMap<InFlight>,
     batches: BTreeMap<u64, Batch>,
+    /// The bytes of the bodies in `batches`: answers waiting for the rest of
+    /// their batch.
+    batch_bytes: usize,
+    /// Open batches with an answer replaced for `max_batch_bytes`: while any
+    /// is open, new batches are refused.
+    batches_over: usize,
     next_batch: u64,
     /// The serial the next deferred request gets.
     next_serial: u64,
@@ -697,6 +709,8 @@ impl<K: Sink> Inner<K> {
             request.token.cancel();
         }
         self.batches.clear();
+        self.batch_bytes = 0;
+        self.batches_over = 0;
         self.held.clear();
         self.held_requests.clear();
         self.held_bytes = 0;
@@ -903,6 +917,32 @@ impl<K: Sink> Inner<K> {
         }
         self.scratch.clear();
         write_response(&mut self.scratch, id, result, self.settings.omit_null_id);
+        let over_budget =
+            self.batch_bytes.saturating_add(self.scratch.len()) > self.settings.max_batch_bytes;
+        if let Some(open) = batch
+            .and_then(|batch| self.batches.get_mut(&batch))
+            .filter(|_| over_budget)
+        {
+            // Held until the rest of its batch is answered, this answer would
+            // take the open batches past their budget: a short refusal under
+            // the same id goes in its place.
+            if !open.over {
+                open.over = true;
+                self.batches_over += 1;
+            }
+            bump(&mut self.stats.errors_out);
+            let error = ErrorObject::new(
+                self.settings.overloaded_code,
+                "the response is too large to hold until its batch is answered",
+            );
+            self.scratch.clear();
+            write_response(
+                &mut self.scratch,
+                id,
+                Err(&error),
+                self.settings.omit_null_id,
+            );
+        }
         let opening = match (&self.gate, id) {
             (GateState::Opening(opening), Some(id)) => opening == id,
             _ => false,
@@ -924,10 +964,12 @@ impl<K: Sink> Inner<K> {
             return Ok(());
         };
         if with_response {
+            let before = open.body.len();
             if open.body.len() > 1 {
                 open.body.push(',');
             }
             open.body.push_str(&self.scratch);
+            self.batch_bytes = self.batch_bytes.saturating_add(open.body.len() - before);
         }
         open.remaining = open.remaining.saturating_sub(1);
         if open.remaining > 0 {
@@ -936,6 +978,13 @@ impl<K: Sink> Inner<K> {
         let Some(mut done) = self.batches.remove(&batch) else {
             return Ok(());
         };
+        // `[` was never counted.
+        self.batch_bytes = self
+            .batch_bytes
+            .saturating_sub(done.body.len().saturating_sub(1));
+        if done.over {
+            self.batches_over = self.batches_over.saturating_sub(1);
+        }
         if done.body.len() == 1 {
             // Every request in it was cancelled without a reply.
             return Ok(());
@@ -977,8 +1026,13 @@ impl<K: Sink> Inner<K> {
         }
     }
 
-    /// Opens a batch that owes `answers` responses.
-    pub(crate) fn open_batch(&mut self, answers: usize) -> u64 {
+    /// Opens a batch that owes `answers` responses; `None` when the open
+    /// batches already hold `max_batch_bytes` of answers, or one of them has
+    /// had an answer replaced for it.
+    pub(crate) fn open_batch(&mut self, answers: usize) -> Option<u64> {
+        if self.batch_bytes >= self.settings.max_batch_bytes || self.batches_over > 0 {
+            return None;
+        }
         let id = self.next_batch;
         self.next_batch = self.next_batch.wrapping_add(1);
         let _fresh = self.batches.insert(
@@ -986,9 +1040,10 @@ impl<K: Sink> Inner<K> {
             Batch {
                 remaining: answers,
                 body: String::from("["),
+                over: false,
             },
         );
-        id
+        Some(id)
     }
 
     /// Whether a deferred request with this id is being answered.

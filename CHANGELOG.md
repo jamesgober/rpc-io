@@ -11,13 +11,61 @@
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] - 2026-11-12
+
+Bounds on three things a peer could make an endpoint or a `Server` hold
+without limit, found by an independent review of 0.4.0. See
+[`docs/release/v0.5.0.md`](./docs/release/v0.5.0.md).
+
 ### Added
+
+- `Limits::max_id_bytes` and `Limits::with_max_id_bytes`: the longest request
+  or response id, as JSON text. 1 KiB by default, 256 B in `Limits::network()`,
+  128 B in `Limits::strict()`.
+- `Config::max_batch_bytes` and `Config::with_max_batch_bytes`: the answers
+  held for open batches, 16 MiB by default.
+- `Server::with_max_connections_per_address` and
+  `Server::max_connections_per_address`: TCP connections one peer IP address
+  may have open at once, 32 by default.
 
 ### Changed
 
+- `Limits::lsp()` (and so `Config::lsp()`) turns batches off. LSP has no
+  batches; `with_max_batch` turns them back on.
+
 ### Fixed
 
+- A malformed message that reused the id of a request still being answered by
+  a deferred handler was answered under that id, so the peer saw two answers
+  for it, and with a gate the error was taken as the opening request's
+  failure. It is now refused under `null`, as a valid duplicate already was.
+
 ### Security
+
+- **Request ids had no length limit.** An id was bounded only by the string
+  budget (16 MiB by default, 1 MiB under `Limits::network()`), and each
+  deferred request in flight keeps two copies of its id until it is answered:
+  1,024 requests with 1 MiB ids held 2 GiB. A longer id than `max_id_bytes`
+  is now refused under `null` before it is copied, and the handler does not
+  run.
+- **A batch's answers had no byte limit.** A batch is answered as one array,
+  so the answers to its other members waited for its slowest deferred member,
+  outside every other budget: 164 KiB of input held 128 MiB. The held answers
+  are now bounded by `max_batch_bytes`. An answer past it is replaced by a
+  short `overloaded_code` error under its id, and a batch that arrives while
+  the budget is spent, or while such a batch is open, is refused whole with
+  one `overloaded_code` error.
+- **One message, then a byte per idle period, held a `Server` slot
+  forever.** After the first message, any bytes restarted the idle clock,
+  including a blank line that forms no message. Only whole messages and our
+  own traffic count now. Because a client that sends a real message every
+  idle period can still keep its connection, one peer IP address may now hold
+  at most `max_connections_per_address` slots, and an extra connection is
+  closed at accept instead of blocking the accept loop. The README and the
+  `Server` docs say that an internet-facing `Server` still needs a connection
+  limiter in front of it.
 
 ---
 
@@ -178,7 +226,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/rpc-io/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rpc-io/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/rpc-io/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/rpc-io/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/rpc-io/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/rpc-io/compare/v0.1.0...v0.2.0
