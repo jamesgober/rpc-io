@@ -525,3 +525,109 @@ fn test_a_client_cannot_hold_a_connection_through_a_request_that_waits_on_it() {
     stopper.stop();
     assert!(serving.join().is_ok_and(|served| served.is_ok()));
 }
+
+#[test]
+fn test_a_byte_per_idle_period_does_not_hold_a_slot() {
+    // Review 0.4 F-3: after one message, any byte reset the idle clock, so a
+    // blank line per idle period held a slot forever. Only whole messages
+    // and our own traffic count now.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline)
+        .with_max_connections(1)
+        .with_message_timeout(Some(Duration::from_secs(1)))
+        .with_idle_timeout(Some(Duration::from_secs(2)));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new()
+                    .request("ping", |_: &mut (), _, _| Ok("pong"))
+                    .notification("hello", |_: &mut (), _, _| {}),
+                (),
+            )
+        })
+    });
+    let (mut attacker, mut attacker_reader) = connect(addr);
+    assert!(
+        attacker
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"hello\"}\n")
+            .is_ok()
+    );
+    // One blank line every 500 ms for 6 s: three idle periods.
+    let started = Instant::now();
+    let mut held = true;
+    while started.elapsed() < Duration::from_secs(6) {
+        if attacker.write_all(b"\n").is_err() {
+            held = false;
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    if held {
+        let _timeout = attacker_reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)));
+        held = !closed(&mut attacker_reader);
+    }
+    assert!(!held, "the trickling connection kept its slot");
+    let (mut client, mut reader) = connect(addr);
+    let answer = ask(
+        &mut client,
+        &mut reader,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+    );
+    assert_eq!(
+        answer,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n"
+    );
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}
+
+#[test]
+fn test_one_address_cannot_take_every_slot() {
+    // Review 0.4 F-3: the slot count was global, so one address could hold
+    // every slot. Past the per-address limit a connection is closed at once
+    // and the accept loop keeps serving others.
+    let (listener, addr) = listener();
+    let server = Server::new(Framing::Newline)
+        .with_max_connections(8)
+        .with_max_connections_per_address(Some(2));
+    let stopper = server.stopper();
+    let serving = thread::spawn(move || {
+        server.serve_tcp(listener, |_| {
+            (
+                Router::new().request("ping", |_: &mut (), _, _| Ok("pong")),
+                (),
+            )
+        })
+    });
+    let ping = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let pong = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}\n";
+    let (mut a, mut a_reader) = connect(addr);
+    let (mut b, mut b_reader) = connect(addr);
+    assert_eq!(ask(&mut a, &mut a_reader, ping), pong);
+    assert_eq!(ask(&mut b, &mut b_reader, ping), pong);
+    // A third from the same address is closed unserved.
+    let (mut c, mut c_reader) = connect(addr);
+    let _sent = c.write_all(format!("{ping}\n").as_bytes());
+    assert!(closed(&mut c_reader));
+    // When one ends, the address may connect again.
+    drop((a, a_reader));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let served = loop {
+        let (mut d, mut d_reader) = connect(addr);
+        let _sent = d.write_all(format!("{ping}\n").as_bytes());
+        let mut line = String::new();
+        if d_reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+            break line == pong;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(served);
+    stopper.stop();
+    assert!(serving.join().is_ok_and(|served| served.is_ok()));
+}

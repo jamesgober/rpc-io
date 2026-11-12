@@ -214,7 +214,7 @@ fn test_gate_presets_and_allowed_requests() {
 #[test]
 fn test_limits_presets_are_ordered() {
     let (default, network, strict) = (Limits::new(), Limits::network(), Limits::strict());
-    assert_eq!(Limits::lsp(), default);
+    assert_eq!(Limits::lsp(), default.without_batches());
     assert_eq!(Limits::mcp().max_batch, 0);
     for (a, b) in [(default, network), (network, strict)] {
         assert!(a.max_message_bytes > b.max_message_bytes);

@@ -226,6 +226,7 @@ With the `net` feature. An accept loop: one [`Endpoint`](#endpoint) per connecti
 |---|---|
 | `new(framing) -> Self` | Defaults for untrusted peers: `Config::new()` with `Limits::network()` (4 MiB messages), `QueueLimits::new()` with 8 MiB and 4,096 messages, 256 connections, a 30 s message timeout, a 300 s idle timeout. |
 | `with_config(self, config)`, `with_queue(self, limits)`, `with_max_connections(self, n)` | Settings for every connection; `max_connections` is at least 1. |
+| `with_max_connections_per_address(self, Option<usize>)`, `max_connections_per_address(&self)` | *(0.5)* TCP connections one peer IP address may have open at once (default 32; `None` is no limit). One more is closed as soon as it is accepted, without blocking the loop. Behind a proxy every connection has the proxy's address: raise or remove the limit there. |
 | `with_message_timeout(self, Option<Duration>)`, `with_idle_timeout(self, Option<Duration>)` | How long a message may take to arrive once its first bytes have (and a new connection to send its first message); how long a connection may stay idle: no traffic either way, no request of ours awaiting the peer within its timeout, and no deferred request of the peer's being answered while nothing of ours waits on the peer without a timeout (one of ours sent without a timeout never counts, and suspends the count of the peer's own requests, whose handler may be waiting on its answer: a peer cannot hold a slot by never answering, and a client slower than `idle_timeout` to answer such a request, a slow MCP `sampling/createMessage` for example, is disconnected unless the request has a timeout of its own; long-lived LSP or MCP sessions may want `None`). `None` is no limit. A connection past either is closed. |
 | `config(&self) -> &Config`, `queue(&self) -> QueueLimits`, `message_timeout(&self)`, `idle_timeout(&self)` | The settings. |
 | `max_connections(&self)`, `connections(&self)` | The bound, and connections served now. |
@@ -233,7 +234,7 @@ With the `net` feature. An accept loop: one [`Endpoint`](#endpoint) per connecti
 | `serve_tcp(&self, TcpListener, connect)` | Serves until stopped; `connect: FnMut(&Connection) -> (Router<S>, S)` runs once per connection. |
 | `serve_unix(&self, UnixListener, connect)` | The same over a Unix domain socket (Unix only). |
 
-At `max_connections` the loop stops accepting (the system queues further connections) until one ends. A connection that leaves a message unfinished past `message_timeout` (a per-message clock, started by the read that brings the message's first bytes and restarted when it completes, so back-to-back streaming is never cut off), or stays idle past `idle_timeout`, is closed, so silent or trickling sockets delay other clients by at most `message_timeout` and cannot lock them out. A read that times out closes the connection; the socket is not read again. Each connection's socket gets the queue's `write_timeout` as its write timeout, and a failed write shuts the connection down. A connection costs a reader thread, a writer thread, and, once a request with a deadline is sent on it, a timer thread. `Stopper::stop` stops accepting, shuts every open connection down (the peers see the stream end), and the serve call returns once every connection's thread has finished. `Connection` (`#[non_exhaustive]`) has `id` (counted from 0) and `addr`; the example below uses it, and the `Stopper`. **Errors:** the I/O error that ended the accept loop. Aborted and reset connections are skipped; running out of descriptors, buffers, or memory pauses the loop (10 ms, doubling to 1 s), and it carries on.
+At `max_connections` the loop stops accepting (the system queues further connections) until one ends. A connection that leaves a message unfinished past `message_timeout` (a per-message clock, started by the read that brings the message's first bytes and restarted when it completes, so back-to-back streaming is never cut off), or stays idle past `idle_timeout`, is closed, so silent or trickling sockets delay other clients by at most `message_timeout` and cannot lock them out. Only a whole message or our own traffic counts as activity: bytes that form no message (a blank line) do not restart the idle clock *(0.5)*. A client that sends a real message every idle period keeps its connection, so one address holds at most `max_connections_per_address` slots; an internet-facing `Server` still needs a connection limiter in front of it. A read that times out closes the connection; the socket is not read again. Each connection's socket gets the queue's `write_timeout` as its write timeout, and a failed write shuts the connection down. A connection costs a reader thread, a writer thread, and, once a request with a deadline is sent on it, a timer thread. `Stopper::stop` stops accepting, shuts every open connection down (the peers see the stream end), and the serve call returns once every connection's thread has finished. `Connection` (`#[non_exhaustive]`) has `id` (counted from 0) and `addr`; the example below uses it, and the `Stopper`. **Errors:** the I/O error that ended the accept loop. Aborted and reset connections are skipped; running out of descriptors, buffers, or memory pauses the loop (10 ms, doubling to 1 s), and it carries on.
 
 ```rust
 #[cfg(not(feature = "net"))] fn main() {}
@@ -758,6 +759,7 @@ fn main() -> Result<(), rpc_io::Error> {
 | `max_pending` | 1024 | Our requests awaiting answers; one more evicts the oldest (`CallError::Evicted`). |
 | `max_in_flight` | 1024 | Deferred requests being answered; more are refused with `-32000`. |
 | `max_held_bytes` | 4 MiB | Messages this side sends while the gate is shut; more fail with `Error::Backlog`. |
+| `max_batch_bytes` | 16 MiB | *(0.5)* Answers held until the rest of their batch is answered, over all open batches. An answer past it is replaced by a short `overloaded_code` error under its id; a new batch that arrives while it is spent, or while a batch with such an answer is open, is refused whole with one `overloaded_code` error under `null`. |
 | `request_timeout` | none | Deadline for requests that set none. |
 | `cancellation` | `Some(Cancellation::lsp())` | How cancellation is spelled; `None` turns it off (the notification then reaches handlers). |
 | `gate` | none | An opening request every other request waits for. |
@@ -767,7 +769,7 @@ fn main() -> Result<(), rpc_io::Error> {
 
 Presets:
 
-- `Config::lsp()`: an LSP server. `Limits::lsp()`, `Cancellation::lsp()`, `Gate::lsp()`. A client leaves the gate out (`with_gate(None)`).
+- `Config::lsp()`: an LSP server. `Limits::lsp()` (batches off, *0.5*), `Cancellation::lsp()`, `Gate::lsp()`. A client leaves the gate out (`with_gate(None)`).
 - `Config::mcp()`: MCP as of its current revision, 2026-07-28, for a server or a client. `Limits::mcp()` (batches off), `Cancellation::mcp()`, **no gate** (the protocol is stateless: every request carries its protocol version in `_meta`, and there is no `initialize`), `omit_null_id`, and `overloaded_code` `-32603`. This is also the preset of a dual-era server: the specification has such a server pick each request's semantics from the request itself (an `initialize` selects the legacy ones), which belongs to the protocol layer above.
 - `Config::mcp_legacy()`: a server for MCP's legacy revisions only (2025-11-25 and earlier): `Config::mcp()` plus `Gate::mcp()`. Modern clients never send `initialize`, so it refuses all their requests.
 
@@ -835,13 +837,14 @@ fn main() -> Result<(), rpc_io::Error> {
 | `max_headers` | 32 | Header lines in one section. |
 | `max_batch` | 1024 | Messages in one batch; `0` turns batches off (`without_batches()`). |
 | `max_skip_bytes` | `u64::MAX` | The largest announced length of an oversized Content-Length body still skipped; above it the connection closes (`FrameError::TooLargeToSkip`). |
+| `max_id_bytes` | 1 KiB | *(0.5)* One request or response id, as JSON text (quotes and escapes included). A request with a longer id is refused with `-32600` under `null` before the id is copied; a response with one matches none of ours. 256 B in `network()`, 128 B in `strict()`. |
 | `json` | `jsonx_lib::Limits::new()` | Depth 128, 16 MiB strings, 1 KiB numbers, 4 Mi values; its `max_input_bytes` is replaced by `max_message_bytes`. |
 | `lenient_ids` | `false` | A policy, not a budget: accept `null` and non-`i64` numeric request ids (see [Ids](#ids)); off in every preset. |
 
 | Preset | Messages | Headers | Batch | Skip | JSON depth / strings / numbers / values |
 |---|---:|---:|---:|---:|---|
-| `new()`, `lsp()` | 64 MiB | 8 KiB, 32 | 1024 | any | 128 / 16 MiB / 1 KiB / 4 Mi |
-| `mcp()` | 64 MiB | 8 KiB, 32 | off | any | 128 / 16 MiB / 1 KiB / 4 Mi |
+| `new()` | 64 MiB | 8 KiB, 32 | 1024 | any | 128 / 16 MiB / 1 KiB / 4 Mi |
+| `lsp()`, `mcp()` | 64 MiB | 8 KiB, 32 | off | any | 128 / 16 MiB / 1 KiB / 4 Mi |
 | `network()` | 4 MiB | 4 KiB, 16 | 128 | 64 MiB | 64 / 1 MiB / 128 B / 256 Ki |
 | `strict()` | 1 MiB | 2 KiB, 8 | 16 | 4 MiB | 32 / 256 KiB / 64 B / 64 Ki |
 

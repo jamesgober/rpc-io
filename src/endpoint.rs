@@ -445,7 +445,27 @@ impl<S, K: Sink> Endpoint<S, K> {
             Incoming::Single(entry) => self.dispatch(entry, None, &mut stop),
             Incoming::Batch(entries) => {
                 let owed = entries.iter().filter(|entry| owes_response(entry)).count();
-                let batch = (owed > 0).then(|| self.shared.lock().open_batch(owed));
+                let batch = if owed > 0 {
+                    let mut inner = self.shared.lock();
+                    match inner.open_batch(owed) {
+                        Some(batch) => Some(batch),
+                        None => {
+                            // The open batches already hold `max_batch_bytes`
+                            // of answers: refused whole, unhandled, as an
+                            // over-long batch is.
+                            let error = ErrorObject::new(
+                                inner.settings.overloaded_code,
+                                "too many batch responses are already waiting",
+                            );
+                            let _reported = inner.respond(None, None, Err(&error));
+                            drop(inner);
+                            self.end_turn()?;
+                            return Ok(Flow::Continue);
+                        }
+                    }
+                } else {
+                    None
+                };
                 for entry in entries {
                     self.dispatch(entry, batch, &mut stop);
                 }
@@ -1101,7 +1121,12 @@ impl<S, K: Sink> Endpoint<S, K> {
     fn on_invalid(&mut self, invalid: &Invalid<'_>, batch: Option<u64>) {
         let answered = !invalid.is_response();
         if answered {
-            self.answer(invalid.id(), batch, &Err(invalid.error()));
+            // An id still being answered by a deferred handler belongs to that
+            // request: the refusal goes under `null`, as `admit` does for a
+            // valid duplicate, so the only response with that id is the real
+            // one.
+            let id = invalid.id().filter(|id| !self.shared.lock().in_flight(id));
+            self.answer(id, batch, &Err(invalid.error()));
         } else if let Some(number) = invalid.id().and_then(ours) {
             // A broken answer still ends the request it names: waiting on would
             // only end in a timeout.

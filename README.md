@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>. One required dependency, from the family: <a href="https://crates.io/crates/jsonx-lib"><code>jsonx-lib</code></a>. The integrations (<code>serde</code>, <code>futures-io</code>, <code>tracing</code>) are optional features, off by default. Without the default <code>std</code> feature the framing, message, and correlation layers are <code>no_std</code> (they need only <code>alloc</code>).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0.</strong> 0.4.0 moves onto jsonx-lib 0.5 with typed params and results through its <code>ToJson</code>/<code>FromJson</code>, follows MCP's stateless 2026-07-28 revision, and makes the 1.0 decisions; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: pre-1.0.</strong> 0.5.0 bounds request ids, the answers held for open batches, and the connection slots one peer can hold; 0.4.0 moved onto jsonx-lib 0.5 with typed params and results through its <code>ToJson</code>/<code>FromJson</code>, follows MCP's stateless 2026-07-28 revision, and makes the 1.0 decisions; the public API is refined across the 0.x series and frozen at <code>1.0.0</code>, after lsp-lang and mcp-io have run on it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -69,10 +69,10 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-rpc-io = "0.4"
+rpc-io = "0.5"
 ```
 
-rpc-io 0.4 needs jsonx-lib 0.5, and is published once jsonx-lib 0.5.0 is on crates.io; until then it builds only against a local jsonx-lib (a `[patch.crates-io]` entry).
+rpc-io 0.5 needs jsonx-lib 0.5.
 
 JSON values are built and read with jsonx-lib, re-exported as `rpc_io::jsonx` (`rpc_io::jsonx::json!`, `rpc_io::jsonx::Value`, the `ToJson`/`FromJson` traits), so no separate dependency is needed and a crate on top always gets the same jsonx-lib version as rpc-io.
 
@@ -80,7 +80,7 @@ The framing, message, and correlation layers without the standard library:
 
 ```toml
 [dependencies]
-rpc-io = { version = "0.4", default-features = false }
+rpc-io = { version = "0.5", default-features = false }
 ```
 
 | Feature | Default | Adds |
@@ -286,7 +286,7 @@ Runnable programs in [`examples/`](./examples):
 
 ## Performance
 
-Decoding is one pass of `jsonx-lib`'s pull reader over each body: the envelope members are read as raw slices, so `params` and `result` are validated once and never copied or decoded unless a handler asks. Method names and string ids borrow from the body when they have no escapes, and deferred requests are looked up without copying their ids. `Framed` frames messages into a reused buffer and writes once per turn, however many messages a handler sends; `Queued` writes each batch of queued messages with one `write_all` and one `flush`. The decoder reads straight into its own buffer, searches for line ends eight bytes at a time, resumes each search where the last one stopped, and grows geometrically while a large message arrives.
+Decoding is one pass of `jsonx-lib`'s pull reader over each body: the envelope members are read as raw slices, so `params` and `result` are validated once and never copied or decoded unless a handler asks. Method names and string ids borrow from the body when they have no escapes, and deferred requests are looked up without copying their ids (each deferred request in flight keeps its own copies of its id, which `Limits::max_id_bytes` bounds). `Framed` frames messages into a reused buffer and writes once per turn, however many messages a handler sends; `Queued` writes each batch of queued messages with one `write_all` and one `flush`. The decoder reads straight into its own buffer, searches for line ends eight bytes at a time, resumes each search where the last one stopped, and grows geometrically while a large message arrives.
 
 Throughput, measured with the benchmarks in [`benches/`](./benches): x86_64 Windows, rustc 1.99, release profile, LSP-shaped `textDocument/hover` requests (about 160 bytes each), jsonx-lib 0.5 at `2161d2c`. The machine was loaded by other work, so each figure is the range of medians over two rounds: a guide to scale, not a speed to quote.
 
@@ -346,7 +346,7 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 - **Panics.** Handler, interceptor, and event-hook panics are caught; so are panics in a `Sink` or a `Queued` writer, which close the connection as an I/O error. This needs `panic = "unwind"`, Rust's default. An I/O error a handler forwards with `?` reaches the peer as "the transport failed", without the operating system's text.
 - **Threads.** Handlers run on the endpoint's thread, one at a time, in arrival order. `Peer`, `Call`, `Responder`, and `Canceller` are `Send` and work from any thread. The endpoint's lock is held to encode a message and hand it to the sink, never while a handler or hook runs; with `Queued` or `outbox`, never during a write either. A message sent from a worker goes out at once, even while a handler runs.
 - **Observability.** `Endpoint::stats()` and `Peer::stats()` give the connection's counters (traffic both ways, errors, timeouts, evictions, cancellations, panics) and gauges (pending, in flight, held). The `tracing` feature adds a span per call and events at documented levels. They record methods, ids, sizes, error codes, error messages, and panic messages, never `params`, results, or error `data` as such. Text the peer chose is clipped and escaped; an error message may quote part of what the peer sent (a `serde` error names the value that did not fit), clipped to 256 bytes.
-- **Serving.** `Server` closes a connection that leaves a message unfinished for `message_timeout` (30 s per message, counted from the read that brought its first bytes, so a client streaming messages back to back is never cut off; also the time a new connection has to send its first message) or stays idle for `idle_timeout` (300 s: no traffic either way and nothing in flight, so a client waiting on a long answer is kept, while a request of ours counts only within its timeout, and while one of ours without a timeout is outstanding the client's own requests in flight do not count either, so a client that never answers cannot hold the connection; long-lived LSP or MCP sessions may want `with_idle_timeout(None)`; a client that takes longer than `idle_timeout` to answer a request of ours, a slow MCP `sampling/createMessage` for example, is disconnected unless that request has a timeout of its own, which keeps the connection busy until it passes), so silent or trickling sockets cannot hold its `max_connections` slots. Its defaults are for untrusted peers: `Limits::network()` (4 MiB messages) and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop (10 ms, doubling to 1 s) instead of ending it.
+- **Serving.** `Server` closes a connection that leaves a message unfinished for `message_timeout` (30 s per message, counted from the read that brought its first bytes, so a client streaming messages back to back is never cut off; also the time a new connection has to send its first message) or stays idle for `idle_timeout` (300 s: no traffic either way and nothing in flight, so a client waiting on a long answer is kept, while a request of ours counts only within its timeout, and while one of ours without a timeout is outstanding the client's own requests in flight do not count either, so a client that never answers cannot hold the connection; long-lived LSP or MCP sessions may want `with_idle_timeout(None)`; a client that takes longer than `idle_timeout` to answer a request of ours, a slow MCP `sampling/createMessage` for example, is disconnected unless that request has a timeout of its own, which keeps the connection busy until it passes). Only a whole message or our own traffic counts as activity, so silent or trickling sockets cannot hold its `max_connections` slots. A client that sends a real message every idle period keeps its connection, as it should, so one peer IP address may hold at most `max_connections_per_address` (32) of them; that does not stop many addresses, so an internet-facing `Server` still needs a connection limiter in front of it, and a TLS front end for any credential. Its defaults are for untrusted peers: `Limits::network()` (4 MiB messages) and an 8 MiB, 4,096-message queue per connection. Running out of descriptors or memory at `accept` pauses the loop (10 ms, doubling to 1 s) instead of ending it.
 
 <hr>
 <br>

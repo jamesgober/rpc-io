@@ -654,9 +654,9 @@ pub fn decode<'a>(body: &'a [u8], limits: &Limits) -> Incoming<'a> {
             let read = read_members(&mut reader, &mut fields)
                 .and_then(|()| reader.finish().map_err(Fail::Json));
             match read {
-                Ok(()) => Incoming::Single(classify(fields, &parser, limits.lenient_ids)),
+                Ok(()) => Incoming::Single(classify(fields, &parser, limits)),
                 Err(fail) => {
-                    let salvaged = fields.salvage(limits.lenient_ids);
+                    let salvaged = fields.salvage(limits);
                     Incoming::Single(Err(unreadable(fail, salvaged)))
                 }
             }
@@ -716,7 +716,7 @@ fn decode_batch<'a>(mut reader: Reader<'a>, parser: &Parser, limits: &Limits) ->
                 if let Err(fail) = read_members(&mut reader, &mut fields) {
                     return Incoming::Single(Err(unreadable(fail, None)));
                 }
-                classify(fields, parser, limits.lenient_ids)
+                classify(fields, parser, limits)
             }
             Event::StartArray => {
                 if let Err(fail) = skip_container(&mut reader) {
@@ -809,13 +809,18 @@ struct Fields<'a> {
 impl<'a> Fields<'a> {
     /// The id to answer an unreadable message under: its own if it was read,
     /// valid, unrepeated, and the message has a method.
-    fn salvage(&self, lenient: bool) -> Option<Id<'a>> {
-        if self.method.is_none() || self.id_repeated {
+    fn salvage(&self, limits: &Limits) -> Option<Id<'a>> {
+        if self.method.is_none() || self.id_repeated || self.id_too_long(limits) {
             return None;
         }
         self.id
             .map(read_id)
-            .and_then(|id| id.into_request_id(lenient))
+            .and_then(|id| id.into_request_id(limits.lenient_ids))
+    }
+
+    /// Whether the `id` member's JSON text is over `max_id_bytes`.
+    fn id_too_long(&self, limits: &Limits) -> bool {
+        self.id.is_some_and(|raw| raw.len() > limits.max_id_bytes)
     }
 }
 
@@ -960,7 +965,20 @@ fn read_string(raw: &str) -> Option<Cow<'_, str>> {
 }
 
 /// Sorts a fully read message object into a message or an `Invalid`.
-fn classify<'a>(fields: Fields<'a>, parser: &Parser, lenient: bool) -> Entry<'a> {
+fn classify<'a>(fields: Fields<'a>, parser: &Parser, limits: &Limits) -> Entry<'a> {
+    let lenient = limits.lenient_ids;
+    if fields.id_too_long(limits) {
+        // Refused before the id is read or copied: it is answered under
+        // `null`, and as a response it can match none of ours.
+        let response =
+            fields.method.is_none() && (fields.result.is_some() || fields.error.is_some());
+        let max = limits.max_id_bytes;
+        return Err(Invalid {
+            id: None,
+            response,
+            error: ErrorObject::invalid_request(format!("an id may be at most {max} bytes")),
+        });
+    }
     let id = fields.id.map(read_id);
     let id_repeated = fields.id_repeated;
     let valid_id = match &id {
