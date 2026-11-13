@@ -1,13 +1,12 @@
 # rpc-io &mdash; Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> LexerSketch plan: `C:/Dev/libraries/Rust/lang-collection/_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is an `-io` pipeline in the owner's net-collection: the JSON-RPC transport of LexerSketch's LSP, MCP and API servers. DAP is not JSON-RPC; it shares only the Content-Length framing.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is an `-io` pipeline in the owner's net-collection: the JSON-RPC transport of the toolchain's LSP, MCP and API servers. DAP is not JSON-RPC; it shares only the Content-Length framing.
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 rpc-io owns message framing, the JSON-RPC envelope, id correlation, and cancellation plumbing. Method semantics belong to the protocol crates on top (lsp-lang, mcp-io); dap-lang uses the framing alone.
 
-Four LexerSketch servers would otherwise each reimplement the same transport; lsp-lang's hard-won robustness fixes (M74/M75) belong in one shared place.
+Four toolchain servers would otherwise each reimplement the same transport; lsp-lang's hard-won robustness fixes (M74/M75) belong in one shared place.
 
 ---
 
@@ -42,7 +41,7 @@ Four LexerSketch servers would otherwise each reimplement the same transport; ls
 6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 

@@ -1,7 +1,6 @@
 # rpc-io - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: C:/Dev/libraries/Rust/lang-collection/_lexersketch/ROADMAP.md and NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -40,7 +39,7 @@ Moved, per the anti-deferral rule:
   of the peer's requests needs a request that is still being answered, so
   `Router::deferred` and `Responder` came with cancellation tokens.
 - **Typed params through jsonx-lib traits** moves to v0.5.0. jsonx-lib 0.2
-  has no `ToJson`/`FromJson`; they arrive in jsonx-lib 0.5 (LexerSketch
+  has no `ToJson`/`FromJson`; they arrive in jsonx-lib 0.5 (the toolchain
   decision D25). Until then handlers take `jsonx_lib::Value` through
   `Params::parse` and return anything `Into<Json>`. Hard dependency: a
   jsonx-lib release this crate cannot make.
