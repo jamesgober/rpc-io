@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `rpc-io`; each section has an example.
 > **Status: pre-1.0 (0.4.0).** The surface is refined across the 0.x series and
-> frozen at `1.0.0`, after lsp-lang and mcp-io have run on it (LexerSketch
+> frozen at `1.0.0`, after lsp-lang and mcp-io have run on it (the toolchain
 > decision D18). See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
